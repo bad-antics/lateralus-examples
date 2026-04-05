@@ -1,0 +1,220 @@
+// rest_api.ltl — REST API server with routing and middleware
+// ──────────────────────────────────────────────
+// What: Define routes, middleware, JSON responses in Lateralus
+// Concepts: structs, enums, closures, pipelines, pattern matching, maps
+// Run: lateralus run web-api/rest_api.ltl
+
+// ─── HTTP Types ─────────────────────────────────────────
+
+enum HttpMethod { GET, POST, PUT, DELETE }
+
+struct Request {
+    method: HttpMethod,
+    path: string,
+    headers: {string: string},
+    body: string,
+    params: {string: string},
+}
+
+struct Response {
+    status: int,
+    headers: {string: string},
+    body: string,
+}
+
+impl Response {
+    fn json(status: int, data: Json) -> Response {
+        Response {
+            status,
+            headers: { "Content-Type": "application/json" },
+            body: json::stringify(data, indent: 2),
+        }
+    }
+
+    fn text(status: int, body: string) -> Response {
+        Response {
+            status,
+            headers: { "Content-Type": "text/plain" },
+            body,
+        }
+    }
+
+    fn not_found() -> Response {
+        Response::json(404, { "error": "not found" })
+    }
+}
+
+// ─── Data Layer ─────────────────────────────────────────
+
+struct User {
+    id: int,
+    name: string,
+    email: string,
+    role: string,
+}
+
+struct UserStore {
+    users: [User],
+    next_id: int,
+}
+
+impl UserStore {
+    fn new() -> UserStore {
+        UserStore {
+            users: [
+                User { id: 1, name: "Alice",   email: "alice@example.com",   role: "admin" },
+                User { id: 2, name: "Bob",     email: "bob@example.com",     role: "user" },
+                User { id: 3, name: "Charlie", email: "charlie@example.com", role: "user" },
+            ],
+            next_id: 4,
+        }
+    }
+
+    fn all(self) -> [User] { self.users }
+
+    fn find(self, id: int) -> Option<User> {
+        self.users |> find(u => u.id == id)
+    }
+
+    fn create(mut self, name: string, email: string, role: string) -> User {
+        let user = User { id: self.next_id, name, email, role }
+        self.users.push(user)
+        self.next_id += 1
+        user
+    }
+
+    fn delete(mut self, id: int) -> Option<User> {
+        match self.users |> find_index(u => u.id == id) {
+            Some(i) => Some(self.users.remove(i)),
+            None    => None
+        }
+    }
+}
+
+// ─── Middleware ──────────────────────────────────────────
+
+type Middleware = fn(Request, fn(Request) -> Response) -> Response
+
+/// Logging middleware
+fn logger(req: Request, next: fn(Request) -> Response) -> Response {
+    let start = time::now()
+    let res = next(req)
+    let elapsed = (time::now() - start).to_ms()
+    print("  ${req.method} ${req.path} → ${res.status} (${elapsed}ms)")
+    res
+}
+
+/// CORS middleware
+fn cors(req: Request, next: fn(Request) -> Response) -> Response {
+    mut res = next(req)
+    res.headers.set("Access-Control-Allow-Origin", "*")
+    res.headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+    res
+}
+
+// ─── Router ─────────────────────────────────────────────
+
+fn route(req: Request, store: mut UserStore) -> Response {
+    match (req.method, req.path) {
+        // GET /users — list all users
+        (HttpMethod::GET, "/users") => {
+            let users = store.all()
+                |> map(u => {
+                    "id": u.id,
+                    "name": u.name,
+                    "email": u.email,
+                    "role": u.role,
+                })
+            Response::json(200, { "users": users, "count": users.len() })
+        },
+
+        // GET /users/:id — get one user
+        (HttpMethod::GET, path) if path.starts_with("/users/") => {
+            let id = path.replace("/users/", "").to_int().unwrap_or(0)
+            match store.find(id) {
+                Some(user) => Response::json(200, {
+                    "id": user.id,
+                    "name": user.name,
+                    "email": user.email,
+                    "role": user.role,
+                }),
+                None => Response::json(404, { "error": "user not found" })
+            }
+        },
+
+        // POST /users — create user
+        (HttpMethod::POST, "/users") => {
+            let body = json::parse(req.body).unwrap_or({})
+            let name = body.get("name").unwrap_or("").as_string()
+            let email = body.get("email").unwrap_or("").as_string()
+            let role = body.get("role").unwrap_or("user").as_string()
+
+            if name.is_empty() || email.is_empty() {
+                return Response::json(422, { "error": "name and email required" })
+            }
+
+            let user = store.create(name, email, role)
+            Response::json(201, {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email,
+                "role": user.role,
+            })
+        },
+
+        // DELETE /users/:id
+        (HttpMethod::DELETE, path) if path.starts_with("/users/") => {
+            let id = path.replace("/users/", "").to_int().unwrap_or(0)
+            match store.delete(id) {
+                Some(_) => Response::json(200, { "deleted": true }),
+                None    => Response::json(404, { "error": "user not found" })
+            }
+        },
+
+        // GET /health
+        (HttpMethod::GET, "/health") => {
+            Response::json(200, { "status": "ok", "uptime": "42s" })
+        },
+
+        // 404 fallback
+        _ => Response::not_found()
+    }
+}
+
+// ─── Simulate Requests ──────────────────────────────────
+
+fn simulate(method: HttpMethod, path: string, body: string) -> Request {
+    Request {
+        method,
+        path,
+        headers: { "Content-Type": "application/json" },
+        body,
+        params: {},
+    }
+}
+
+fn main() {
+    mut store = UserStore::new()
+
+    print("🌐 REST API Simulation")
+    print("═".repeat(50))
+
+    // Simulate API calls
+    let requests = [
+        simulate(HttpMethod::GET, "/health", ""),
+        simulate(HttpMethod::GET, "/users", ""),
+        simulate(HttpMethod::GET, "/users/1", ""),
+        simulate(HttpMethod::POST, "/users", "{\"name\":\"Diana\",\"email\":\"diana@example.com\"}"),
+        simulate(HttpMethod::GET, "/users", ""),
+        simulate(HttpMethod::DELETE, "/users/2", ""),
+        simulate(HttpMethod::GET, "/users/99", ""),
+    ]
+
+    for req in requests {
+        print("")
+        let res = logger(req, r => cors(r, r2 => route(r2, store)))
+        print("  Body: ${res.body}")
+    }
+}
+
+main()

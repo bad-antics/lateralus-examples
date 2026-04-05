@@ -1,0 +1,178 @@
+// http_client.ltl — Simple HTTP client with pipelines
+// ──────────────────────────────────────────────
+// What: Build and send HTTP requests with a fluent pipeline API
+// Concepts: structs, enums, impl blocks, builder pattern, pipelines, error handling
+// Run: lateralus run cli/http_client.ltl
+
+enum Method {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+}
+
+impl Method {
+    fn to_string(self) -> string {
+        match self {
+            Method::GET    => "GET",
+            Method::POST   => "POST",
+            Method::PUT    => "PUT",
+            Method::DELETE => "DELETE",
+        }
+    }
+}
+
+struct Request {
+    method: Method,
+    url: string,
+    headers: {string: string},
+    body: Option<string>,
+    timeout: int,
+}
+
+struct Response {
+    status: int,
+    headers: {string: string},
+    body: string,
+    elapsed_ms: int,
+}
+
+impl Request {
+    /// Start building a GET request
+    fn get(url: string) -> Request {
+        Request {
+            method: Method::GET,
+            url,
+            headers: {},
+            body: None,
+            timeout: 30000,
+        }
+    }
+
+    /// Start building a POST request
+    fn post(url: string) -> Request {
+        Request { ...Request::get(url), method: Method::POST }
+    }
+
+    /// Add a header
+    fn header(self, key: string, value: string) -> Request {
+        mut headers = self.headers
+        headers.set(key, value)
+        Request { ...self, headers }
+    }
+
+    /// Set JSON body
+    fn json(self, data: Json) -> Request {
+        Request {
+            ...self,
+            body: Some(json::stringify(data)),
+            headers: { ...self.headers, "Content-Type": "application/json" },
+        }
+    }
+
+    /// Set timeout
+    fn timeout(self, ms: int) -> Request {
+        Request { ...self, timeout: ms }
+    }
+
+    /// Send the request
+    fn send(self) -> Result<Response, string> {
+        let start = time::now()
+        try {
+            let raw = http::send(self)?
+            Ok(Response {
+                status: raw.status,
+                headers: raw.headers,
+                body: raw.body,
+                elapsed_ms: (time::now() - start).to_ms(),
+            })
+        } recover err {
+            Err("request failed: ${err}")
+        }
+    }
+
+    /// Display the request
+    fn display(self) -> string {
+        let header_str = self.headers
+            |> entries()
+            |> map((k, v) => "  ${k}: ${v}")
+            |> join("\n")
+
+        "${self.method.to_string()} ${self.url}\n${header_str}"
+    }
+}
+
+impl Response {
+    fn is_ok(self) -> bool {
+        self.status >= 200 && self.status < 300
+    }
+
+    fn json(self) -> Result<Json, string> {
+        json::parse(self.body)
+    }
+
+    fn display(self) -> string {
+        let status_icon = match self.status {
+            200..=299 => "✅",
+            300..=399 => "↩️ ",
+            400..=499 => "⚠️ ",
+            500..=599 => "❌",
+            _         => "❓",
+        }
+        "${status_icon} ${self.status} (${self.elapsed_ms}ms)"
+    }
+}
+
+// ─── Demo ───────────────────────────────────────────────
+
+fn main() {
+    print("🌐 HTTP Client Demo")
+    print("═".repeat(40))
+
+    // Simple GET — pipeline style
+    print("\n--- GET Request ---")
+    let request = Request::get("https://api.example.com/users")
+        |> .header("Accept", "application/json")
+        |> .header("Authorization", "Bearer token123")
+        |> .timeout(5000)
+
+    print(request.display())
+
+    // POST with JSON body
+    print("\n--- POST Request ---")
+    let create = Request::post("https://api.example.com/users")
+        |> .header("Accept", "application/json")
+        |> .json({
+            "name": "Alice",
+            "email": "alice@example.com",
+            "role": "developer"
+        })
+
+    print(create.display())
+
+    // Simulated response processing pipeline
+    print("\n--- Response Pipeline ---")
+
+    // Simulate a response
+    let response = Response {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+        body: "[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]",
+        elapsed_ms: 142,
+    }
+
+    print(response.display())
+
+    // Process with pipeline
+    match response.json() {
+        Ok(data) => {
+            let names = data
+                |> as_array()
+                |> map(user => json_get(user, "name").unwrap().as_string())
+            print("Users: ${names}")
+        },
+        Err(e) => print("Parse error: ${e}")
+    }
+}
+
+main()

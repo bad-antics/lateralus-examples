@@ -1,0 +1,32 @@
+// euler_002.ltl — Project Euler #2: Even Fibonacci numbers
+// ──────────────────────────────────────────────
+// What: Sum of even-valued Fibonacci numbers not exceeding 4 million
+// Concepts: loops, pipelines, filter, generators
+// Run: lateralus run challenges/euler_002.ltl
+
+/// Generate Fibonacci numbers up to a limit
+fn fibs_up_to(limit: int) -> [int] {
+    mut seq = [1, 2]
+    loop {
+        let next = seq[seq.len() - 1] + seq[seq.len() - 2]
+        if next > limit { break }
+        seq.push(next)
+    }
+    seq
+}
+
+fn solve(limit: int) -> int {
+    fibs_up_to(limit)
+        |> filter(n => n % 2 == 0)
+        |> sum()
+}
+
+fn main() {
+    let answer = solve(4_000_000)
+    print("Sum of even Fibonacci numbers ≤ 4M: ${answer}")
+    assert_eq(answer, 4613732)
+
+    print("✓ Correct!")
+}
+
+main()

@@ -1,0 +1,25 @@
+// euler_001.ltl — Project Euler #1: Multiples of 3 or 5
+// ──────────────────────────────────────────────
+// What: Find the sum of all multiples of 3 or 5 below 1000
+// Concepts: ranges, filter, sum, pipelines
+// Run: lateralus run challenges/euler_001.ltl
+
+fn solve(limit: int) -> int {
+    range(1, limit)
+        |> filter(n => n % 3 == 0 || n % 5 == 0)
+        |> sum()
+}
+
+fn main() {
+    // Small case for verification
+    assert_eq(solve(10), 23)    // 3 + 5 + 6 + 9 = 23
+
+    // Actual problem
+    let answer = solve(1000)
+    print("Sum of multiples of 3 or 5 below 1000: ${answer}")
+    assert_eq(answer, 233168)
+
+    print("✓ Correct!")
+}
+
+main()

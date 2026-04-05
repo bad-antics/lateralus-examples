@@ -1,0 +1,35 @@
+// euler_006.ltl — Project Euler #6: Sum square difference
+// ──────────────────────────────────────────────
+// What: Difference between sum-of-squares and square-of-sum for 1..100
+// Concepts: ranges, map, sum, pipelines, math
+// Run: lateralus run challenges/euler_006.ltl
+
+fn solve(n: int) -> int {
+    let numbers = range(1, n + 1)
+
+    let sum_of_squares = numbers
+        |> map(x => x * x)
+        |> sum()
+
+    let square_of_sum = numbers
+        |> sum()
+        |> pow(2)
+
+    square_of_sum - sum_of_squares
+}
+
+fn main() {
+    // Verify small case: 1..10
+    // Sum of squares: 1 + 4 + 9 + ... + 100 = 385
+    // Square of sum: (1 + 2 + ... + 10)² = 55² = 3025
+    // Difference: 3025 - 385 = 2640
+    assert_eq(solve(10), 2640)
+
+    let answer = solve(100)
+    print("Sum square difference for 1..100: ${answer}")
+    assert_eq(answer, 25164150)
+
+    print("✓ Correct!")
+}
+
+main()

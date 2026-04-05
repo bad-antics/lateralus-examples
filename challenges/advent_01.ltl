@@ -1,0 +1,57 @@
+// advent_01.ltl — Advent of Code style: Calorie Counting
+// ──────────────────────────────────────────────
+// What: Find the elf carrying the most calories (groups separated by blank lines)
+// Concepts: string splitting, pipelines, group processing, sort, take
+// Run: lateralus run challenges/advent_01.ltl
+
+fn solve(input: string) -> (int, int) {
+    let elf_totals = input
+        |> trim()
+        |> split("\n\n")                              // split by blank lines (groups)
+        |> map(group => {
+            group
+                |> split("\n")
+                |> filter(line => !line.is_empty())
+                |> map(line => line.to_int().unwrap_or(0))
+                |> sum()
+        })
+        |> sort(:desc)
+
+    let part1 = elf_totals[0]                          // max single elf
+    let part2 = elf_totals |> take(3) |> sum()         // top 3 elves
+
+    (part1, part2)
+}
+
+fn main() {
+    let input = "
+1000
+2000
+3000
+
+4000
+
+5000
+6000
+
+7000
+8000
+9000
+
+10000
+"
+
+    let (part1, part2) = solve(input)
+
+    print("🧝 Calorie Counting")
+    print("═".repeat(40))
+    print("Part 1 — Max single elf: ${part1}")
+    print("Part 2 — Top 3 elves:    ${part2}")
+
+    assert_eq(part1, 24000)    // elf 4: 7000+8000+9000
+    assert_eq(part2, 45000)    // top 3: 24000+11000+10000
+
+    print("\n✓ Both parts correct!")
+}
+
+main()

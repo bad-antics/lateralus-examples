@@ -1,0 +1,118 @@
+// sorting.ltl — Sorting algorithms in Lateralus
+// ──────────────────────────────────────────────
+// What: Quicksort and mergesort with functional style
+// Concepts: recursion, pattern matching, pipelines, closures, generics
+// Run: lateralus run algorithms/sorting.ltl
+
+/// Quicksort — functional style using pipeline
+fn quicksort<T: Ord>(arr: [T]) -> [T] {
+    match arr.len() {
+        0 | 1 => arr,
+        _ => {
+            let pivot = arr[0]
+            let rest = arr[1..]
+
+            let left = rest |> filter(x => x < pivot) |> quicksort()
+            let right = rest |> filter(x => x >= pivot) |> quicksort()
+
+            [...left, pivot, ...right]
+        }
+    }
+}
+
+/// Mergesort — divide and conquer
+fn mergesort<T: Ord>(arr: [T]) -> [T] {
+    if arr.len() <= 1 { return arr }
+
+    let mid = arr.len() / 2
+    let left = mergesort(arr[..mid])
+    let right = mergesort(arr[mid..])
+
+    merge(left, right)
+}
+
+fn merge<T: Ord>(a: [T], b: [T]) -> [T] {
+    mut result = []
+    mut i = 0
+    mut j = 0
+
+    while i < a.len() && j < b.len() {
+        if a[i] <= b[j] {
+            result.push(a[i])
+            i += 1
+        } else {
+            result.push(b[j])
+            j += 1
+        }
+    }
+
+    [...result, ...a[i..], ...b[j..]]
+}
+
+/// Insertion sort — good for small/nearly-sorted arrays
+fn insertion_sort<T: Ord>(arr: [T]) -> [T] {
+    mut sorted = arr.clone()
+    for i in 1..sorted.len() {
+        let key = sorted[i]
+        mut j = i - 1
+        while j >= 0 && sorted[j] > key {
+            sorted[j + 1] = sorted[j]
+            j -= 1
+        }
+        sorted[j + 1] = key
+    }
+    sorted
+}
+
+/// Sort by a key function using pipelines
+fn sort_by_key<T, K: Ord>(arr: [T], key_fn: fn(T) -> K) -> [T] {
+    arr
+        |> map(item => (key_fn(item), item))
+        |> quicksort_by((a, b) => a.0.cmp(b.0))
+        |> map((_, item) => item)
+}
+
+// ─── Demo ───────────────────────────────────────────────
+
+fn main() {
+    let data = [38, 27, 43, 3, 9, 82, 10]
+    print("Original:  ${data}")
+    print("─".repeat(40))
+
+    let qs = quicksort(data)
+    print("Quicksort: ${qs}")
+
+    let ms = mergesort(data)
+    print("Mergesort: ${ms}")
+
+    let is = insertion_sort(data)
+    print("Insertion: ${is}")
+
+    // Verify all produce same result
+    assert_eq(qs, ms)
+    assert_eq(ms, is)
+    print("\n✓ All algorithms agree")
+
+    // Sort strings
+    let words = ["banana", "apple", "cherry", "date"]
+    print("\nWords sorted: ${quicksort(words)}")
+
+    // Sort structs by key
+    struct Person { name: string, age: int }
+    let people = [
+        Person { name: "Charlie", age: 30 },
+        Person { name: "Alice",   age: 25 },
+        Person { name: "Bob",     age: 35 },
+    ]
+
+    let by_name = people |> sort_by_key(p => p.name)
+    let by_age = people |> sort_by_key(p => p.age)
+
+    print("\nBy name:")
+    by_name |> each(p => print("  ${p.name}: ${p.age}"))
+
+    print("\nBy age:")
+    by_age |> each(p => print("  ${p.name}: ${p.age}"))
+}
+
+main()

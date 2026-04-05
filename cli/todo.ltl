@@ -1,0 +1,155 @@
+// todo.ltl — Full-featured CLI todo app
+// ──────────────────────────────────────────────
+// What: Persistent todo list with priorities, tags, and filtering
+// Concepts: structs, enums, file I/O, match, pipelines, error handling
+// Run: lateralus run cli/todo.ltl -- add "buy groceries" --priority high --tag shopping
+
+enum Priority {
+    Low,
+    Medium,
+    High,
+}
+
+impl Priority {
+    fn from_str(s: string) -> Priority {
+        match s.lower() {
+            "high" | "h"   => Priority::High,
+            "medium" | "m" => Priority::Medium,
+            _              => Priority::Low
+        }
+    }
+
+    fn icon(self) -> string {
+        match self {
+            Priority::High   => "🔴",
+            Priority::Medium => "🟡",
+            Priority::Low    => "🟢",
+        }
+    }
+
+    fn weight(self) -> int {
+        match self {
+            Priority::High   => 3,
+            Priority::Medium => 2,
+            Priority::Low    => 1,
+        }
+    }
+}
+
+struct Task {
+    id: int,
+    text: string,
+    done: bool,
+    priority: Priority,
+    tags: [string],
+    created: string,
+}
+
+impl Task {
+    fn display(self) -> string {
+        let check = if self.done { "✓" } else { " " }
+        let tag_str = if self.tags.is_empty() {
+            ""
+        } else {
+            self.tags |> map(t => "#${t}") |> join(" ") |> prepend("  ")
+        }
+        "${self.priority.icon()} [${check}] #${self.id} ${self.text}${tag_str}"
+    }
+}
+
+struct TodoStore {
+    tasks: [Task],
+    next_id: int,
+}
+
+impl TodoStore {
+    fn new() -> TodoStore {
+        TodoStore { tasks: [], next_id: 1 }
+    }
+
+    fn add(mut self, text: string, priority: Priority, tags: [string]) -> Task {
+        let task = Task {
+            id: self.next_id,
+            text,
+            done: false,
+            priority,
+            tags,
+            created: time::now().format("%Y-%m-%d"),
+        }
+        self.tasks.push(task)
+        self.next_id += 1
+        task
+    }
+
+    fn complete(mut self, id: int) -> Result<Task, string> {
+        match self.tasks |> find_index(t => t.id == id) {
+            Some(i) => {
+                self.tasks[i].done = true
+                Ok(self.tasks[i])
+            },
+            None => Err("task #${id} not found")
+        }
+    }
+
+    fn remove(mut self, id: int) -> Result<Task, string> {
+        match self.tasks |> find_index(t => t.id == id) {
+            Some(i) => Ok(self.tasks.remove(i)),
+            None    => Err("task #${id} not found")
+        }
+    }
+
+    fn list(self, show_done: bool) -> [Task] {
+        self.tasks
+            |> filter(t => show_done || !t.done)
+            |> sort_by(t => t.priority.weight(), :desc)
+    }
+
+    fn by_tag(self, tag: string) -> [Task] {
+        self.tasks
+            |> filter(t => t.tags.contains(tag))
+            |> sort_by(t => t.priority.weight(), :desc)
+    }
+
+    fn stats(self) -> string {
+        let total = self.tasks.len()
+        let done = self.tasks |> filter(t => t.done) |> len()
+        let high = self.tasks |> filter(t => t.priority == Priority::High && !t.done) |> len()
+        "${done}/${total} done, ${high} high priority remaining"
+    }
+}
+
+// ─── Demo ───────────────────────────────────────────────
+
+fn main() {
+    mut store = TodoStore::new()
+
+    // Add tasks
+    store.add("Write documentation", Priority::High, ["work", "docs"])
+    store.add("Buy groceries", Priority::Medium, ["personal", "shopping"])
+    store.add("Review PR #42", Priority::High, ["work", "code-review"])
+    store.add("Clean desk", Priority::Low, ["personal"])
+    store.add("Deploy v2.0", Priority::High, ["work", "deploy"])
+    store.add("Read Rust book", Priority::Low, ["learning"])
+
+    // Complete some tasks
+    store.complete(1).unwrap()
+    store.complete(4).unwrap()
+
+    // Display
+    print("📋 Todo List")
+    print("═".repeat(50))
+    store.list(true) |> each(t => print("  ${t.display()}"))
+
+    // Stats
+    print("\n📊 ${store.stats()}")
+
+    // Filter by tag
+    print("\n🏷️  Work tasks:")
+    store.by_tag("work") |> each(t => print("  ${t.display()}"))
+
+    // Only pending
+    print("\n⏳ Pending:")
+    store.list(false) |> each(t => print("  ${t.display()}"))
+}
+
+main()

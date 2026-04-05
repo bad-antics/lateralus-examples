@@ -1,0 +1,144 @@
+// json_transform.ltl — JSON traversal and reshaping
+// ──────────────────────────────────────────────
+// What: Parse nested JSON, reshape data structures, extract values
+// Concepts: match, recursion, pipelines, maps, pattern matching
+// Run: lateralus run data-processing/json_transform.ltl
+
+/// Recursive JSON pretty-printer
+fn json_pretty(value: Json, indent: int) -> string {
+    let pad = "  ".repeat(indent)
+    let pad_inner = "  ".repeat(indent + 1)
+
+    match value {
+        Json::Null          => "null",
+        Json::Bool(b)       => "${b}",
+        Json::Number(n)     => "${n}",
+        Json::String(s)     => "\"${s}\"",
+        Json::Array(items)  => {
+            if items.is_empty() { return "[]" }
+            let inner = items
+                |> map(item => "${pad_inner}${json_pretty(item, indent + 1)}")
+                |> join(",\n")
+            "[\n${inner}\n${pad}]"
+        },
+        Json::Object(pairs) => {
+            if pairs.is_empty() { return "{}" }
+            let inner = pairs
+                |> entries()
+                |> map((k, v) => "${pad_inner}\"${k}\": ${json_pretty(v, indent + 1)}")
+                |> join(",\n")
+            "{\n${inner}\n${pad}}"
+        }
+    }
+}
+
+/// Extract a nested value using dot notation: "user.address.city"
+fn json_get(value: Json, path: string) -> Option<Json> {
+    let keys = path |> split(".")
+
+    keys |> reduce(Some(value), (current, key) => {
+        match current {
+            Some(Json::Object(obj)) => obj.get(key),
+            Some(Json::Array(arr))  => {
+                match key.to_int() {
+                    Some(i) if i < arr.len() => Some(arr[i]),
+                    _ => None
+                }
+            },
+            _ => None
+        }
+    })
+}
+
+/// Flatten a nested JSON object into dot-notation keys
+fn json_flatten(value: Json) -> {string: Json} {
+    mut result = {}
+
+    fn walk(val: Json, prefix: string) {
+        match val {
+            Json::Object(pairs) => {
+                for (key, child) in pairs {
+                    let path = if prefix.is_empty() { key } else { "${prefix}.${key}" }
+                    walk(child, path)
+                }
+            },
+            Json::Array(items) => {
+                for (i, child) in items.enumerate() {
+                    walk(child, "${prefix}.${i}")
+                }
+            },
+            leaf => result.set(prefix, leaf)
+        }
+    }
+
+    walk(value, "")
+    result
+}
+
+// ─── Demo ───────────────────────────────────────────────
+
+fn main() {
+    // Parse a JSON string
+    let data = json::parse("{
+        \"users\": [
+            {
+                \"name\": \"Alice\",
+                \"age\": 30,
+                \"address\": {
+                    \"city\": \"Portland\",
+                    \"state\": \"OR\"
+                },
+                \"tags\": [\"admin\", \"developer\"]
+            },
+            {
+                \"name\": \"Bob\",
+                \"age\": 25,
+                \"address\": {
+                    \"city\": \"Seattle\",
+                    \"state\": \"WA\"
+                },
+                \"tags\": [\"user\"]
+            }
+        ],
+        \"meta\": {
+            \"total\": 2,
+            \"page\": 1
+        }
+    }").unwrap()
+
+    print("📋 Original JSON:")
+    print(json_pretty(data, 0))
+    print("")
+
+    // Extract nested values
+    print("🔍 Dot-notation access:")
+    let city = json_get(data, "users.0.address.city")
+    print("  users.0.address.city = ${city}")
+
+    let total = json_get(data, "meta.total")
+    print("  meta.total = ${total}")
+    print("")
+
+    // Flatten
+    print("📦 Flattened:")
+    let flat = json_flatten(data)
+    flat
+        |> entries()
+        |> sort_by((key, _) => key)
+        |> each((key, val) => print("  ${key} = ${json_pretty(val, 0)}"))
+    print("")
+
+    // Transform: extract just names and cities using pipeline
+    print("🔄 Transformed (name → city):")
+    let summary = json_get(data, "users").unwrap()
+        |> as_array()
+        |> map(user => {
+            let name = json_get(user, "name").unwrap().as_string()
+            let city = json_get(user, "address.city").unwrap().as_string()
+            "${name} → ${city}"
+        })
+
+    summary |> each(s => print("  ${s}"))
+}
+
+main()

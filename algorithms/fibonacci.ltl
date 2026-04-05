@@ -1,0 +1,95 @@
+// fibonacci.ltl — Four ways to compute Fibonacci numbers
+// ──────────────────────────────────────────────
+// What: Compares recursive, iterative, memoized, and pipeline approaches
+// Concepts: recursion, loops, maps, pipelines, closures
+// Run: lateralus run algorithms/fibonacci.ltl
+
+/// 1. Classic recursive (exponential time — for demonstration only)
+fn fib_recursive(n: int) -> int {
+    match n {
+        0 => 0,
+        1 => 1,
+        n => fib_recursive(n - 1) + fib_recursive(n - 2)
+    }
+}
+
+/// 2. Iterative (O(n) time, O(1) space)
+fn fib_iterative(n: int) -> int {
+    if n <= 1 { return n }
+
+    mut a = 0
+    mut b = 1
+    for _ in 2..=n {
+        let temp = a + b
+        a = b
+        b = temp
+    }
+    b
+}
+
+/// 3. Memoized with closure (O(n) time, O(n) space)
+fn make_fib_memo() -> fn(int) -> int {
+    mut cache = { 0: 0, 1: 1 }
+
+    fn fib(n: int) -> int {
+        match cache.get(n) {
+            Some(val) => val,
+            None => {
+                let result = fib(n - 1) + fib(n - 2)
+                cache.set(n, result)
+                result
+            }
+        }
+    }
+
+    fib
+}
+
+/// 4. Pipeline style — generate sequence
+fn fib_sequence(count: int) -> [int] {
+    range(0, count)
+        |> reduce([], (seq, _) => {
+            match seq.len() {
+                0 => [0],
+                1 => [0, 1],
+                n => {
+                    let next = seq[n - 1] + seq[n - 2]
+                    seq.push(next)
+                }
+            }
+        })
+}
+
+// ─── Demo ───────────────────────────────────────────────
+
+fn main() {
+    print("Fibonacci Numbers")
+    print("═".repeat(40))
+
+    // Compare first 10
+    print("\nFirst 10 (iterative):")
+    let seq = fib_sequence(10)
+    print("  ${seq}")
+
+    // Verify all methods agree
+    for i in 0..10 {
+        let r = fib_recursive(i)
+        let it = fib_iterative(i)
+        assert_eq(r, it)
+        assert_eq(it, seq[i])
+    }
+    print("\n✓ All methods produce identical results")
+
+    // Memoized — efficient for repeated lookups
+    let fib = make_fib_memo()
+    print("\nFib(50) via memoized: ${fib(50)}")
+
+    // Pipeline: sum of even Fibonacci numbers under 4 million
+    let sum = fib_sequence(50)
+        |> filter(n => n < 4_000_000)
+        |> filter(n => n % 2 == 0)
+        |> sum()
+    print("Sum of even fibs < 4M: ${sum}")
+}
+
+main()

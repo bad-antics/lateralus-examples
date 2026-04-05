@@ -1,0 +1,126 @@
+// csv_pipeline.ltl — CSV data processing with pipelines
+// ──────────────────────────────────────────────
+// What: Parse, transform, and aggregate CSV sales data
+// Concepts: pipelines, maps, closures, structs, reduce, group_by
+// Run: lateralus run data-processing/csv_pipeline.ltl
+
+struct Sale {
+    date: string,
+    product: string,
+    quantity: int,
+    price: float,
+    region: string,
+}
+
+/// Parse a CSV line into a Sale struct
+fn parse_sale(line: string) -> Result<Sale, string> {
+    let parts = line |> split(",") |> map(s => s.trim())
+
+    match parts {
+        [date, product, qty, price, region] => {
+            Ok(Sale {
+                date,
+                product,
+                quantity: qty.to_int()?,
+                price: price.to_float()?,
+                region,
+            })
+        },
+        _ => Err("invalid CSV line: ${line}")
+    }
+}
+
+/// Revenue for a single sale
+fn revenue(sale: Sale) -> float {
+    sale.quantity.to_float() * sale.price
+}
+
+// ─── Main ───────────────────────────────────────────────
+
+fn main() {
+    // Sample CSV data (header + rows)
+    let csv_data = "
+date,product,quantity,price,region
+2026-01-15,Widget A,50,29.99,North
+2026-01-15,Widget B,30,49.99,South
+2026-01-16,Widget A,25,29.99,East
+2026-01-16,Widget C,10,99.99,North
+2026-01-17,Widget B,45,49.99,West
+2026-01-17,Widget A,60,29.99,South
+2026-01-18,Widget C,15,99.99,East
+2026-01-18,Widget B,20,49.99,North
+2026-01-19,Widget A,35,29.99,West
+2026-01-19,Widget C,8,99.99,South
+"
+
+    // Parse CSV → Sale structs
+    let sales = csv_data
+        |> trim()
+        |> split("\n")
+        |> skip(1)                           // skip header
+        |> filter(line => !line.is_empty())
+        |> map(line => parse_sale(line).unwrap())
+
+    print("📊 Sales Report")
+    print("═".repeat(50))
+    print("Total records: ${sales.len()}")
+
+    // ─── Total Revenue ──────────────────────────────
+
+    let total = sales
+        |> map(revenue)
+        |> sum()
+    print("\n💰 Total Revenue: $${total:.2}")
+
+    // ─── Revenue by Product ─────────────────────────
+
+    print("\n📦 Revenue by Product:")
+    sales
+        |> group_by(.product)
+        |> map_values(group => group |> map(revenue) |> sum())
+        |> entries()
+        |> sort_by((_, rev) => rev, :desc)
+        |> each((product, rev) => {
+            let bar = "█".repeat((rev / 100.0).round().to_int())
+            print("  ${product.pad_right(10)} $${rev:>8.2}  ${bar}")
+        })
+
+    // ─── Revenue by Region ──────────────────────────
+
+    print("\n🌍 Revenue by Region:")
+    sales
+        |> group_by(.region)
+        |> map_values(group => group |> map(revenue) |> sum())
+        |> entries()
+        |> sort_by((_, rev) => rev, :desc)
+        |> each((region, rev) => {
+            let pct = (rev / total * 100.0).round(1)
+            print("  ${region.pad_right(8)} $${rev:>8.2}  (${pct}%)")
+        })
+
+    // ─── Top 3 Highest-Revenue Sales ────────────────
+
+    print("\n🏆 Top 3 Sales:")
+    sales
+        |> sort_by(s => revenue(s), :desc)
+        |> take(3)
+        |> enumerate()
+        |> each((i, s) => {
+            print("  ${i + 1}. ${s.product} — ${s.quantity} units × $${s.price} = $${revenue(s):.2} (${s.region})")
+        })
+
+    // ─── Daily Trend ────────────────────────────────
+
+    print("\n📈 Daily Revenue:")
+    sales
+        |> group_by(.date)
+        |> map_values(group => group |> map(revenue) |> sum())
+        |> entries()
+        |> sort_by((date, _) => date)
+        |> each((date, rev) => {
+            let bar = "▓".repeat((rev / 200.0).round().to_int())
+            print("  ${date}  $${rev:>8.2}  ${bar}")
+        })
+}
+
+main()

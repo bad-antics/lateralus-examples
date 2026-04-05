@@ -1,0 +1,107 @@
+// binary_search.ltl — Generic binary search implementation
+// ──────────────────────────────────────────────
+// What: Binary search on sorted arrays with generics
+// Concepts: generics, match, ranges, comparison traits
+// Run: lateralus run algorithms/binary_search.ltl
+
+/// Binary search on a sorted array
+/// Returns Some(index) if found, None if not
+fn binary_search<T: Ord>(arr: [T], target: T) -> Option<int> {
+    mut low = 0
+    mut high = arr.len() - 1
+
+    while low <= high {
+        let mid = low + (high - low) / 2
+
+        match arr[mid].cmp(target) {
+            Ordering::Equal   => return Some(mid),
+            Ordering::Less    => low = mid + 1,
+            Ordering::Greater => high = mid - 1,
+        }
+    }
+
+    None
+}
+
+/// Binary search that returns the insertion point
+/// (where the element would go to maintain sort order)
+fn binary_search_insert<T: Ord>(arr: [T], target: T) -> int {
+    mut low = 0
+    mut high = arr.len()
+
+    while low < high {
+        let mid = low + (high - low) / 2
+        if arr[mid] < target {
+            low = mid + 1
+        } else {
+            high = mid
+        }
+    }
+
+    low
+}
+
+/// Find the first element satisfying a predicate in a sorted array
+fn binary_search_by<T>(arr: [T], pred: fn(T) -> bool) -> Option<int> {
+    mut low = 0
+    mut high = arr.len()
+    mut result = None
+
+    while low < high {
+        let mid = low + (high - low) / 2
+        if pred(arr[mid]) {
+            result = Some(mid)
+            high = mid
+        } else {
+            low = mid + 1
+        }
+    }
+
+    result
+}
+
+// ─── Demo ───────────────────────────────────────────────
+
+fn main() {
+    let numbers = [2, 5, 8, 12, 16, 23, 38, 42, 56, 72, 91]
+
+    print("Array: ${numbers}")
+    print("─".repeat(40))
+
+    // Search for existing element
+    match binary_search(numbers, 23) {
+        Some(i) => print("Found 23 at index ${i}"),
+        None    => print("23 not found")
+    }
+
+    // Search for missing element
+    match binary_search(numbers, 15) {
+        Some(i) => print("Found 15 at index ${i}"),
+        None    => print("15 not found")
+    }
+
+    // Find insertion point
+    let pos = binary_search_insert(numbers, 15)
+    print("15 would be inserted at index ${pos}")
+
+    // Search by predicate — find first number > 20
+    match binary_search_by(numbers, n => n > 20) {
+        Some(i) => print("First element > 20: ${numbers[i]} at index ${i}"),
+        None    => print("No element > 20")
+    }
+
+    // Pipeline: search multiple targets
+    let targets = [5, 15, 42, 100]
+    targets
+        |> map(t => (t, binary_search(numbers, t)))
+        |> each((target, result) => {
+            match result {
+                Some(i) => print("  ${target} → index ${i}"),
+                None    => print("  ${target} → not found")
+            }
+        })
+
+    print("\n✓ All searches complete")
+}
+
+main()

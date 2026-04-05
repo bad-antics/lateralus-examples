@@ -1,0 +1,156 @@
+// log_analyzer.ltl — Parse and analyze server logs
+// ──────────────────────────────────────────────
+// What: Parse log lines, group errors, generate a report
+// Concepts: enums, structs, pipelines, group_by, match, closures
+// Run: lateralus run data-processing/log_analyzer.ltl
+
+enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+}
+
+impl LogLevel {
+    fn from_str(s: string) -> Result<LogLevel, string> {
+        match s.upper() {
+            "DEBUG" => Ok(LogLevel::Debug),
+            "INFO"  => Ok(LogLevel::Info),
+            "WARN"  => Ok(LogLevel::Warn),
+            "ERROR" => Ok(LogLevel::Error),
+            "FATAL" => Ok(LogLevel::Fatal),
+            other   => Err("unknown log level: ${other}")
+        }
+    }
+
+    fn icon(self) -> string {
+        match self {
+            LogLevel::Debug => "🔍",
+            LogLevel::Info  => "ℹ️ ",
+            LogLevel::Warn  => "⚠️ ",
+            LogLevel::Error => "❌",
+            LogLevel::Fatal => "💀",
+        }
+    }
+
+    fn severity(self) -> int {
+        match self {
+            LogLevel::Debug => 0,
+            LogLevel::Info  => 1,
+            LogLevel::Warn  => 2,
+            LogLevel::Error => 3,
+            LogLevel::Fatal => 4,
+        }
+    }
+}
+
+struct LogEntry {
+    timestamp: string,
+    level: LogLevel,
+    source: string,
+    message: string,
+}
+
+/// Parse a log line: "2026-01-15 10:30:45 [ERROR] auth: Login failed"
+fn parse_log(line: string) -> Result<LogEntry, string> {
+    try {
+        let parts = line.splitn(4, " ")
+        let date = parts[0]
+        let time = parts[1]
+        let level_str = parts[2].trim_matches(['[', ']'])
+        let rest = parts[3]
+
+        let (source, message) = rest.split_once(": ")?
+
+        Ok(LogEntry {
+            timestamp: "${date} ${time}",
+            level: LogLevel::from_str(level_str)?,
+            source: source.trim(),
+            message: message.trim(),
+        })
+    } recover err {
+        Err("failed to parse log: ${err}")
+    }
+}
+
+// ─── Demo ───────────────────────────────────────────────
+
+fn main() {
+    let raw_logs = "
+2026-01-15 10:30:45 [INFO] server: Server started on port 8080
+2026-01-15 10:31:02 [DEBUG] db: Connection pool initialized
+2026-01-15 10:31:15 [INFO] auth: User alice logged in
+2026-01-15 10:32:00 [WARN] db: Slow query detected (2.3s)
+2026-01-15 10:32:45 [ERROR] auth: Login failed for user bob
+2026-01-15 10:33:12 [INFO] api: GET /users 200 (45ms)
+2026-01-15 10:33:30 [ERROR] api: POST /orders 500 (120ms)
+2026-01-15 10:34:00 [WARN] memory: Heap usage at 85%
+2026-01-15 10:34:15 [ERROR] db: Connection timeout after 30s
+2026-01-15 10:34:30 [FATAL] server: Out of memory - shutting down
+2026-01-15 10:34:45 [INFO] server: Graceful shutdown initiated
+2026-01-15 10:35:00 [ERROR] api: GET /health 503 (5ms)
+"
+
+    // Parse all logs
+    let entries = raw_logs
+        |> trim()
+        |> split("\n")
+        |> filter(line => !line.is_empty())
+        |> map(line => parse_log(line))
+        |> filter(r => r.is_ok())
+        |> map(r => r.unwrap())
+
+    print("📊 Log Analysis Report")
+    print("═".repeat(50))
+    print("Total entries: ${entries.len()}")
+
+    // ─── Severity Breakdown ─────────────────────────
+
+    print("\n📈 By Severity:")
+    entries
+        |> group_by(e => e.level)
+        |> entries()
+        |> sort_by((level, _) => level.severity(), :desc)
+        |> each((level, group) => {
+            let bar = "█".repeat(group.len())
+            print("  ${level.icon()} ${level}: ${group.len()} ${bar}")
+        })
+
+    // ─── Errors & Fatals ────────────────────────────
+
+    let problems = entries
+        |> filter(e => e.level.severity() >= 3)
+
+    print("\n🚨 Errors & Fatals (${problems.len()}):")
+    problems |> each(e => {
+        print("  ${e.level.icon()} [${e.timestamp}] ${e.source}: ${e.message}")
+    })
+
+    // ─── By Source ──────────────────────────────────
+
+    print("\n🔧 Entries by Source:")
+    entries
+        |> group_by(.source)
+        |> entries()
+        |> sort_by((_, group) => group.len(), :desc)
+        |> each((source, group) => {
+            let error_count = group |> filter(e => e.level.severity() >= 3) |> len()
+            let indicator = if error_count > 0 { " ⚠ ${error_count} errors" } else { "" }
+            print("  ${source.pad_right(10)} ${group.len()} entries${indicator}")
+        })
+
+    // ─── Timeline ───────────────────────────────────
+
+    print("\n⏱️ Error Timeline:")
+    problems
+        |> map(e => {
+            let time = e.timestamp.split(" ")[1]
+            (time, e)
+        })
+        |> each((time, e) => {
+            print("  ${time} │ ${e.source}: ${e.message}")
+        })
+}
+
+main()
