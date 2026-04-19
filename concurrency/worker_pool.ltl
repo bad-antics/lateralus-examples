@@ -1,0 +1,70 @@
+// worker_pool.ltl — Bounded worker pool with job queue
+// Run: lateralus run concurrency/worker_pool.ltl
+
+use std.async.{spawn, channel, select}
+use std.sync.{Arc, Mutex}
+use std.time.Duration
+
+struct WorkerPool<In: Send, Out: Send> {
+    job_tx:    Sender<In>,
+    result_rx: Receiver<Out>,
+    size:      int,
+}
+
+impl<In: Send + Clone, Out: Send> WorkerPool<In, Out> {
+    fn new(size: int, worker: fn(In) -> Out) -> WorkerPool<In, Out> {
+        let (job_tx,    job_rx)    = channel()
+        let (result_tx, result_rx) = channel()
+
+        for _ in range(0, size) {
+            let rx = job_rx.clone()
+            let tx = result_tx.clone()
+            let w  = worker.clone()
+            spawn(async || {
+                while let some(job) = await rx.recv() {
+                    let result = w(job)
+                    await tx.send(result)
+                }
+            })
+        }
+
+        WorkerPool { job_tx, result_rx, size }
+    }
+
+    async fn submit(self, job: In) {
+        await self.job_tx.send(job)
+    }
+
+    async fn collect(self, expected: int) -> [Out] {
+        let mut results = []
+        for _ in range(0, expected) {
+            if let some(r) = await self.result_rx.recv() {
+                results.push(r)
+            }
+        }
+        results
+    }
+
+    fn close(self) { self.job_tx.close() }
+}
+
+async fn main() {
+    // Simulate CPU-bound work: compute squares
+    let pool: WorkerPool<int, int> = WorkerPool.new(4, |n| {
+        std.thread.sleep_ms(10)  // simulate work
+        n * n
+    })
+
+    let jobs = range(1, 21) |> collect()
+    let n = jobs.len()
+
+    for j in jobs { await pool.submit(j) }
+
+    let results = await pool.collect(n)
+    let sorted  = results |> sort() |> collect()
+
+    print("Results (${sorted.len()} items): ${sorted}")
+    pool.close()
+}
+
+main()
