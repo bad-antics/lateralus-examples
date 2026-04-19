@@ -1,0 +1,291 @@
+// certificate_authority.ltl — X.509 certificate authority in Lateralus
+
+use std.crypto.{ed25519, sha256, random_bytes}
+use std.time.{now_secs, Duration}
+
+// ── ASN.1 DER encoding (subset for X.509) ────────────────────────────────────
+enum Asn1Tag {
+    Integer = 0x02, BitString = 0x03, OctetString = 0x04,
+    Null = 0x05, Oid = 0x06, Utf8String = 0x0c,
+    Sequence = 0x30, Set = 0x31,
+    PrintableString = 0x13, UtcTime = 0x17, GeneralizedTime = 0x18,
+    ContextSpecific0 = 0xa0, ContextSpecific3 = 0xa3,
+}
+
+fn der_encode_length(len: usize) -> [u8] {
+    if len < 0x80 { vec![len as u8] }
+    else if len < 0x100 { vec![0x81, len as u8] }
+    else { vec![0x82, (len >> 8) as u8, (len & 0xff) as u8] }
+}
+
+fn der_encode_tlv(tag: u8, value: &[u8]) -> [u8] {
+    let mut out = vec![tag]
+    out.extend_from_slice(&der_encode_length(value.len()))
+    out.extend_from_slice(value)
+    out
+}
+
+fn der_sequence(items: &[[u8]]) -> [u8] {
+    let mut inner: [u8] = []
+    for item in items { inner.extend_from_slice(item) }
+    der_encode_tlv(0x30, &inner)
+}
+
+fn der_integer(val: &[u8]) -> [u8] {
+    if val[0] & 0x80 != 0 { der_encode_tlv(0x02, &[&[0x00], val].concat()) }
+    else { der_encode_tlv(0x02, val) }
+}
+
+fn der_oid(oid: &[u32]) -> [u8] {
+    let mut encoded: [u8] = vec![(oid[0] * 40 + oid[1]) as u8]
+    for &component in &oid[2..] {
+        if component < 128 { encoded.push(component as u8) }
+        else {
+            let mut bytes: [u8] = []
+            let mut val = component
+            bytes.push((val & 0x7f) as u8); val >>= 7
+            while val > 0 { bytes.push((val & 0x7f | 0x80) as u8); val >>= 7 }
+            bytes.reverse()
+            encoded.extend_from_slice(&bytes)
+        }
+    }
+    der_encode_tlv(0x06, &encoded)
+}
+
+// ── X.509 Certificate ────────────────────────────────────────────────────────
+struct Certificate {
+    version:          u8,          // v3 = 2
+    serial_number:    [u8; 20],
+    signature_algo:   string,
+    issuer:           DistinguishedName,
+    not_before:       u64,
+    not_after:        u64,
+    subject:          DistinguishedName,
+    public_key:       [u8; 32],    // Ed25519
+    extensions:       [Extension],
+    signature:        [u8; 64],
+    tbs_bytes:        [u8],        // to-be-signed bytes
+}
+
+struct DistinguishedName {
+    country:      string?,
+    state:        string?,
+    locality:     string?,
+    organization: string?,
+    org_unit:     string?,
+    common_name:  string,
+}
+
+impl DistinguishedName {
+    fn to_der(self) -> [u8] {
+        let mut rdns: [[u8]] = []
+        if let some(ref c) = self.country { rdns.push(rdn_attr(&[2,5,4,6], c)) }
+        if let some(ref s) = self.state { rdns.push(rdn_attr(&[2,5,4,8], s)) }
+        if let some(ref l) = self.locality { rdns.push(rdn_attr(&[2,5,4,7], l)) }
+        if let some(ref o) = self.organization { rdns.push(rdn_attr(&[2,5,4,10], o)) }
+        rdns.push(rdn_attr(&[2,5,4,3], &self.common_name))
+        der_sequence(&rdns)
+    }
+}
+
+fn rdn_attr(oid_parts: &[u32], value: &str) -> [u8] {
+    let attr = der_sequence(&[der_oid(oid_parts), der_encode_tlv(0x0c, value.as_bytes())])
+    der_encode_tlv(0x31, &attr)  // SET
+}
+
+enum Extension {
+    BasicConstraints { ca: bool, path_len: u32? },
+    KeyUsage(u16),
+    SubjectAltName([SanEntry]),
+    AuthorityKeyId([u8; 20]),
+    SubjectKeyId([u8; 20]),
+}
+
+enum SanEntry { DnsName(string), IpAddr([u8; 4]), Email(string) }
+
+const KEY_USAGE_DIGITAL_SIGNATURE: u16 = 0x0080;
+const KEY_USAGE_KEY_CERT_SIGN:     u16 = 0x0004;
+const KEY_USAGE_CRL_SIGN:          u16 = 0x0002;
+
+// ── Certificate Authority ────────────────────────────────────────────────────
+struct CertificateAuthority {
+    ca_cert:     Certificate,
+    ca_key:      ed25519.Keypair,
+    serial:      u64,
+    issued:      [Certificate],
+    revoked:     [(u64, [u8; 20])],   // (time, serial)
+}
+
+struct CertRequest {
+    subject:    DistinguishedName,
+    public_key: [u8; 32],
+    san:        [SanEntry],
+    validity:   Duration,
+}
+
+impl CertificateAuthority {
+    fn new(name: DistinguishedName, validity_years: u32) -> CertificateAuthority {
+        let seed = random_bytes(32).try_into().unwrap()
+        let kp = ed25519.keypair_from_seed(seed)
+        let now = now_secs()
+
+        let serial = random_serial()
+        let ca_cert = Certificate {
+            version: 2, serial_number: serial,
+            signature_algo: "Ed25519".to_string(),
+            issuer: name.clone(), subject: name,
+            not_before: now, not_after: now + validity_years as u64 * 365 * 86400,
+            public_key: kp.public_key,
+            extensions: [
+                Extension.BasicConstraints { ca: true, path_len: some(1) },
+                Extension.KeyUsage(KEY_USAGE_KEY_CERT_SIGN | KEY_USAGE_CRL_SIGN),
+            ],
+            signature: [0; 64], tbs_bytes: [],
+        };
+        // self-sign
+        let tbs = ca_cert.encode_tbs()
+        let sig = ed25519.sign(&kp, &sha256.hash(&tbs))
+
+        CertificateAuthority {
+            ca_cert: Certificate { signature: sig, tbs_bytes: tbs, ..ca_cert },
+            ca_key: kp, serial: 1, issued: [], revoked: [],
+        }
+    }
+
+    fn issue(mut self, req: CertRequest) -> Result<Certificate, string> {
+        if now_secs() > self.ca_cert.not_after { return err("CA certificate expired") }
+
+        self.serial += 1
+        let serial = random_serial()
+        let now = now_secs()
+
+        let cert = Certificate {
+            version: 2, serial_number: serial,
+            signature_algo: "Ed25519".to_string(),
+            issuer: self.ca_cert.subject.clone(),
+            subject: req.subject, not_before: now,
+            not_after: now + req.validity.as_secs(),
+            public_key: req.public_key,
+            extensions: [
+                Extension.BasicConstraints { ca: false, path_len: none },
+                Extension.KeyUsage(KEY_USAGE_DIGITAL_SIGNATURE),
+                Extension.SubjectAltName(req.san),
+            ],
+            signature: [0; 64], tbs_bytes: [],
+        };
+        let tbs = cert.encode_tbs()
+        let sig = ed25519.sign(&self.ca_key, &sha256.hash(&tbs))
+        let issued = Certificate { signature: sig, tbs_bytes: tbs, ..cert }
+        self.issued.push(issued.clone())
+        ok(issued)
+    }
+
+    fn revoke(mut self, serial: [u8; 20]) { self.revoked.push((now_secs(), serial)) }
+
+    fn verify_chain(self, cert: &Certificate) -> Result<(), string> {
+        // Check issuer matches CA subject
+        if cert.issuer.common_name != self.ca_cert.subject.common_name {
+            return err("issuer mismatch")
+        }
+        // Check validity period
+        let now = now_secs()
+        if now < cert.not_before || now > cert.not_after { return err("certificate expired") }
+        // Check not revoked
+        if self.revoked.iter().any(|(_, s)| *s == cert.serial_number) { return err("certificate revoked") }
+        // Verify signature
+        let hash = sha256.hash(&cert.tbs_bytes)
+        if !ed25519.verify(&self.ca_cert.public_key, &hash, &cert.signature) {
+            return err("signature verification failed")
+        }
+        ok(())
+    }
+}
+
+impl Certificate {
+    fn encode_tbs(self) -> [u8] {
+        der_sequence(&[
+            der_encode_tlv(0xa0, &der_integer(&[self.version])),
+            der_integer(&self.serial_number),
+            der_sequence(&[der_oid(&[1,3,101,112]), der_encode_tlv(0x05, &[])]),
+            self.issuer.to_der(),
+            der_sequence(&[encode_time(self.not_before), encode_time(self.not_after)]),
+            self.subject.to_der(),
+            der_sequence(&[
+                der_sequence(&[der_oid(&[1,3,101,112])]),
+                der_encode_tlv(0x03, &[&[0x00], &self.public_key[..]].concat()),
+            ]),
+        ])
+    }
+
+    fn to_pem(self) -> string {
+        let der = der_sequence(&[
+            self.tbs_bytes.clone(),
+            der_sequence(&[der_oid(&[1,3,101,112])]),
+            der_encode_tlv(0x03, &[&[0x00], &self.signature[..]].concat()),
+        ])
+        let b64 = std.encoding.base64.encode(&der)
+        let mut pem = "-----BEGIN CERTIFICATE-----\n".to_string()
+        for chunk in b64.as_bytes().chunks(64) {
+            pem += &string.from_utf8(chunk).unwrap()
+            pem += "\n"
+        }
+        pem += "-----END CERTIFICATE-----\n"
+        pem
+    }
+}
+
+fn encode_time(ts: u64) -> [u8] {
+    let formatted = format_utc_time(ts)
+    der_encode_tlv(0x17, formatted.as_bytes())
+}
+
+fn format_utc_time(ts: u64) -> string { format!("240101000000Z") /* simplified */ }
+
+fn random_serial() -> [u8; 20] { random_bytes(20).try_into().unwrap() }
+
+fn main() {
+    let ca = CertificateAuthority.new(
+        DistinguishedName {
+            country: some("US".to_string()), state: some("California".to_string()),
+            locality: some("San Francisco".to_string()),
+            organization: some("Lateralus Security".to_string()),
+            org_unit: none, common_name: "Lateralus Root CA".to_string(),
+        },
+        10,
+    )
+    print("CA created: ${ca.ca_cert.subject.common_name}")
+    assert(ca.ca_cert.version == 2)
+
+    // Issue a server certificate
+    let server_seed = random_bytes(32).try_into().unwrap()
+    let server_kp = ed25519.keypair_from_seed(server_seed)
+    let server_cert = ca.issue(CertRequest {
+        subject: DistinguishedName {
+            country: none, state: none, locality: none,
+            organization: some("Example Corp".to_string()),
+            org_unit: none, common_name: "example.com".to_string(),
+        },
+        public_key: server_kp.public_key,
+        san: [SanEntry.DnsName("example.com".to_string()), SanEntry.DnsName("www.example.com".to_string())],
+        validity: Duration.from_days(365),
+    }).unwrap()
+    print("Issued: ${server_cert.subject.common_name}")
+
+    // Verify
+    assert(ca.verify_chain(&server_cert).is_ok())
+    print("Certificate chain verified ✓")
+
+    // PEM output
+    let pem = server_cert.to_pem()
+    assert(pem.starts_with("-----BEGIN CERTIFICATE-----"))
+    assert(pem.ends_with("-----END CERTIFICATE-----\n"))
+    print("PEM encoding ✓")
+
+    // Revocation
+    let mut ca = ca
+    ca.revoke(server_cert.serial_number)
+    assert(ca.verify_chain(&server_cert).is_err())
+    print("Revoked certificate rejected ✓")
+
+    print("Certificate authority — all passed ✓")
+}
