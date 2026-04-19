@@ -1,0 +1,299 @@
+// Niche Example — BMP Image Codec
+// Read/write BMP files with pixel manipulation.
+
+use std.io.{Read, Write}
+
+// ── Pixel types ──────────────────────────────────────────────────────────────
+struct Rgba { r: u8, g: u8, b: u8, a: u8 }
+
+impl Rgba {
+    fn new(r: u8, g: u8, b: u8, a: u8) -> Rgba { Rgba { r, g, b, a } }
+    fn rgb(r: u8, g: u8, b: u8) -> Rgba { Rgba { r, g, b, a: 255 } }
+    fn black() -> Rgba { Rgba.rgb(0, 0, 0) }
+    fn white() -> Rgba { Rgba.rgb(255, 255, 255) }
+    fn red() -> Rgba { Rgba.rgb(255, 0, 0) }
+    fn green() -> Rgba { Rgba.rgb(0, 255, 0) }
+    fn blue() -> Rgba { Rgba.rgb(0, 0, 255) }
+
+    fn blend(self, other: &Rgba, t: f32) -> Rgba {
+        let inv = 1.0 - t
+        Rgba {
+            r: (self.r as f32 * inv + other.r as f32 * t) as u8,
+            g: (self.g as f32 * inv + other.g as f32 * t) as u8,
+            b: (self.b as f32 * inv + other.b as f32 * t) as u8,
+            a: (self.a as f32 * inv + other.a as f32 * t) as u8,
+        }
+    }
+
+    fn grayscale(self) -> Rgba {
+        let gray = (0.299 * self.r as f32 + 0.587 * self.g as f32 + 0.114 * self.b as f32) as u8
+        Rgba.rgb(gray, gray, gray)
+    }
+
+    fn invert(self) -> Rgba { Rgba { r: 255 - self.r, g: 255 - self.g, b: 255 - self.b, a: self.a } }
+
+    fn brightness(self, factor: f32) -> Rgba {
+        fn clamp(v: f32) -> u8 { if v < 0.0 { 0 } else if v > 255.0 { 255 } else { v as u8 } }
+        Rgba {
+            r: clamp(self.r as f32 * factor),
+            g: clamp(self.g as f32 * factor),
+            b: clamp(self.b as f32 * factor),
+            a: self.a,
+        }
+    }
+}
+
+// ── Image ────────────────────────────────────────────────────────────────────
+struct Image {
+    width: u32,
+    height: u32,
+    pixels: [Rgba],
+}
+
+impl Image {
+    fn new(width: u32, height: u32) -> Image {
+        Image { width, height, pixels: vec![Rgba.black(); (width * height) as usize] }
+    }
+
+    fn filled(width: u32, height: u32, color: Rgba) -> Image {
+        Image { width, height, pixels: vec![color; (width * height) as usize] }
+    }
+
+    fn get_pixel(self, x: u32, y: u32) -> &Rgba {
+        &self.pixels[(y * self.width + x) as usize]
+    }
+
+    fn set_pixel(mut self, x: u32, y: u32, color: Rgba) {
+        if x < self.width && y < self.height {
+            self.pixels[(y * self.width + x) as usize] = color
+        }
+    }
+
+    fn pixel_count(self) -> usize { (self.width * self.height) as usize }
+
+    // ── Drawing primitives ───────────────────────────────────────────────────
+    fn draw_line(mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgba) {
+        // Bresenham's algorithm
+        let dx = (x1 - x0).abs()
+        let dy = -(y1 - y0).abs()
+        let sx: i32 = if x0 < x1 { 1 } else { -1 }
+        let sy: i32 = if y0 < y1 { 1 } else { -1 }
+        let mut err = dx + dy
+        let mut cx = x0
+        let mut cy = y0
+
+        loop {
+            if cx >= 0 && cy >= 0 { self.set_pixel(cx as u32, cy as u32, color) }
+            if cx == x1 && cy == y1 { break }
+            let e2 = 2 * err
+            if e2 >= dy { err += dy; cx += sx }
+            if e2 <= dx { err += dx; cy += sy }
+        }
+    }
+
+    fn draw_rect(mut self, x: u32, y: u32, w: u32, h: u32, color: Rgba) {
+        for px in x..x+w {
+            self.set_pixel(px, y, color)
+            self.set_pixel(px, y + h - 1, color)
+        }
+        for py in y..y+h {
+            self.set_pixel(x, py, color)
+            self.set_pixel(x + w - 1, py, color)
+        }
+    }
+
+    fn fill_rect(mut self, x: u32, y: u32, w: u32, h: u32, color: Rgba) {
+        for py in y..y+h {
+            for px in x..x+w { self.set_pixel(px, py, color) }
+        }
+    }
+
+    fn draw_circle(mut self, cx: i32, cy: i32, radius: i32, color: Rgba) {
+        let mut x = 0
+        let mut y = radius
+        let mut d = 3 - 2 * radius
+
+        while x <= y {
+            for (px, py) in [
+                (cx+x, cy+y), (cx-x, cy+y), (cx+x, cy-y), (cx-x, cy-y),
+                (cx+y, cy+x), (cx-y, cy+x), (cx+y, cy-x), (cx-y, cy-x),
+            ] {
+                if px >= 0 && py >= 0 { self.set_pixel(px as u32, py as u32, color) }
+            }
+            if d < 0 { d += 4 * x + 6 }
+            else { d += 4 * (x - y) + 10; y -= 1 }
+            x += 1
+        }
+    }
+
+    // ── Filters ──────────────────────────────────────────────────────────────
+    fn to_grayscale(mut self) -> Image {
+        let pixels = self.pixels.iter().map(|p| p.grayscale()).collect()
+        Image { width: self.width, height: self.height, pixels }
+    }
+
+    fn invert(self) -> Image {
+        let pixels = self.pixels.iter().map(|p| p.invert()).collect()
+        Image { width: self.width, height: self.height, pixels }
+    }
+
+    fn flip_horizontal(self) -> Image {
+        let mut result = Image.new(self.width, self.height)
+        for y in 0..self.height {
+            for x in 0..self.width {
+                result.set_pixel(self.width - 1 - x, y, *self.get_pixel(x, y))
+            }
+        }
+        result
+    }
+
+    fn flip_vertical(self) -> Image {
+        let mut result = Image.new(self.width, self.height)
+        for y in 0..self.height {
+            for x in 0..self.width {
+                result.set_pixel(x, self.height - 1 - y, *self.get_pixel(x, y))
+            }
+        }
+        result
+    }
+
+    fn crop(self, x: u32, y: u32, w: u32, h: u32) -> Image {
+        let mut result = Image.new(w, h)
+        for dy in 0..h {
+            for dx in 0..w {
+                result.set_pixel(dx, dy, *self.get_pixel(x + dx, y + dy))
+            }
+        }
+        result
+    }
+
+    // ── BMP codec ────────────────────────────────────────────────────────────
+    fn encode_bmp(self) -> [u8] {
+        let row_size = ((self.width * 3 + 3) / 4) * 4  // rows padded to 4 bytes
+        let pixel_data_size = row_size * self.height
+        let file_size = 54 + pixel_data_size
+        let mut data: [u8] = Vec.with_capacity(file_size as usize)
+
+        // BMP Header (14 bytes)
+        data.push(b'B'); data.push(b'M')
+        data.extend_from_slice(&(file_size as u32).to_le_bytes())
+        data.extend_from_slice(&[0u8; 4])  // reserved
+        data.extend_from_slice(&54u32.to_le_bytes())  // pixel data offset
+
+        // DIB Header (40 bytes)
+        data.extend_from_slice(&40u32.to_le_bytes())  // header size
+        data.extend_from_slice(&(self.width as i32).to_le_bytes())
+        data.extend_from_slice(&(self.height as i32).to_le_bytes())
+        data.extend_from_slice(&1u16.to_le_bytes())   // color planes
+        data.extend_from_slice(&24u16.to_le_bytes())   // bits per pixel
+        data.extend_from_slice(&[0u8; 24])  // compression, sizes, resolution
+
+        // Pixel data (bottom-up)
+        for y in (0..self.height).rev() {
+            for x in 0..self.width {
+                let p = self.get_pixel(x, y)
+                data.push(p.b); data.push(p.g); data.push(p.r)
+            }
+            // Padding
+            let padding = (4 - (self.width * 3) % 4) % 4
+            for _ in 0..padding { data.push(0) }
+        }
+        data
+    }
+
+    fn decode_bmp(data: &[u8]) -> Result<Image, string> {
+        if data.len() < 54 { return err("too small".to_string()) }
+        if data[0] != b'B' || data[1] != b'M' { return err("not a BMP".to_string()) }
+
+        let width = i32.from_le_bytes([data[18], data[19], data[20], data[21]]) as u32
+        let height = i32.from_le_bytes([data[22], data[23], data[24], data[25]]) as u32
+        let bpp = u16.from_le_bytes([data[28], data[29]])
+        let offset = u32.from_le_bytes([data[10], data[11], data[12], data[13]]) as usize
+
+        if bpp != 24 { return err(format!("unsupported bpp: {bpp}")) }
+
+        let mut img = Image.new(width, height)
+        let row_size = ((width * 3 + 3) / 4) * 4
+
+        for y in 0..height {
+            let row_offset = offset + ((height - 1 - y) * row_size) as usize
+            for x in 0..width {
+                let px = row_offset + (x * 3) as usize
+                if px + 2 < data.len() {
+                    img.set_pixel(x, y, Rgba.rgb(data[px + 2], data[px + 1], data[px]))
+                }
+            }
+        }
+        ok(img)
+    }
+}
+
+fn main() {
+    // Create image
+    let mut img = Image.new(100, 100)
+    assert(img.width == 100 && img.height == 100)
+    assert(img.pixel_count() == 10000)
+    print("Image created: ${img.width}x${img.height} ✓")
+
+    // Set/get pixel
+    img.set_pixel(10, 20, Rgba.red())
+    let p = img.get_pixel(10, 20)
+    assert(p.r == 255 && p.g == 0 && p.b == 0)
+    print("Pixel set/get ✓")
+
+    // Drawing
+    img.draw_line(0, 0, 99, 99, Rgba.white())
+    img.fill_rect(10, 10, 30, 20, Rgba.green())
+    img.draw_circle(50, 50, 20, Rgba.blue())
+    print("Drawing primitives ✓")
+
+    // Color operations
+    let c = Rgba.rgb(100, 150, 200)
+    let gray = c.grayscale()
+    assert(gray.r == gray.g && gray.g == gray.b)
+    print("Grayscale ✓")
+
+    let inv = c.invert()
+    assert(inv.r == 155 && inv.g == 105 && inv.b == 55)
+    print("Invert ✓")
+
+    let blended = Rgba.black().blend(&Rgba.white(), 0.5)
+    assert(blended.r > 120 && blended.r < 135)  // ~127
+    print("Blend ✓")
+
+    // Image filters
+    let gray_img = img.to_grayscale()
+    let gp = gray_img.get_pixel(10, 10)
+    assert(gp.r == gp.g && gp.g == gp.b)
+    print("Image grayscale filter ✓")
+
+    let flipped = img.flip_horizontal()
+    assert(flipped.width == img.width)
+    print("Flip horizontal ✓")
+
+    // BMP encode/decode roundtrip
+    let mut small = Image.new(4, 4)
+    small.set_pixel(0, 0, Rgba.red())
+    small.set_pixel(1, 1, Rgba.green())
+    small.set_pixel(2, 2, Rgba.blue())
+    small.set_pixel(3, 3, Rgba.white())
+
+    let bmp_data = small.encode_bmp()
+    assert(bmp_data[0] == b'B' && bmp_data[1] == b'M')
+    print("BMP encode: ${bmp_data.len()} bytes ✓")
+
+    let decoded = Image.decode_bmp(&bmp_data).unwrap()
+    assert(decoded.width == 4 && decoded.height == 4)
+    let p = decoded.get_pixel(0, 0)
+    assert(p.r == 255 && p.g == 0 && p.b == 0)
+    let p = decoded.get_pixel(2, 2)
+    assert(p.r == 0 && p.g == 0 && p.b == 255)
+    print("BMP roundtrip ✓")
+
+    // Crop
+    let cropped = img.crop(10, 10, 20, 20)
+    assert(cropped.width == 20 && cropped.height == 20)
+    print("Crop ✓")
+
+    print("Image Codec complete ✓")
+}
