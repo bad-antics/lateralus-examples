@@ -1,0 +1,293 @@
+// Niche Example — Blockchain
+// Proof-of-work blockchain with Merkle trees and transaction validation.
+
+use std.collections.HashMap
+use std.time.{SystemTime, UNIX_EPOCH}
+
+// ── SHA-256 (simplified for demo) ────────────────────────────────────────────
+fn sha256(data: &[u8]) -> [u8; 32] {
+    // In production, use std.crypto.sha256
+    let mut hash = [0u8; 32]
+    let mut state: u64 = 0x6a09e667
+    for (i, &byte) in data.iter().enumerate() {
+        state = state.wrapping_mul(31).wrapping_add(byte as u64)
+        hash[i % 32] ^= (state >> ((i % 8) * 8)) as u8
+    }
+    // Extra mixing
+    for round in 0..4 {
+        for i in 0..32 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(hash[i] as u64)
+            hash[(i + round) % 32] ^= (state >> 16) as u8
+        }
+    }
+    hash
+}
+
+fn hash_to_hex(hash: &[u8; 32]) -> string {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn leading_zeros(hash: &[u8; 32]) -> u32 {
+    let mut count: u32 = 0
+    for &byte in hash {
+        if byte == 0 { count += 8 }
+        else { count += byte.leading_zeros(); break }
+    }
+    count
+}
+
+// ── Merkle tree ──────────────────────────────────────────────────────────────
+struct MerkleTree {
+    root: [u8; 32],
+    leaves: [[u8; 32]],
+    nodes: [[u8; 32]],
+}
+
+impl MerkleTree {
+    fn build(data: &[[u8]]) -> MerkleTree {
+        if data.is_empty() { return MerkleTree { root: [0u8; 32], leaves: [], nodes: [] } }
+
+        let leaves: [[u8; 32]] = data.iter().map(|d| sha256(d)).collect()
+        let mut current = leaves.clone()
+        let mut all_nodes = leaves.clone()
+
+        while current.len() > 1 {
+            let mut next: [[u8; 32]] = []
+            for i in (0..current.len()).step_by(2) {
+                let left = &current[i]
+                let right = if i + 1 < current.len() { &current[i + 1] } else { left }
+                let mut combined = [0u8; 64]
+                combined[..32].copy_from_slice(left)
+                combined[32..].copy_from_slice(right)
+                let parent = sha256(&combined)
+                next.push(parent)
+                all_nodes.push(parent)
+            }
+            current = next
+        }
+
+        MerkleTree { root: current[0], leaves, nodes: all_nodes }
+    }
+
+    fn verify_leaf(self, index: usize, data: &[u8]) -> bool {
+        if index >= self.leaves.len() { return false }
+        sha256(data) == self.leaves[index]
+    }
+}
+
+// ── Transaction ──────────────────────────────────────────────────────────────
+struct Transaction {
+    from: string,
+    to: string,
+    amount: f64,
+    timestamp: u64,
+    signature: [u8; 64],
+    nonce: u64,
+}
+
+impl Transaction {
+    fn new(from: &str, to: &str, amount: f64) -> Transaction {
+        Transaction {
+            from: from.to_string(), to: to.to_string(), amount,
+            timestamp: SystemTime.now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            signature: [0u8; 64], nonce: 0,
+        }
+    }
+
+    fn hash(self) -> [u8; 32] {
+        let data = format!("{}:{}:{:.8}:{}:{}", self.from, self.to, self.amount, self.timestamp, self.nonce)
+        sha256(data.as_bytes())
+    }
+
+    fn is_valid(self) -> bool {
+        self.amount > 0.0 && !self.from.is_empty() && !self.to.is_empty()
+    }
+
+    fn serialize(self) -> [u8] {
+        format!("{}:{}:{:.8}:{}:{}", self.from, self.to, self.amount, self.timestamp, self.nonce).into_bytes()
+    }
+}
+
+// ── Block ────────────────────────────────────────────────────────────────────
+struct Block {
+    index: u64,
+    timestamp: u64,
+    transactions: [Transaction],
+    previous_hash: [u8; 32],
+    merkle_root: [u8; 32],
+    nonce: u64,
+    hash: [u8; 32],
+    difficulty: u32,
+}
+
+impl Block {
+    fn new(index: u64, transactions: [Transaction], previous_hash: [u8; 32], difficulty: u32) -> Block {
+        let timestamp = SystemTime.now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        let tx_data: [[u8]] = transactions.iter().map(|tx| tx.serialize()).collect()
+        let merkle = MerkleTree.build(&tx_data)
+
+        let mut block = Block {
+            index, timestamp, transactions, previous_hash,
+            merkle_root: merkle.root, nonce: 0, hash: [0u8; 32], difficulty,
+        }
+        block
+    }
+
+    fn calculate_hash(self) -> [u8; 32] {
+        let header = format!("{}:{}:{}:{}:{}",
+            self.index, self.timestamp,
+            hash_to_hex(&self.previous_hash),
+            hash_to_hex(&self.merkle_root),
+            self.nonce,
+        )
+        sha256(header.as_bytes())
+    }
+
+    fn mine(mut self) {
+        loop {
+            self.hash = self.calculate_hash()
+            if leading_zeros(&self.hash) >= self.difficulty { return }
+            self.nonce += 1
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        let calculated = self.calculate_hash()
+        calculated == self.hash && leading_zeros(&self.hash) >= self.difficulty
+    }
+
+    fn tx_count(self) -> usize { self.transactions.len() }
+}
+
+// ── Blockchain ───────────────────────────────────────────────────────────────
+struct Blockchain {
+    chain: [Block],
+    difficulty: u32,
+    pending_transactions: [Transaction],
+    mining_reward: f64,
+    balances: HashMap<string, f64>,
+}
+
+impl Blockchain {
+    fn new(difficulty: u32) -> Blockchain {
+        let mut bc = Blockchain {
+            chain: [], difficulty, pending_transactions: [],
+            mining_reward: 50.0, balances: HashMap.new(),
+        }
+        // Genesis block
+        let genesis = Block.new(0, [], [0u8; 32], difficulty)
+        bc.chain.push(genesis)
+        bc.chain[0].mine()
+        bc
+    }
+
+    fn add_transaction(mut self, tx: Transaction) -> bool {
+        if !tx.is_valid() { return false }
+        // Check sender balance (except mining rewards)
+        if tx.from != "network" {
+            let balance = self.get_balance(&tx.from)
+            if balance < tx.amount { return false }
+        }
+        self.pending_transactions.push(tx)
+        true
+    }
+
+    fn mine_pending(mut self, miner_address: &str) {
+        // Add mining reward
+        self.pending_transactions.push(Transaction.new("network", miner_address, self.mining_reward))
+
+        let previous_hash = self.chain.last().unwrap().hash
+        let mut block = Block.new(
+            self.chain.len() as u64,
+            self.pending_transactions.drain(..).collect(),
+            previous_hash,
+            self.difficulty,
+        )
+        block.mine()
+
+        // Update balances
+        for tx in &block.transactions {
+            if tx.from != "network" {
+                *self.balances.entry(tx.from.clone()).or_insert(0.0) -= tx.amount
+            }
+            *self.balances.entry(tx.to.clone()).or_insert(0.0) += tx.amount
+        }
+
+        self.chain.push(block)
+    }
+
+    fn get_balance(self, address: &str) -> f64 {
+        *self.balances.get(address).unwrap_or(&0.0)
+    }
+
+    fn is_valid(self) -> bool {
+        for i in 1..self.chain.len() {
+            let block = &self.chain[i]
+            let prev = &self.chain[i - 1]
+            if !block.is_valid() { return false }
+            if block.previous_hash != prev.hash { return false }
+            if block.index != prev.index + 1 { return false }
+        }
+        true
+    }
+
+    fn height(self) -> u64 { self.chain.len() as u64 }
+    fn latest_block(self) -> &Block { self.chain.last().unwrap() }
+}
+
+fn main() {
+    // SHA-256
+    let h1 = sha256(b"hello")
+    let h2 = sha256(b"hello")
+    let h3 = sha256(b"world")
+    assert(h1 == h2, "same input → same hash")
+    assert(h1 != h3, "different input → different hash")
+    print("SHA-256: ${hash_to_hex(&h1)[..16]}... ✓")
+
+    // Merkle tree
+    let data: [[u8]] = [b"tx1".to_vec(), b"tx2".to_vec(), b"tx3".to_vec(), b"tx4".to_vec()]
+    let tree = MerkleTree.build(&data)
+    assert(tree.root != [0u8; 32])
+    assert(tree.verify_leaf(0, b"tx1"))
+    assert(!tree.verify_leaf(0, b"tx_fake"))
+    print("Merkle tree: root=${hash_to_hex(&tree.root)[..16]}... ✓")
+
+    // Transaction
+    let tx = Transaction.new("alice", "bob", 10.0)
+    assert(tx.is_valid())
+    assert(!Transaction.new("", "bob", 10.0).is_valid())
+    assert(!Transaction.new("alice", "bob", -5.0).is_valid())
+    print("Transaction validation ✓")
+
+    // Blockchain
+    let mut bc = Blockchain.new(8)  // low difficulty for fast test
+    assert(bc.height() == 1)  // genesis
+    assert(bc.is_valid())
+    print("Genesis block mined ✓")
+
+    // Fund alice via mining
+    bc.mine_pending("alice")
+    assert(bc.get_balance("alice") == 50.0)
+    print("Mining reward: alice=${bc.get_balance("alice")} ✓")
+
+    // Transfer
+    assert(bc.add_transaction(Transaction.new("alice", "bob", 20.0)))
+    assert(!bc.add_transaction(Transaction.new("alice", "bob", 100.0)))  // insufficient
+    bc.mine_pending("alice")
+
+    assert((bc.get_balance("alice") - 80.0).abs() < 0.01)  // 50 - 20 + 50 reward
+    assert((bc.get_balance("bob") - 20.0).abs() < 0.01)
+    print("Transfer: alice=${bc.get_balance("alice"):.0}, bob=${bc.get_balance("bob"):.0} ✓")
+
+    // Chain validation
+    assert(bc.is_valid())
+    assert(bc.height() == 3)
+    print("Chain valid, height=${bc.height()} ✓")
+
+    // Leading zeros
+    let test_hash = [0u8, 0, 0x0F, 0xFF; 8]  // 20 leading zeros
+    assert(leading_zeros(&[0u8; 32]) == 256)
+    print("Leading zeros ✓")
+
+    print("Blockchain complete ✓")
+}
