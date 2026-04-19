@@ -1,0 +1,409 @@
+// Niche Example - Markdown Renderer
+// Parses Markdown to AST and renders to HTML.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+enum MdNode {
+    Document([MdNode]),
+    Heading(u8, [MdNode]),           // level 1-6, inline content
+    Paragraph([MdNode]),
+    BlockQuote([MdNode]),
+    CodeBlock(Option<string>, string), // language, code
+    UnorderedList([MdNode]),
+    OrderedList([MdNode]),
+    ListItem([MdNode]),
+    ThematicBreak,
+    // Inline
+    Text(string),
+    Bold([MdNode]),
+    Italic([MdNode]),
+    Code(string),
+    Link(string, string, Option<string>),   // text, url, title
+    Image(string, string, Option<string>),  // alt, src, title
+    LineBreak,
+}
+
+struct MarkdownParser {
+    input: string,
+    pos: usize,
+}
+
+impl MarkdownParser {
+    fn new(input: &str) -> MarkdownParser {
+        MarkdownParser { input: input.to_string(), pos: 0 }
+    }
+
+    fn parse(mut self) -> MdNode {
+        let lines: [string] = self.input.lines().map(|l| l.to_string()).collect()
+        let blocks = self.parse_blocks(&lines)
+        MdNode.Document(blocks)
+    }
+
+    fn parse_blocks(mut self, lines: &[string]) -> [MdNode] {
+        let mut blocks: [MdNode] = []
+        let mut i = 0
+
+        while i < lines.len() {
+            let line = &lines[i]
+            let trimmed = line.trim()
+
+            if trimmed.is_empty() {
+                i += 1
+                continue
+            }
+
+            // Heading
+            if trimmed.starts_with('#') {
+                let level = trimmed.chars().take_while(|c| *c == '#').count() as u8
+                if level <= 6 && trimmed.len() > level as usize {
+                    let text = trimmed[level as usize..].trim()
+                    blocks.push(MdNode.Heading(level, self.parse_inline(text)))
+                    i += 1
+                    continue
+                }
+            }
+
+            // Thematic break
+            if trimmed.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
+                && trimmed.chars().filter(|c| *c != ' ').count() >= 3 {
+                blocks.push(MdNode.ThematicBreak)
+                i += 1
+                continue
+            }
+
+            // Code block
+            if trimmed.starts_with("```") {
+                let lang = trimmed[3..].trim()
+                let language = if lang.is_empty() { none } else { some(lang.to_string()) }
+                let mut code = string.new()
+                i += 1
+                while i < lines.len() && !lines[i].trim().starts_with("```") {
+                    if !code.is_empty() { code.push('\n') }
+                    code.push_str(&lines[i])
+                    i += 1
+                }
+                i += 1  // skip closing ```
+                blocks.push(MdNode.CodeBlock(language, code))
+                continue
+            }
+
+            // Block quote
+            if trimmed.starts_with('>') {
+                let mut quote_lines: [string] = []
+                while i < lines.len() && (lines[i].trim().starts_with('>') || !lines[i].trim().is_empty()) {
+                    let ql = lines[i].trim()
+                    let content = if ql.starts_with("> ") { &ql[2..] }
+                                  else if ql.starts_with(">") { &ql[1..] }
+                                  else { break }
+                    quote_lines.push(content.to_string())
+                    i += 1
+                }
+                let inner = self.parse_blocks(&quote_lines)
+                blocks.push(MdNode.BlockQuote(inner))
+                continue
+            }
+
+            // Unordered list
+            if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+                let mut items: [MdNode] = []
+                while i < lines.len() {
+                    let lt = lines[i].trim()
+                    if lt.starts_with("- ") || lt.starts_with("* ") || lt.starts_with("+ ") {
+                        let content = &lt[2..]
+                        items.push(MdNode.ListItem(self.parse_inline(content)))
+                        i += 1
+                    } else { break }
+                }
+                blocks.push(MdNode.UnorderedList(items))
+                continue
+            }
+
+            // Ordered list
+            if trimmed.len() > 2 && trimmed[..1].chars().all(|c| c.is_ascii_digit()) {
+                if let some(dot_pos) = trimmed.find(". ") {
+                    if trimmed[..dot_pos].chars().all(|c| c.is_ascii_digit()) {
+                        let mut items: [MdNode] = []
+                        while i < lines.len() {
+                            let lt = lines[i].trim()
+                            if let some(dp) = lt.find(". ") {
+                                if lt[..dp].chars().all(|c| c.is_ascii_digit()) {
+                                    items.push(MdNode.ListItem(self.parse_inline(&lt[dp + 2..])))
+                                    i += 1
+                                    continue
+                                }
+                            }
+                            break
+                        }
+                        blocks.push(MdNode.OrderedList(items))
+                        continue
+                    }
+                }
+            }
+
+            // Paragraph (collect consecutive non-empty lines)
+            let mut para_text = string.new()
+            while i < lines.len() && !lines[i].trim().is_empty() {
+                if !para_text.is_empty() { para_text.push(' ') }
+                para_text.push_str(lines[i].trim())
+                i += 1
+            }
+            blocks.push(MdNode.Paragraph(self.parse_inline(&para_text)))
+        }
+        blocks
+    }
+
+    fn parse_inline(self, text: &str) -> [MdNode] {
+        let mut nodes: [MdNode] = []
+        let mut buf = string.new()
+        let chars: [char] = text.chars().collect()
+        let mut i = 0
+
+        while i < chars.len() {
+            // Bold **text**
+            if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
+                if !buf.is_empty() { nodes.push(MdNode.Text(buf.clone())); buf.clear() }
+                i += 2
+                let mut inner = string.new()
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '*') {
+                    inner.push(chars[i]); i += 1
+                }
+                if i + 1 < chars.len() { i += 2 }
+                nodes.push(MdNode.Bold(vec![MdNode.Text(inner)]))
+                continue
+            }
+
+            // Italic *text*
+            if chars[i] == '*' && (i + 1 >= chars.len() || chars[i + 1] != '*') {
+                if !buf.is_empty() { nodes.push(MdNode.Text(buf.clone())); buf.clear() }
+                i += 1
+                let mut inner = string.new()
+                while i < chars.len() && chars[i] != '*' { inner.push(chars[i]); i += 1 }
+                if i < chars.len() { i += 1 }
+                nodes.push(MdNode.Italic(vec![MdNode.Text(inner)]))
+                continue
+            }
+
+            // Inline code `code`
+            if chars[i] == '`' {
+                if !buf.is_empty() { nodes.push(MdNode.Text(buf.clone())); buf.clear() }
+                i += 1
+                let mut code = string.new()
+                while i < chars.len() && chars[i] != '`' { code.push(chars[i]); i += 1 }
+                if i < chars.len() { i += 1 }
+                nodes.push(MdNode.Code(code))
+                continue
+            }
+
+            // Link [text](url)
+            if chars[i] == '[' {
+                if !buf.is_empty() { nodes.push(MdNode.Text(buf.clone())); buf.clear() }
+                i += 1
+                let mut link_text = string.new()
+                while i < chars.len() && chars[i] != ']' { link_text.push(chars[i]); i += 1 }
+                if i < chars.len() { i += 1 }  // ]
+                if i < chars.len() && chars[i] == '(' {
+                    i += 1
+                    let mut url = string.new()
+                    while i < chars.len() && chars[i] != ')' { url.push(chars[i]); i += 1 }
+                    if i < chars.len() { i += 1 }
+                    nodes.push(MdNode.Link(link_text, url, none))
+                } else {
+                    nodes.push(MdNode.Text(format!("[{}]", link_text)))
+                }
+                continue
+            }
+
+            // Image ![alt](src)
+            if chars[i] == '!' && i + 1 < chars.len() && chars[i + 1] == '[' {
+                if !buf.is_empty() { nodes.push(MdNode.Text(buf.clone())); buf.clear() }
+                i += 2
+                let mut alt = string.new()
+                while i < chars.len() && chars[i] != ']' { alt.push(chars[i]); i += 1 }
+                if i < chars.len() { i += 1 }
+                if i < chars.len() && chars[i] == '(' {
+                    i += 1
+                    let mut src = string.new()
+                    while i < chars.len() && chars[i] != ')' { src.push(chars[i]); i += 1 }
+                    if i < chars.len() { i += 1 }
+                    nodes.push(MdNode.Image(alt, src, none))
+                }
+                continue
+            }
+
+            buf.push(chars[i])
+            i += 1
+        }
+
+        if !buf.is_empty() { nodes.push(MdNode.Text(buf)) }
+        nodes
+    }
+}
+
+struct HtmlRenderer;
+
+impl HtmlRenderer {
+    fn render(node: &MdNode) -> string {
+        match node {
+            MdNode.Document(children) => {
+                children.iter().map(|c| Self.render(c)).collect::<[string]>().join("\n")
+            },
+            MdNode.Heading(level, inlines) => {
+                let inner = Self.render_inlines(inlines)
+                format!("<h{level}>{inner}</h{level}>")
+            },
+            MdNode.Paragraph(inlines) => {
+                format!("<p>{}</p>", Self.render_inlines(inlines))
+            },
+            MdNode.BlockQuote(children) => {
+                let inner = children.iter().map(|c| Self.render(c)).collect::<[string]>().join("\n")
+                format!("<blockquote>\n{}\n</blockquote>", inner)
+            },
+            MdNode.CodeBlock(lang, code) => {
+                let class = match lang { some(l) => format!(" class=\"language-{}\"", l), none => "".to_string() }
+                format!("<pre><code{}>{}</code></pre>", class, html_escape(code))
+            },
+            MdNode.UnorderedList(items) => {
+                let inner = items.iter().map(|i| Self.render(i)).collect::<[string]>().join("\n")
+                format!("<ul>\n{}\n</ul>", inner)
+            },
+            MdNode.OrderedList(items) => {
+                let inner = items.iter().map(|i| Self.render(i)).collect::<[string]>().join("\n")
+                format!("<ol>\n{}\n</ol>", inner)
+            },
+            MdNode.ListItem(inlines) => {
+                format!("<li>{}</li>", Self.render_inlines(inlines))
+            },
+            MdNode.ThematicBreak => "<hr>".to_string(),
+            _ => Self.render_inline(node),
+        }
+    }
+
+    fn render_inlines(nodes: &[MdNode]) -> string {
+        nodes.iter().map(|n| Self.render_inline(n)).collect::<[string]>().join("")
+    }
+
+    fn render_inline(node: &MdNode) -> string {
+        match node {
+            MdNode.Text(s) => html_escape(s),
+            MdNode.Bold(children) => format!("<strong>{}</strong>", Self.render_inlines(children)),
+            MdNode.Italic(children) => format!("<em>{}</em>", Self.render_inlines(children)),
+            MdNode.Code(code) => format!("<code>{}</code>", html_escape(code)),
+            MdNode.Link(text, url, _) => format!("<a href=\"{}\">{}</a>", html_escape(url), html_escape(text)),
+            MdNode.Image(alt, src, _) => format!("<img src=\"{}\" alt=\"{}\">", html_escape(src), html_escape(alt)),
+            MdNode.LineBreak => "<br>".to_string(),
+            _ => "".to_string(),
+        }
+    }
+}
+
+fn html_escape(s: &str) -> string {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+     .replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+fn main() {
+    // Parse heading
+    let parser = MarkdownParser.new("# Hello World")
+    let doc = parser.parse()
+    match &doc {
+        MdNode.Document(blocks) => {
+            assert(blocks.len() == 1)
+            match &blocks[0] {
+                MdNode.Heading(1, _) => {},
+                _ => panic!("expected h1"),
+            }
+        },
+        _ => panic!("expected document"),
+    }
+    print("Parse heading ✓")
+
+    // Render heading
+    let html = HtmlRenderer.render(&doc)
+    assert(html.contains("<h1>Hello World</h1>"))
+    print("Render heading ✓")
+
+    // Bold and italic
+    let p2 = MarkdownParser.new("This is **bold** and *italic*")
+    let doc2 = p2.parse()
+    let html2 = HtmlRenderer.render(&doc2)
+    assert(html2.contains("<strong>bold</strong>"))
+    assert(html2.contains("<em>italic</em>"))
+    print("Bold/italic ✓")
+
+    // Code block
+    let p3 = MarkdownParser.new("```rust\nfn main() {}\n```")
+    let doc3 = p3.parse()
+    let html3 = HtmlRenderer.render(&doc3)
+    assert(html3.contains("language-rust"))
+    assert(html3.contains("fn main()"))
+    print("Code block ✓")
+
+    // Link
+    let p4 = MarkdownParser.new("[Click](https://example.com)")
+    let doc4 = p4.parse()
+    let html4 = HtmlRenderer.render(&doc4)
+    assert(html4.contains("<a href=\"https://example.com\">Click</a>"))
+    print("Link ✓")
+
+    // Image
+    let p5 = MarkdownParser.new("![Alt text](image.png)")
+    let doc5 = p5.parse()
+    let html5 = HtmlRenderer.render(&doc5)
+    assert(html5.contains("<img src=\"image.png\" alt=\"Alt text\">"))
+    print("Image ✓")
+
+    // Unordered list
+    let p6 = MarkdownParser.new("- Item 1\n- Item 2\n- Item 3")
+    let doc6 = p6.parse()
+    let html6 = HtmlRenderer.render(&doc6)
+    assert(html6.contains("<ul>"))
+    assert(html6.contains("<li>Item 1</li>"))
+    assert(html6.contains("<li>Item 3</li>"))
+    print("Unordered list ✓")
+
+    // Ordered list
+    let p7 = MarkdownParser.new("1. First\n2. Second")
+    let doc7 = p7.parse()
+    let html7 = HtmlRenderer.render(&doc7)
+    assert(html7.contains("<ol>"))
+    assert(html7.contains("<li>First</li>"))
+    print("Ordered list ✓")
+
+    // Block quote
+    let p8 = MarkdownParser.new("> This is a quote")
+    let doc8 = p8.parse()
+    let html8 = HtmlRenderer.render(&doc8)
+    assert(html8.contains("<blockquote>"))
+    print("Block quote ✓")
+
+    // Thematic break
+    let p9 = MarkdownParser.new("---")
+    let doc9 = p9.parse()
+    let html9 = HtmlRenderer.render(&doc9)
+    assert(html9.contains("<hr>"))
+    print("Thematic break ✓")
+
+    // Inline code
+    let p10 = MarkdownParser.new("Use `println!` to print")
+    let doc10 = p10.parse()
+    let html10 = HtmlRenderer.render(&doc10)
+    assert(html10.contains("<code>println!</code>"))
+    print("Inline code ✓")
+
+    // HTML escaping
+    assert(html_escape("<script>") == "&lt;script&gt;")
+    assert(html_escape("a & b") == "a &amp; b")
+    print("HTML escape ✓")
+
+    // Multiple headings
+    let p11 = MarkdownParser.new("## H2\n### H3\n#### H4")
+    let doc11 = p11.parse()
+    let html11 = HtmlRenderer.render(&doc11)
+    assert(html11.contains("<h2>"))
+    assert(html11.contains("<h3>"))
+    assert(html11.contains("<h4>"))
+    print("Multiple headings ✓")
+
+    print("Markdown Renderer complete ✓")
+}
