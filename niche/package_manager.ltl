@@ -1,330 +1,335 @@
-// Niche Example — Package Manager
-// Dependency resolution (SAT-based), semantic versioning, lockfile, registry.
+// Niche Example - Package Manager
+// Dependency resolution, version comparison, package registry, and installation.
 
-use std.collections.{HashMap, HashSet, BTreeMap}
-use std.io.{Read, Write}
+use std.collections.{HashMap, HashSet}
 
-// ── Semantic Versioning ──────────────────────────────────────────────────────
-struct SemVer {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Version {
     major: u32,
     minor: u32,
     patch: u32,
     pre: Option<string>,
-    build: Option<string>,
 }
 
-impl SemVer {
-    fn parse(s: &str) -> Result<SemVer, string> {
-        let (version_str, build) = if let some(plus) = s.find('+') {
-            (&s[..plus], some(s[plus+1..].to_string()))
-        } else { (s, none) }
+impl Version {
+    fn new(major: u32, minor: u32, patch: u32) -> Version {
+        Version { major, minor, patch, pre: none }
+    }
 
-        let (version_str, pre) = if let some(dash) = version_str.find('-') {
-            (&version_str[..dash], some(version_str[dash+1..].to_string()))
-        } else { (version_str, none) }
+    fn parse(s: &str) -> Option<Version> {
+        let (main, pre) = if let some(idx) = s.find('-') {
+            (&s[..idx], some(s[idx + 1..].to_string()))
+        } else {
+            (s, none)
+        };
 
-        let parts: [&str] = version_str.split('.').collect()
-        if parts.len() != 3 { return err(format!("invalid semver: {s}")) }
-
-        let major = parts[0].parse::<u32>().map_err(|_| format!("invalid major: {}", parts[0]))?
-        let minor = parts[1].parse::<u32>().map_err(|_| format!("invalid minor: {}", parts[1]))?
-        let patch = parts[2].parse::<u32>().map_err(|_| format!("invalid patch: {}", parts[2]))?
-
-        ok(SemVer { major, minor, patch, pre, build })
+        let parts: [&str] = main.split('.').collect()
+        if parts.len() != 3 { return none }
+        let major = parts[0].parse::<u32>().ok()?
+        let minor = parts[1].parse::<u32>().ok()?
+        let patch = parts[2].parse::<u32>().ok()?
+        some(Version { major, minor, patch, pre })
     }
 
     fn to_string(self) -> string {
-        let mut s = format!("{}.{}.{}", self.major, self.minor, self.patch)
-        if let some(ref pre) = self.pre { s.push_str(&format!("-{pre}")) }
-        if let some(ref build) = self.build { s.push_str(&format!("+{build}")) }
-        s
+        let base = format!("{}.{}.{}", self.major, self.minor, self.patch)
+        match &self.pre {
+            some(p) => format!("{}-{}", base, p),
+            none => base,
+        }
     }
 
-    fn is_compatible(self, other: &SemVer) -> bool {
-        if self.major != other.major { return false }
-        if self.major == 0 { return self.minor == other.minor && self.patch <= other.patch }
-        true
+    fn is_compatible(self, other: &Version) -> bool {
+        if self.major == 0 && other.major == 0 {
+            self.minor == other.minor
+        } else {
+            self.major == other.major
+        }
     }
 
     fn satisfies(self, req: &VersionReq) -> bool {
-        match req {
-            VersionReq.Exact(v) => self == v,
-            VersionReq.Caret(v) => self.is_compatible(v) && self >= v,
-            VersionReq.Tilde(v) => self.major == v.major && self.minor == v.minor && self.patch >= v.patch,
-            VersionReq.Gte(v) => self >= v,
-            VersionReq.Lt(v) => self < v,
-            VersionReq.Range(min, max) => self >= min && self < max,
-            VersionReq.Any => true,
+        match req.op {
+            ReqOp.Exact => self == &req.version,
+            ReqOp.Gte => self >= &req.version,
+            ReqOp.Lte => self <= &req.version,
+            ReqOp.Gt => self > &req.version,
+            ReqOp.Lt => self < &req.version,
+            ReqOp.Caret => self.is_compatible(&req.version) && self >= &req.version,
+            ReqOp.Tilde => self.major == req.version.major
+                && self.minor == req.version.minor
+                && self.patch >= req.version.patch,
+            ReqOp.Wildcard => true,
         }
     }
 }
 
-impl PartialEq for SemVer {
-    fn eq(self, other: &SemVer) -> bool {
-        self.major == other.major && self.minor == other.minor && self.patch == other.patch
-    }
-}
-
-impl PartialOrd for SemVer {
-    fn partial_cmp(self, other: &SemVer) -> Option<std.cmp.Ordering> {
-        some(self.cmp(other))
-    }
-}
-
-impl Ord for SemVer {
-    fn cmp(self, other: &SemVer) -> std.cmp.Ordering {
+impl Ord for Version {
+    fn cmp(self, other: &Version) -> Ordering {
         self.major.cmp(&other.major)
             .then(self.minor.cmp(&other.minor))
             .then(self.patch.cmp(&other.patch))
     }
 }
 
-// ── Version Requirements ─────────────────────────────────────────────────────
-enum VersionReq {
-    Exact(SemVer),
-    Caret(SemVer),     // ^1.2.3 => >=1.2.3 <2.0.0
-    Tilde(SemVer),     // ~1.2.3 => >=1.2.3 <1.3.0
-    Gte(SemVer),
-    Lt(SemVer),
-    Range(SemVer, SemVer),
-    Any,
+#[derive(Clone, Debug)]
+enum ReqOp {
+    Exact,    // =1.0.0
+    Gte,      // >=1.0.0
+    Lte,      // <=1.0.0
+    Gt,       // >1.0.0
+    Lt,       // <1.0.0
+    Caret,    // ^1.0.0
+    Tilde,    // ~1.0.0
+    Wildcard, // *
+}
+
+#[derive(Clone, Debug)]
+struct VersionReq {
+    op: ReqOp,
+    version: Version,
 }
 
 impl VersionReq {
-    fn parse(s: &str) -> Result<VersionReq, string> {
-        let s = s.trim()
-        if s == "*" { return ok(VersionReq.Any) }
-        if s.starts_with('^') { return ok(VersionReq.Caret(SemVer.parse(&s[1..])?)) }
-        if s.starts_with('~') { return ok(VersionReq.Tilde(SemVer.parse(&s[1..])?)) }
-        if s.starts_with(">=") { return ok(VersionReq.Gte(SemVer.parse(&s[2..])?)) }
-        if s.starts_with('<') { return ok(VersionReq.Lt(SemVer.parse(&s[1..])?)) }
-        ok(VersionReq.Exact(SemVer.parse(s)?))
+    fn exact(v: Version) -> VersionReq {
+        VersionReq { op: ReqOp.Exact, version: v }
+    }
+
+    fn caret(v: Version) -> VersionReq {
+        VersionReq { op: ReqOp.Caret, version: v }
+    }
+
+    fn tilde(v: Version) -> VersionReq {
+        VersionReq { op: ReqOp.Tilde, version: v }
+    }
+
+    fn gte(v: Version) -> VersionReq {
+        VersionReq { op: ReqOp.Gte, version: v }
+    }
+
+    fn wildcard() -> VersionReq {
+        VersionReq { op: ReqOp.Wildcard, version: Version.new(0, 0, 0) }
     }
 }
 
-// ── Package Metadata ─────────────────────────────────────────────────────────
-struct PackageMeta {
+#[derive(Clone, Debug)]
+struct Package {
     name: string,
-    version: SemVer,
+    version: Version,
     description: string,
-    authors: [string],
-    license: string,
     dependencies: [(string, VersionReq)],
     dev_dependencies: [(string, VersionReq)],
-    checksum: string,
+    checksum: Option<string>,
 }
 
-// ── Registry ─────────────────────────────────────────────────────────────────
+impl Package {
+    fn new(name: &str, version: Version) -> Package {
+        Package {
+            name: name.to_string(), version, description: string.new(),
+            dependencies: [], dev_dependencies: [], checksum: none,
+        }
+    }
+
+    fn with_dep(mut self, name: &str, req: VersionReq) -> Package {
+        self.dependencies.push((name.to_string(), req))
+        self
+    }
+}
+
 struct Registry {
-    packages: HashMap<string, [PackageMeta]>,
+    packages: HashMap<string, [Package]>,
 }
 
 impl Registry {
-    fn new() -> Registry { Registry { packages: HashMap.new() } }
+    fn new() -> Registry {
+        Registry { packages: HashMap.new() }
+    }
 
-    fn publish(mut self, pkg: PackageMeta) {
+    fn publish(mut self, pkg: Package) {
         self.packages.entry(pkg.name.clone()).or_insert_with(|| []).push(pkg)
     }
 
-    fn get_versions(self, name: &str) -> Option<&[PackageMeta]> { self.packages.get(name) }
+    fn find(self, name: &str, req: &VersionReq) -> Option<&Package> {
+        self.packages.get(name)?
+            .iter()
+            .filter(|p| p.version.satisfies(req))
+            .max_by(|a, b| a.version.cmp(&b.version))
+    }
 
-    fn resolve_version(self, name: &str, req: &VersionReq) -> Option<&PackageMeta> {
-        self.packages.get(name).and_then(|versions| {
-            versions.iter().filter(|v| v.version.satisfies(req)).max_by(|a, b| a.version.cmp(&b.version))
-        })
+    fn latest(self, name: &str) -> Option<&Package> {
+        self.packages.get(name)?
+            .iter()
+            .max_by(|a, b| a.version.cmp(&b.version))
+    }
+
+    fn all_versions(self, name: &str) -> [&Version] {
+        match self.packages.get(name) {
+            some(pkgs) => pkgs.iter().map(|p| &p.version).collect(),
+            none => [],
+        }
+    }
+
+    fn package_count(self) -> usize {
+        self.packages.values().map(|v| v.len()).sum()
     }
 }
 
-// ── Dependency Resolver ──────────────────────────────────────────────────────
-struct Resolved {
+#[derive(Clone, Debug)]
+struct LockEntry {
     name: string,
-    version: SemVer,
+    version: Version,
+    checksum: Option<string>,
 }
 
-struct Resolver<'a> {
-    registry: &'a Registry,
-    resolved: HashMap<string, SemVer>,
-    visited: HashSet<string>,
+struct Resolver {
+    registry: Registry,
+    resolved: HashMap<string, Version>,
+    errors: [string],
 }
 
-impl<'a> Resolver<'a> {
-    fn new(registry: &'a Registry) -> Resolver<'a> {
-        Resolver { registry, resolved: HashMap.new(), visited: HashSet.new() }
+impl Resolver {
+    fn new(registry: Registry) -> Resolver {
+        Resolver { registry, resolved: HashMap.new(), errors: [] }
     }
 
-    fn resolve(mut self, deps: &[(string, VersionReq)]) -> Result<[Resolved], string> {
+    fn resolve(mut self, deps: &[(string, VersionReq)]) -> Result<HashMap<string, Version>, [string]> {
         for (name, req) in deps {
-            self.resolve_one(name, req)?
+            self.resolve_one(name, req)
         }
-        let mut result: [Resolved] = self.resolved.iter()
-            .map(|(name, version)| Resolved { name: name.clone(), version: version.clone() })
-            .collect()
-        result.sort_by(|a, b| a.name.cmp(&b.name))
-        ok(result)
+        if self.errors.is_empty() {
+            ok(self.resolved.clone())
+        } else {
+            err(self.errors.clone())
+        }
     }
 
-    fn resolve_one(mut self, name: &str, req: &VersionReq) -> Result<(), string> {
-        // Check for circular dependencies
-        if self.visited.contains(name) {
-            return err(format!("circular dependency: {name}"))
-        }
-
-        // Check if already resolved with compatible version
+    fn resolve_one(mut self, name: &str, req: &VersionReq) {
         if let some(existing) = self.resolved.get(name) {
-            if existing.satisfies(req) { return ok(()) }
-            return err(format!("version conflict for {name}: have {}, need {:?}", existing.to_string(), req))
-        }
-
-        // Find best matching version
-        let pkg = self.registry.resolve_version(name, req)
-            .ok_or(format!("package not found: {name}"))?
-
-        self.resolved.insert(name.to_string(), pkg.version.clone())
-        self.visited.insert(name.to_string())
-
-        // Resolve transitive dependencies
-        for (dep_name, dep_req) in &pkg.dependencies {
-            self.resolve_one(dep_name, dep_req)?
-        }
-
-        self.visited.remove(name)
-        ok(())
-    }
-}
-
-// ── Lockfile ─────────────────────────────────────────────────────────────────
-struct Lockfile {
-    packages: [(string, SemVer, string)],  // name, version, checksum
-}
-
-impl Lockfile {
-    fn from_resolved(resolved: &[Resolved], registry: &Registry) -> Lockfile {
-        let packages = resolved.iter().map(|r| {
-            let checksum = registry.resolve_version(&r.name, &VersionReq.Exact(r.version.clone()))
-                .map(|p| p.checksum.clone()).unwrap_or_default()
-            (r.name.clone(), r.version.clone(), checksum)
-        }).collect()
-        Lockfile { packages }
-    }
-
-    fn serialize(self) -> string {
-        let mut output = "# Lockfile v1\n".to_string()
-        for (name, version, checksum) in &self.packages {
-            output.push_str(&format!("{name} {}\n  checksum: {checksum}\n", version.to_string()))
-        }
-        output
-    }
-
-    fn parse(s: &str) -> Result<Lockfile, string> {
-        let mut packages: [(string, SemVer, string)] = []
-        let mut current_name: Option<string> = none
-        let mut current_version: Option<SemVer> = none
-
-        for line in s.lines() {
-            if line.starts_with('#') || line.is_empty() { continue }
-            if line.starts_with("  checksum: ") {
-                let checksum = line[12..].to_string()
-                if let (some(name), some(version)) = (current_name.take(), current_version.take()) {
-                    packages.push((name, version, checksum))
-                }
-            } else {
-                let parts: [&str] = line.split(' ').collect()
-                if parts.len() == 2 {
-                    current_name = some(parts[0].to_string())
-                    current_version = some(SemVer.parse(parts[1])?)
-                }
+            if !existing.satisfies(req) {
+                self.errors.push(format!("Conflict: {} requires {} but {} already resolved", name, req.version.to_string(), existing.to_string()))
             }
+            return
         }
-        ok(Lockfile { packages })
+
+        match self.registry.find(name, req) {
+            some(pkg) => {
+                self.resolved.insert(name.to_string(), pkg.version.clone())
+                let sub_deps = pkg.dependencies.clone()
+                for (dep_name, dep_req) in &sub_deps {
+                    self.resolve_one(dep_name, dep_req)
+                }
+            },
+            none => {
+                self.errors.push(format!("Package not found: {} matching {}", name, req.version.to_string()))
+            },
+        }
+    }
+
+    fn to_lock_entries(self) -> [LockEntry] {
+        self.resolved.iter().map(|(name, version)| {
+            LockEntry { name: name.clone(), version: version.clone(), checksum: none }
+        }).collect()
     }
 }
 
 fn main() {
-    // SemVer parsing
-    let v = SemVer.parse("1.2.3").unwrap()
+    // Version parsing
+    let v = Version.parse("1.2.3").unwrap()
     assert(v.major == 1 && v.minor == 2 && v.patch == 3)
-    print("SemVer parse ✓")
+    assert(v.pre.is_none())
+    print("Version parse ✓")
 
-    let v = SemVer.parse("1.0.0-alpha+build.123").unwrap()
-    assert(v.pre == some("alpha".to_string()))
-    assert(v.build == some("build.123".to_string()))
-    print("SemVer with pre-release ✓")
+    // Pre-release
+    let pre = Version.parse("1.0.0-alpha").unwrap()
+    assert(pre.pre.as_deref().unwrap() == "alpha")
+    print("Pre-release ✓")
 
-    // SemVer comparison
-    let v1 = SemVer.parse("1.2.3").unwrap()
-    let v2 = SemVer.parse("1.3.0").unwrap()
+    // Version comparison
+    let v1 = Version.new(1, 0, 0)
+    let v2 = Version.new(1, 2, 0)
+    let v3 = Version.new(2, 0, 0)
     assert(v1 < v2)
-    assert(v1 == SemVer.parse("1.2.3").unwrap())
-    print("SemVer comparison ✓")
-
-    // Version requirements
-    let req = VersionReq.parse("^1.2.0").unwrap()
-    assert(SemVer.parse("1.2.5").unwrap().satisfies(&req))
-    assert(SemVer.parse("1.9.0").unwrap().satisfies(&req))
-    assert(!SemVer.parse("2.0.0").unwrap().satisfies(&req))
-    assert(!SemVer.parse("1.1.0").unwrap().satisfies(&req))
-    print("Caret requirement ✓")
-
-    let req = VersionReq.parse("~1.2.0").unwrap()
-    assert(SemVer.parse("1.2.5").unwrap().satisfies(&req))
-    assert(!SemVer.parse("1.3.0").unwrap().satisfies(&req))
-    print("Tilde requirement ✓")
-
-    // Registry
-    let mut registry = Registry.new()
-    registry.publish(PackageMeta {
-        name: "serde".to_string(), version: SemVer.parse("1.0.0").unwrap(),
-        description: "Serialization".to_string(), authors: ["dev".to_string()],
-        license: "MIT".to_string(), dependencies: [],
-        dev_dependencies: [], checksum: "abc123".to_string(),
-    })
-    registry.publish(PackageMeta {
-        name: "serde".to_string(), version: SemVer.parse("1.1.0").unwrap(),
-        description: "Serialization".to_string(), authors: ["dev".to_string()],
-        license: "MIT".to_string(), dependencies: [],
-        dev_dependencies: [], checksum: "def456".to_string(),
-    })
-    registry.publish(PackageMeta {
-        name: "http".to_string(), version: SemVer.parse("0.2.0").unwrap(),
-        description: "HTTP types".to_string(), authors: ["dev".to_string()],
-        license: "MIT".to_string(),
-        dependencies: [("serde".to_string(), VersionReq.parse("^1.0.0").unwrap())],
-        dev_dependencies: [], checksum: "ghi789".to_string(),
-    })
-
-    // Resolve
-    let req = VersionReq.parse("^1.0.0").unwrap()
-    let pkg = registry.resolve_version("serde", &req).unwrap()
-    assert(pkg.version == SemVer.parse("1.1.0").unwrap())  // picks latest compatible
-    print("Registry resolve ✓")
-
-    // Dependency resolution
-    let mut resolver = Resolver.new(&registry)
-    let deps = [("http".to_string(), VersionReq.parse("^0.2.0").unwrap())]
-    let resolved = resolver.resolve(&deps).unwrap()
-    assert(resolved.len() == 2)  // http + serde (transitive)
-    print("Dependency resolution: ${resolved.len()} packages ✓")
-
-    for r in &resolved { print("  ${r.name} ${r.version.to_string()}") }
-
-    // Lockfile
-    let lockfile = Lockfile.from_resolved(&resolved, &registry)
-    let serialized = lockfile.serialize()
-    assert(serialized.contains("http"))
-    assert(serialized.contains("serde"))
-    print("Lockfile serialization ✓")
-
-    let parsed = Lockfile.parse(&serialized).unwrap()
-    assert(parsed.packages.len() == 2)
-    print("Lockfile parsing ✓")
+    assert(v2 < v3)
+    assert(v1 < v3)
+    print("Version ordering ✓")
 
     // Compatibility
-    let v1 = SemVer.parse("1.2.0").unwrap()
-    let v2 = SemVer.parse("1.5.0").unwrap()
-    assert(v1.is_compatible(&v2))
-    let v3 = SemVer.parse("2.0.0").unwrap()
-    assert(!v1.is_compatible(&v3))
-    print("Compatibility check ✓")
+    assert(v1.is_compatible(&v2)) // same major
+    assert(!v1.is_compatible(&v3)) // different major
+    print("Compatibility ✓")
+
+    // Version requirements
+    let req = VersionReq.caret(Version.new(1, 0, 0))
+    assert(Version.new(1, 5, 0).satisfies(&req))
+    assert(!Version.new(2, 0, 0).satisfies(&req))
+    assert(!Version.new(0, 9, 0).satisfies(&req))
+    print("Caret req ✓")
+
+    let tilde = VersionReq.tilde(Version.new(1, 2, 0))
+    assert(Version.new(1, 2, 5).satisfies(&tilde))
+    assert(!Version.new(1, 3, 0).satisfies(&tilde))
+    print("Tilde req ✓")
+
+    let exact = VersionReq.exact(Version.new(1, 0, 0))
+    assert(Version.new(1, 0, 0).satisfies(&exact))
+    assert(!Version.new(1, 0, 1).satisfies(&exact))
+    print("Exact req ✓")
+
+    let wild = VersionReq.wildcard()
+    assert(Version.new(99, 99, 99).satisfies(&wild))
+    print("Wildcard req ✓")
+
+    // Registry
+    let mut reg = Registry.new()
+    let serde_1 = Package.new("serde", Version.new(1, 0, 0))
+    let serde_2 = Package.new("serde", Version.new(1, 1, 0))
+    let serde_3 = Package.new("serde", Version.new(1, 2, 0))
+    reg.publish(serde_1)
+    reg.publish(serde_2)
+    reg.publish(serde_3)
+
+    let tokio = Package.new("tokio", Version.new(1, 0, 0))
+        .with_dep("serde", VersionReq.caret(Version.new(1, 0, 0)))
+    reg.publish(tokio)
+
+    assert(reg.package_count() == 4)
+    print("Registry ✓")
+
+    // Find package
+    let found = reg.find("serde", &VersionReq.caret(Version.new(1, 0, 0))).unwrap()
+    assert(found.version == Version.new(1, 2, 0)) // latest compatible
+    print("Find package ✓")
+
+    // Latest
+    let latest = reg.latest("serde").unwrap()
+    assert(latest.version == Version.new(1, 2, 0))
+    print("Latest ✓")
+
+    // All versions
+    let versions = reg.all_versions("serde")
+    assert(versions.len() == 3)
+    print("All versions ✓")
+
+    // Resolver
+    let mut resolver = Resolver.new(reg)
+    let deps = [
+        ("tokio".to_string(), VersionReq.caret(Version.new(1, 0, 0))),
+    ]
+    let resolved = resolver.resolve(&deps).unwrap()
+    assert(resolved.contains_key("tokio"))
+    assert(resolved.contains_key("serde")) // transitive
+    print("Resolve ✓")
+
+    // Lock entries
+    let entries = resolver.to_lock_entries()
+    assert(entries.len() >= 2)
+    print("Lock entries ✓")
+
+    // Version to_string
+    let v = Version.new(1, 2, 3)
+    assert(v.to_string() == "1.2.3")
+    let vp = Version { major: 1, minor: 0, patch: 0, pre: some("beta.1".to_string()) }
+    assert(vp.to_string() == "1.0.0-beta.1")
+    print("Version to_string ✓")
 
     print("Package Manager complete ✓")
 }
