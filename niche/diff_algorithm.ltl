@@ -1,0 +1,309 @@
+// Niche Example — Diff Algorithm
+// Myers diff (edit graph shortest path), unified diff output, patch application.
+
+use std.collections.HashMap
+
+// ── Edit operations ──────────────────────────────────────────────────────────
+enum EditOp { Equal, Insert, Delete }
+
+struct Edit {
+    op: EditOp,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    text: string,
+}
+
+impl Edit {
+    fn equal(old_line: usize, new_line: usize, text: &str) -> Edit {
+        Edit { op: EditOp.Equal, old_line: some(old_line), new_line: some(new_line), text: text.to_string() }
+    }
+    fn insert(new_line: usize, text: &str) -> Edit {
+        Edit { op: EditOp.Insert, old_line: none, new_line: some(new_line), text: text.to_string() }
+    }
+    fn delete(old_line: usize, text: &str) -> Edit {
+        Edit { op: EditOp.Delete, old_line: some(old_line), new_line: none, text: text.to_string() }
+    }
+
+    fn prefix(self) -> char {
+        match self.op { EditOp.Equal => ' ', EditOp.Insert => '+', EditOp.Delete => '-' }
+    }
+}
+
+// ── Myers Diff ───────────────────────────────────────────────────────────────
+fn myers_diff(old: &[string], new: &[string]) -> [Edit] {
+    let n = old.len()
+    let m = new.len()
+    let max = n + m
+
+    if max == 0 { return [] }
+
+    // V array: maps diagonal k to furthest x
+    let mut v_history: [HashMap<i64, usize>] = []
+    let mut v: HashMap<i64, usize> = HashMap.new()
+    v.insert(1, 0)
+
+    // Find shortest edit script
+    let mut found = false
+    let mut d_final: usize = 0
+
+    for d in 0..=max {
+        let mut v_copy = v.clone()
+        let k_start = -(d as i64)
+        let k_end = d as i64
+
+        let mut k = k_start
+        while k <= k_end {
+            // Decide: go down (insert) or right (delete)
+            let x = if k == k_start
+                || (k != k_end && v.get(&(k - 1)).unwrap_or(&0) < v.get(&(k + 1)).unwrap_or(&0))
+            {
+                *v.get(&(k + 1)).unwrap_or(&0)  // down: insert
+            } else {
+                *v.get(&(k - 1)).unwrap_or(&0) + 1  // right: delete
+            };
+
+            let mut x = x
+            let mut y = (x as i64 - k) as usize
+
+            // Follow diagonal (equal elements)
+            while x < n && y < m && old[x] == new[y] { x += 1; y += 1 }
+
+            v_copy.insert(k, x)
+
+            if x >= n && y >= m {
+                v = v_copy.clone()
+                v_history.push(v.clone())
+                d_final = d
+                found = true
+                break
+            }
+
+            k += 2
+        }
+
+        if found { break }
+        v = v_copy
+        v_history.push(v.clone())
+    }
+
+    // Backtrack to produce edits
+    let mut edits: [Edit] = []
+    let mut x = n
+    let mut y = m
+
+    for d in (0..=d_final).rev() {
+        let k = x as i64 - y as i64
+        let prev_v = if d > 0 { &v_history[d - 1] } else { &HashMap.from([(1i64, 0usize)]) }
+
+        let prev_k = if k == -(d as i64)
+            || (k != d as i64 && *prev_v.get(&(k - 1)).unwrap_or(&0) < *prev_v.get(&(k + 1)).unwrap_or(&0))
+        {
+            k + 1  // came from down (insert)
+        } else {
+            k - 1  // came from right (delete)
+        };
+
+        let prev_x = *prev_v.get(&prev_k).unwrap_or(&0)
+        let prev_y = (prev_x as i64 - prev_k) as usize
+
+        // Diagonal (equal)
+        while x > prev_x && y > prev_y && x > 0 && y > 0 {
+            x -= 1; y -= 1
+            edits.push(Edit.equal(x, y, &old[x]))
+        }
+
+        if d > 0 {
+            if prev_k == k + 1 && y > 0 {
+                y -= 1
+                edits.push(Edit.insert(y, &new[y]))
+            } else if x > 0 {
+                x -= 1
+                edits.push(Edit.delete(x, &old[x]))
+            }
+        }
+    }
+
+    edits.reverse()
+    edits
+}
+
+// ── Unified Diff Output ──────────────────────────────────────────────────────
+struct UnifiedDiff {
+    old_name: string,
+    new_name: string,
+    hunks: [DiffHunk],
+}
+
+struct DiffHunk {
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    lines: [Edit],
+}
+
+impl UnifiedDiff {
+    fn generate(old: &[string], new: &[string], old_name: &str, new_name: &str, context: usize) -> UnifiedDiff {
+        let edits = myers_diff(old, new)
+        let mut hunks: [DiffHunk] = []
+
+        // Find change regions
+        let mut changes: [(usize, usize)] = []
+        for i in 0..edits.len() {
+            match edits[i].op {
+                EditOp.Insert | EditOp.Delete => {
+                    let start = if i > context { i - context } else { 0 }
+                    let end = (i + context + 1).min(edits.len())
+                    if changes.is_empty() || start > changes.last().unwrap().1 {
+                        changes.push((start, end))
+                    } else {
+                        changes.last_mut().unwrap().1 = end
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (start, end) in &changes {
+            let hunk_edits = edits[*start..*end].to_vec()
+            let old_start = hunk_edits.iter()
+                .filter_map(|e| e.old_line).min().unwrap_or(0) + 1
+            let new_start = hunk_edits.iter()
+                .filter_map(|e| e.new_line).min().unwrap_or(0) + 1
+            let old_count = hunk_edits.iter()
+                .filter(|e| match e.op { EditOp.Equal | EditOp.Delete => true, _ => false }).count()
+            let new_count = hunk_edits.iter()
+                .filter(|e| match e.op { EditOp.Equal | EditOp.Insert => true, _ => false }).count()
+
+            hunks.push(DiffHunk { old_start, old_count, new_start, new_count, lines: hunk_edits })
+        }
+
+        UnifiedDiff { old_name: old_name.to_string(), new_name: new_name.to_string(), hunks }
+    }
+
+    fn to_string(self) -> string {
+        let mut out = string.new()
+        out.push_str(&format!("--- {}\n", self.old_name))
+        out.push_str(&format!("+++ {}\n", self.new_name))
+
+        for hunk in &self.hunks {
+            out.push_str(&format!("@@ -{},{} +{},{} @@\n",
+                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count))
+            for line in &hunk.lines {
+                out.push_str(&format!("{}{}\n", line.prefix(), line.text))
+            }
+        }
+        out
+    }
+}
+
+// ── Patch Application ────────────────────────────────────────────────────────
+fn apply_patch(original: &[string], edits: &[Edit]) -> [string] {
+    let mut result: [string] = []
+    for edit in edits {
+        match edit.op {
+            EditOp.Equal => result.push(edit.text.clone()),
+            EditOp.Insert => result.push(edit.text.clone()),
+            EditOp.Delete => {} // skip
+        }
+    }
+    result
+}
+
+fn reverse_edits(edits: &[Edit]) -> [Edit] {
+    edits.iter().map(|e| {
+        match e.op {
+            EditOp.Equal => Edit.equal(e.new_line.unwrap_or(0), e.old_line.unwrap_or(0), &e.text),
+            EditOp.Insert => Edit.delete(e.new_line.unwrap_or(0), &e.text),
+            EditOp.Delete => Edit.insert(e.old_line.unwrap_or(0), &e.text),
+        }
+    }).collect()
+}
+
+// ── Edit Distance ────────────────────────────────────────────────────────────
+fn edit_distance(a: &str, b: &str) -> usize {
+    let n = a.len(); let m = b.len()
+    let mut dp = vec![vec![0usize; m + 1]; n + 1]
+
+    for i in 0..=n { dp[i][0] = i }
+    for j in 0..=m { dp[0][j] = j }
+
+    let a_bytes = a.as_bytes()
+    let b_bytes = b.as_bytes()
+
+    for i in 1..=n {
+        for j in 1..=m {
+            if a_bytes[i - 1] == b_bytes[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1]
+            } else {
+                dp[i][j] = 1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1])
+            }
+        }
+    }
+    dp[n][m]
+}
+
+fn main() {
+    // Basic diff
+    let old = ["alpha", "beta", "gamma", "delta"].map(|s| s.to_string())
+    let new = ["alpha", "beta", "epsilon", "delta"].map(|s| s.to_string())
+
+    let edits = myers_diff(&old, &new)
+    let inserts = edits.iter().filter(|e| match e.op { EditOp.Insert => true, _ => false }).count()
+    let deletes = edits.iter().filter(|e| match e.op { EditOp.Delete => true, _ => false }).count()
+    assert(inserts == 1)  // +epsilon
+    assert(deletes == 1)  // -gamma
+    print("Myers diff: +${inserts} -${deletes} ✓")
+
+    // Patch application
+    let patched = apply_patch(&old, &edits)
+    assert(patched == new)
+    print("Patch apply ✓")
+
+    // Reverse patch
+    let reversed = reverse_edits(&edits)
+    let unpatched = apply_patch(&new, &reversed)
+    assert(unpatched == old)
+    print("Reverse patch ✓")
+
+    // Unified diff output
+    let diff = UnifiedDiff.generate(&old, &new, "a/file.txt", "b/file.txt", 3)
+    let diff_str = diff.to_string()
+    assert(diff_str.contains("---"))
+    assert(diff_str.contains("+++"))
+    assert(diff_str.contains("@@"))
+    assert(diff_str.contains("-gamma"))
+    assert(diff_str.contains("+epsilon"))
+    print("Unified diff output ✓")
+
+    // Edit distance
+    assert(edit_distance("kitten", "sitting") == 3)
+    assert(edit_distance("", "abc") == 3)
+    assert(edit_distance("abc", "abc") == 0)
+    assert(edit_distance("a", "b") == 1)
+    print("Edit distance ✓")
+
+    // Identical files
+    let same = ["a", "b", "c"].map(|s| s.to_string())
+    let edits = myers_diff(&same, &same)
+    let changes = edits.iter().filter(|e| match e.op { EditOp.Equal => false, _ => true }).count()
+    assert(changes == 0)
+    print("Identical files: 0 changes ✓")
+
+    // All different
+    let a = ["x", "y"].map(|s| s.to_string())
+    let b = ["p", "q", "r"].map(|s| s.to_string())
+    let edits = myers_diff(&a, &b)
+    let patched = apply_patch(&a, &edits)
+    assert(patched == b)
+    print("All different ✓")
+
+    // Empty
+    let empty: [string] = []
+    let edits = myers_diff(&empty, &["new".to_string()])
+    assert(edits.len() == 1)
+    assert(apply_patch(&empty, &edits) == ["new".to_string()])
+    print("Empty -> non-empty ✓")
+
+    print("Diff Algorithm complete ✓")
+}
