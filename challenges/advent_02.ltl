@@ -1,0 +1,53 @@
+// Advent of Code 2023 — Day 2: Cube Conundrum
+// Run: lateralus run challenges/advent_02.ltl
+
+struct Round { red: int, green: int, blue: int }
+struct Game  { id: int, rounds: [Round] }
+
+fn parse_round(s: string) -> Round {
+    mut r = Round { red: 0, green: 0, blue: 0 }
+    s.split(", ") |> each(part => {
+        let tokens = part.trim().split(" ")
+        let count  = tokens[0].parse_int().unwrap()
+        match tokens[1] {
+            "red"   => r.red   = count,
+            "green" => r.green = count,
+            "blue"  => r.blue  = count,
+            _       => {},
+        }
+    })
+    r
+}
+
+fn parse_game(line: string) -> Game {
+    let parts  = line.split(": ")
+    let id     = parts[0].strip_prefix("Game ").unwrap().parse_int().unwrap()
+    let rounds = parts[1].split("; ") |> map(parse_round) |> collect()
+    Game { id, rounds }
+}
+
+fn part1(games: [Game]) -> int {
+    let limit = Round { red: 12, green: 13, blue: 14 }
+    games
+        |> filter(g => g.rounds |> all(r => r.red <= limit.red && r.green <= limit.green && r.blue <= limit.blue))
+        |> map(g => g.id)
+        |> sum()
+}
+
+fn part2(games: [Game]) -> int {
+    games |> map(g => {
+        let max_r = g.rounds |> map(r => r.red)   |> max() |> unwrap_or(0)
+        let max_g = g.rounds |> map(r => r.green) |> max() |> unwrap_or(0)
+        let max_b = g.rounds |> map(r => r.blue)  |> max() |> unwrap_or(0)
+        max_r * max_g * max_b
+    }) |> sum()
+}
+
+fn main() {
+    let input = read_file("input.txt")
+    let games = input.lines() |> map(parse_game) |> collect()
+    print("Part 1: ${part1(games)}")
+    print("Part 2: ${part2(games)}")
+}
+
+main()
