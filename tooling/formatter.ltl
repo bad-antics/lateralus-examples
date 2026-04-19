@@ -1,0 +1,115 @@
+// formatter.ltl — Source code formatter for Lateralus (opinionated, like gofmt)
+use std.fs.{read_to_string, write}
+
+struct FormatOptions {
+    indent_width: int,
+    max_line:     int,
+    trailing_newline: bool,
+}
+
+impl FormatOptions {
+    fn default() -> FormatOptions {
+        FormatOptions { indent_width: 4, max_line: 100, trailing_newline: true }
+    }
+}
+
+enum Token { Indent, Dedent, Newline, Space, Raw(string) }
+
+struct Formatter {
+    opts:    FormatOptions,
+    output:  string,
+    indent:  int,
+    col:     int,
+}
+
+impl Formatter {
+    fn new(opts: FormatOptions) -> Formatter {
+        Formatter { opts, output: "", indent: 0, col: 0 }
+    }
+
+    fn emit(mut self, s: string) {
+        self.output += s
+        self.col    += s.len()
+    }
+
+    fn newline(mut self) {
+        self.output += "
+"
+        self.col     = 0
+    }
+
+    fn indent_str(self) -> string { " ".repeat(self.indent * self.opts.indent_width) }
+
+    fn emit_line(mut self, line: string) {
+        if self.col == 0 { self.emit(self.indent_str()) }
+        self.emit(line)
+        self.newline()
+    }
+
+    fn format_braces(mut self, lines: [string]) -> string {
+        for raw_line in lines {
+            let line = raw_line.trim()
+            if line.is_empty() {
+                self.newline()
+                continue
+            }
+            // Dedent before closing brace
+            if line.starts_with('}') || line.starts_with(']') || line.starts_with(')') {
+                self.indent -= 1
+            }
+            self.emit_line(line)
+            // Indent after opening brace
+            if line.ends_with('{') || line.ends_with('(') || line.ends_with('[') {
+                self.indent += 1
+            }
+        }
+        let mut out = self.output.clone()
+        if self.opts.trailing_newline && !out.ends_with('
+') { out += "
+" }
+        out
+    }
+}
+
+fn normalise_spaces(line: string) -> string {
+    // Ensure single space around operators: =, +, -, *, /, ==, !=, <=, >=, ->, =>
+    let ops = ["==","!=","<=",">=","->","=>","+=","-=","*=","/="]
+    let mut s = line
+    for op in ops {
+        s = s.replace(op, " ${op} ")
+    }
+    // Collapse multiple spaces (except leading indent)
+    let indent = s.len() - s.trim_start().len()
+    let body   = s.trim()
+    let trimmed = body.split(" ") |> filter(|w| !w.is_empty()) |> join(" ")
+    " ".repeat(indent) + trimmed
+}
+
+fn format_source(source: string, opts: FormatOptions) -> string {
+    let lines = source.lines() |> map(normalise_spaces) |> collect()
+    Formatter.new(opts).format_braces(lines)
+}
+
+fn main() {
+    let source = r#"
+fn add( a : int , b:int)->int{
+let x=a+b
+x
+}
+
+struct Foo{
+bar:int,
+baz:string,
+}
+"#
+    let formatted = format_source(source, FormatOptions.default())
+    print("Formatted output:")
+    print("---")
+    print(formatted)
+    print("---")
+
+    // Idempotency check
+    let second = format_source(formatted.clone(), FormatOptions.default())
+    assert(second == formatted, "formatter must be idempotent")
+    print("Idempotency check ✓")
+}
