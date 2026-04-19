@@ -1,0 +1,224 @@
+// Niche Example - FTP Client
+// File Transfer Protocol (RFC 959) client implementation.
+
+use std.net.TcpStream
+use std.io.{Read, Write, BufRead, BufReader}
+
+enum FtpMode { Active, Passive }
+enum TransferType { Ascii, Binary }
+
+struct FtpResponse { code: u16, message: string }
+
+impl FtpResponse {
+    fn is_positive(self) -> bool { self.code >= 100 && self.code < 400 }
+    fn is_positive_completion(self) -> bool { self.code >= 200 && self.code < 300 }
+    fn is_positive_preliminary(self) -> bool { self.code >= 100 && self.code < 200 }
+    fn is_positive_intermediate(self) -> bool { self.code >= 300 && self.code < 400 }
+    fn is_negative(self) -> bool { self.code >= 400 }
+}
+
+struct FtpClient {
+    control: Option<BufReader<TcpStream>>,
+    mode: FtpMode,
+    transfer_type: TransferType,
+    logged_in: bool,
+}
+
+impl FtpClient {
+    fn new() -> FtpClient {
+        FtpClient { control: none, mode: FtpMode.Passive, transfer_type: TransferType.Binary, logged_in: false }
+    }
+
+    fn connect(mut self, host: &str, port: u16) -> Result<FtpResponse, string> {
+        let stream = TcpStream.connect(format!("{}:{}", host, port)).map_err(|e| e.to_string())?
+        self.control = some(BufReader.new(stream))
+        self.read_response()
+    }
+
+    fn login(mut self, username: &str, password: &str) -> Result<FtpResponse, string> {
+        let resp = self.send_command(&format!("USER {}", username))?
+        if resp.code == 331 {
+            let resp2 = self.send_command(&format!("PASS {}", password))?
+            if resp2.is_positive_completion() { self.logged_in = true }
+            ok(resp2)
+        } else { ok(resp) }
+    }
+
+    fn send_command(mut self, cmd: &str) -> Result<FtpResponse, string> {
+        let stream = self.get_stream()?
+        stream.write_all(format!("{}\r\n", cmd).as_bytes()).map_err(|e| e.to_string())?
+        stream.flush().map_err(|e| e.to_string())?
+        self.read_response()
+    }
+
+    fn read_response(mut self) -> Result<FtpResponse, string> {
+        let reader = self.control.as_mut().ok_or("not connected")?
+        let mut line = string.new()
+        reader.read_line(&mut line).map_err(|e| e.to_string())?
+
+        if line.len() < 4 { return err("invalid response".to_string()) }
+        let code = line[..3].parse::<u16>().map_err(|e| e.to_string())?
+        let mut message = line[4..].trim().to_string()
+
+        // Multi-line response
+        if line.as_bytes()[3] == b'-' {
+            let end_marker = format!("{} ", code)
+            loop {
+                let mut next = string.new()
+                reader.read_line(&mut next).map_err(|e| e.to_string())?
+                message.push_str(&next.trim())
+                if next.starts_with(&end_marker) { break }
+            }
+        }
+
+        ok(FtpResponse { code, message })
+    }
+
+    fn pwd(mut self) -> Result<string, string> {
+        let resp = self.send_command("PWD")?
+        if !resp.is_positive_completion() { return err(resp.message) }
+        // Extract path from "257 "/path" is current directory"
+        let msg = &resp.message
+        let start = msg.find('"').unwrap_or(0) + 1
+        let end = msg[start..].find('"').map(|i| start + i).unwrap_or(msg.len())
+        ok(msg[start..end].to_string())
+    }
+
+    fn cwd(mut self, path: &str) -> Result<FtpResponse, string> {
+        self.send_command(&format!("CWD {}", path))
+    }
+
+    fn cdup(mut self) -> Result<FtpResponse, string> { self.send_command("CDUP") }
+
+    fn mkdir(mut self, name: &str) -> Result<FtpResponse, string> {
+        self.send_command(&format!("MKD {}", name))
+    }
+
+    fn rmdir(mut self, name: &str) -> Result<FtpResponse, string> {
+        self.send_command(&format!("RMD {}", name))
+    }
+
+    fn delete(mut self, name: &str) -> Result<FtpResponse, string> {
+        self.send_command(&format!("DELE {}", name))
+    }
+
+    fn rename(mut self, from: &str, to: &str) -> Result<FtpResponse, string> {
+        let resp = self.send_command(&format!("RNFR {}", from))?
+        if resp.code != 350 { return err(resp.message) }
+        self.send_command(&format!("RNTO {}", to))
+    }
+
+    fn size(mut self, path: &str) -> Result<u64, string> {
+        let resp = self.send_command(&format!("SIZE {}", path))?
+        if !resp.is_positive_completion() { return err(resp.message) }
+        resp.message.trim().parse::<u64>().map_err(|e| e.to_string())
+    }
+
+    fn set_passive(mut self) -> Result<(string, u16), string> {
+        let resp = self.send_command("PASV")?
+        if resp.code != 227 { return err(resp.message) }
+        self.parse_pasv_response(&resp.message)
+    }
+
+    fn parse_pasv_response(self, msg: &str) -> Result<(string, u16), string> {
+        let start = msg.find('(').ok_or("invalid PASV")? + 1
+        let end = msg.find(')').ok_or("invalid PASV")?
+        let parts: [&str] = msg[start..end].split(",").collect()
+        if parts.len() != 6 { return err("invalid PASV".to_string()) }
+        let ip = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], parts[3])
+        let port = parts[4].parse::<u16>().map_err(|e| e.to_string())? * 256
+                 + parts[5].parse::<u16>().map_err(|e| e.to_string())?
+        ok((ip, port))
+    }
+
+    fn set_binary(mut self) -> Result<FtpResponse, string> {
+        self.transfer_type = TransferType.Binary
+        self.send_command("TYPE I")
+    }
+
+    fn set_ascii(mut self) -> Result<FtpResponse, string> {
+        self.transfer_type = TransferType.Ascii
+        self.send_command("TYPE A")
+    }
+
+    fn list(mut self, path: Option<&str>) -> Result<string, string> {
+        let (ip, port) = self.set_passive()?
+        let cmd = match path { some(p) => format!("LIST {}", p), none => "LIST".to_string() }
+        self.send_command(&cmd)?
+        let mut data_stream = TcpStream.connect(format!("{}:{}", ip, port)).map_err(|e| e.to_string())?
+        let mut listing = string.new()
+        data_stream.read_to_string(&mut listing).map_err(|e| e.to_string())?
+        self.read_response()?  // 226 Transfer complete
+        ok(listing)
+    }
+
+    fn retrieve(mut self, path: &str) -> Result<[u8], string> {
+        let (ip, port) = self.set_passive()?
+        self.send_command(&format!("RETR {}", path))?
+        let mut data_stream = TcpStream.connect(format!("{}:{}", ip, port)).map_err(|e| e.to_string())?
+        let mut data: [u8] = []
+        data_stream.read_to_end(&mut data).map_err(|e| e.to_string())?
+        self.read_response()?
+        ok(data)
+    }
+
+    fn store(mut self, path: &str, data: &[u8]) -> Result<FtpResponse, string> {
+        let (ip, port) = self.set_passive()?
+        self.send_command(&format!("STOR {}", path))?
+        let mut data_stream = TcpStream.connect(format!("{}:{}", ip, port)).map_err(|e| e.to_string())?
+        data_stream.write_all(data).map_err(|e| e.to_string())?
+        drop(data_stream)
+        self.read_response()
+    }
+
+    fn noop(mut self) -> Result<FtpResponse, string> { self.send_command("NOOP") }
+
+    fn quit(mut self) -> Result<FtpResponse, string> {
+        let resp = self.send_command("QUIT")?
+        self.logged_in = false
+        ok(resp)
+    }
+
+    fn get_stream(mut self) -> Result<&mut TcpStream, string> {
+        self.control.as_mut().map(|r| r.get_mut()).ok_or("not connected".to_string())
+    }
+}
+
+fn main() {
+    // FtpResponse
+    let resp_ok = FtpResponse { code: 220, message: "Welcome".to_string() }
+    assert(resp_ok.is_positive())
+    assert(resp_ok.is_positive_completion())
+    print("Response positive \u2713")
+
+    let resp_err = FtpResponse { code: 550, message: "Not found".to_string() }
+    assert(resp_err.is_negative())
+    assert(!resp_err.is_positive())
+    print("Response negative \u2713")
+
+    let resp_pre = FtpResponse { code: 150, message: "Opening".to_string() }
+    assert(resp_pre.is_positive_preliminary())
+    let resp_int = FtpResponse { code: 331, message: "Need password".to_string() }
+    assert(resp_int.is_positive_intermediate())
+    print("Response categories \u2713")
+
+    // PASV parsing
+    let client = FtpClient.new()
+    let (ip, port) = client.parse_pasv_response("Entering Passive Mode (192,168,1,1,4,1)").unwrap()
+    assert(ip == "192.168.1.1")
+    assert(port == 1025)  // 4*256 + 1
+    print("PASV parse \u2713")
+
+    let (ip2, port2) = client.parse_pasv_response("(10,0,0,1,39,207)").unwrap()
+    assert(ip2 == "10.0.0.1")
+    assert(port2 == 10191)  // 39*256 + 207
+    print("PASV parse 2 \u2713")
+
+    // Client state
+    let c = FtpClient.new()
+    assert(!c.logged_in)
+    match c.mode { FtpMode.Passive => {} _ => panic!("expected passive") }
+    print("Client state \u2713")
+
+    print("FTP Client complete \u2713")
+}
