@@ -1,0 +1,46 @@
+// websocket_server.ltl — Simple WebSocket chat server
+// Run: lateralus run web-api/websocket_server.ltl
+
+use std.net.{WebSocketServer, WebSocketConn}
+use std.sync.{Mutex, Arc}
+use std.collections.HashMap
+
+type Clients = Arc<Mutex<HashMap<int, WebSocketConn>>>
+
+fn broadcast(clients: Clients, sender_id: int, msg: string) {
+    let locked = clients.lock()
+    for (id, conn) in locked.iter() {
+        if id != sender_id {
+            conn.send(msg)
+        }
+    }
+}
+
+fn main() {
+    let clients: Clients = Arc.new(Mutex.new(HashMap.new()))
+    mut next_id = 0
+
+    let server = WebSocketServer.bind("0.0.0.0:8080")
+    print("WebSocket server on ws://localhost:8080")
+
+    server.on_connect(|conn| {
+        let id = next_id
+        next_id += 1
+        clients.lock().insert(id, conn.clone())
+        broadcast(clients.clone(), id, "[${id}] joined the chat")
+
+        conn.on_message(|msg| {
+            print("[${id}] ${msg}")
+            broadcast(clients.clone(), id, "[${id}]: ${msg}")
+        })
+
+        conn.on_close(|| {
+            clients.lock().remove(id)
+            broadcast(clients.clone(), id, "[${id}] left the chat")
+        })
+    })
+
+    server.run()
+}
+
+main()
