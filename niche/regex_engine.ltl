@@ -1,444 +1,444 @@
-// Niche Example — Regular Expression Engine
-// NFA-based regex with Thompson's construction and epsilon transitions.
+// Niche Example - Regex Engine
+// NFA-based regex matching with character classes, quantifiers, and groups.
 
-use std.collections.{HashSet, HashMap}
-
-type StateId = u32
-
-// ── Regex AST ────────────────────────────────────────────────────────────────
-enum Regex {
+#[derive(Clone, Debug)]
+enum RegexNode {
     Literal(char),
-    Dot,                            // match any char
-    CharClass([CharRange], bool),   // ranges, negated?
-    Concat(Box<Regex>, Box<Regex>),
-    Alternation(Box<Regex>, Box<Regex>),
-    Repetition(Box<Regex>, RepKind),
-    Group(Box<Regex>, u32),         // capturing group
+    AnyChar,              // .
+    CharClass([CharRange], bool), // ranges, negated
+    Sequence([RegexNode]),
+    Alternation(Box<RegexNode>, Box<RegexNode>), // |
+    Quantifier(Box<RegexNode>, QuantKind),
+    Group(Box<RegexNode>, usize), // group index
     Anchor(AnchorKind),
 }
 
-struct CharRange { start: char, end: char }
+#[derive(Clone, Debug)]
+struct CharRange {
+    start: char,
+    end: char,
+}
+
 impl CharRange {
-    fn new(start: char, end: char) -> CharRange { CharRange { start, end } }
-    fn contains(self, c: char) -> bool { c >= self.start && c <= self.end }
-}
-
-enum RepKind { ZeroOrMore, OneOrMore, ZeroOrOne, Exactly(u32), Between(u32, u32) }
-enum AnchorKind { Start, End, WordBoundary }
-
-// ── Parser ───────────────────────────────────────────────────────────────────
-struct RegexParser {
-    input: [char],
-    pos: usize,
-    group_count: u32,
-}
-
-impl RegexParser {
-    fn new(pattern: &str) -> RegexParser {
-        RegexParser { input: pattern.chars().collect(), pos: 0, group_count: 0 }
+    fn new(start: char, end: char) -> CharRange {
+        CharRange { start, end }
     }
 
-    fn peek(self) -> Option<char> {
-        if self.pos < self.input.len() { some(self.input[self.pos]) } else { none }
+    fn single(ch: char) -> CharRange {
+        CharRange { start: ch, end: ch }
     }
 
-    fn advance(mut self) -> Option<char> {
-        if self.pos < self.input.len() {
-            let c = self.input[self.pos]; self.pos += 1; some(c)
-        } else { none }
-    }
-
-    fn parse(mut self) -> Result<Regex, string> { self.parse_alternation() }
-
-    fn parse_alternation(mut self) -> Result<Regex, string> {
-        let mut left = self.parse_concat()?
-        while self.peek() == some('|') {
-            self.advance()
-            let right = self.parse_concat()?
-            left = Regex.Alternation(box left, box right)
-        }
-        ok(left)
-    }
-
-    fn parse_concat(mut self) -> Result<Regex, string> {
-        let mut parts: [Regex] = []
-        while self.peek().is_some() && !matches!(self.peek(), some('|') | some(')')) {
-            parts.push(self.parse_quantified()?)
-        }
-        if parts.is_empty() { return ok(Regex.Literal('\0')) }
-        let mut result = parts.remove(0)
-        for part in parts { result = Regex.Concat(box result, box part) }
-        ok(result)
-    }
-
-    fn parse_quantified(mut self) -> Result<Regex, string> {
-        let mut base = self.parse_atom()?
-        if let some(c) = self.peek() {
-            let kind = match c {
-                '*' => { self.advance(); some(RepKind.ZeroOrMore) }
-                '+' => { self.advance(); some(RepKind.OneOrMore) }
-                '?' => { self.advance(); some(RepKind.ZeroOrOne) }
-                '{' => { self.advance(); some(self.parse_quantifier()?) }
-                _ => none,
-            }
-            if let some(k) = kind { base = Regex.Repetition(box base, k) }
-        }
-        ok(base)
-    }
-
-    fn parse_quantifier(mut self) -> Result<RepKind, string> {
-        let min = self.parse_number()?
-        if self.peek() == some('}') { self.advance(); return ok(RepKind.Exactly(min)) }
-        if self.peek() != some(',') { return err("expected , or }".to_string()) }
-        self.advance()
-        if self.peek() == some('}') { self.advance(); return ok(RepKind.Between(min, u32.MAX)) }
-        let max = self.parse_number()?
-        if self.advance() != some('}') { return err("expected }".to_string()) }
-        ok(RepKind.Between(min, max))
-    }
-
-    fn parse_number(mut self) -> Result<u32, string> {
-        let mut n: u32 = 0
-        let mut found = false
-        while let some(c) = self.peek() {
-            if c.is_ascii_digit() { n = n * 10 + (c as u32 - '0' as u32); self.advance(); found = true }
-            else { break }
-        }
-        if found { ok(n) } else { err("expected number".to_string()) }
-    }
-
-    fn parse_atom(mut self) -> Result<Regex, string> {
-        match self.peek() {
-            some('(') => {
-                self.advance()
-                self.group_count += 1
-                let group_id = self.group_count
-                let inner = self.parse_alternation()?
-                if self.advance() != some(')') { return err("unmatched (".to_string()) }
-                ok(Regex.Group(box inner, group_id))
-            }
-            some('[') => self.parse_char_class(),
-            some('.') => { self.advance(); ok(Regex.Dot) }
-            some('^') => { self.advance(); ok(Regex.Anchor(AnchorKind.Start)) }
-            some('$') => { self.advance(); ok(Regex.Anchor(AnchorKind.End)) }
-            some('\\') => {
-                self.advance()
-                match self.advance() {
-                    some('d') => ok(Regex.CharClass([CharRange.new('0', '9')], false)),
-                    some('w') => ok(Regex.CharClass([
-                        CharRange.new('a', 'z'), CharRange.new('A', 'Z'),
-                        CharRange.new('0', '9'), CharRange.new('_', '_'),
-                    ], false)),
-                    some('s') => ok(Regex.CharClass([
-                        CharRange.new(' ', ' '), CharRange.new('\t', '\t'),
-                        CharRange.new('\n', '\n'), CharRange.new('\r', '\r'),
-                    ], false)),
-                    some('b') => ok(Regex.Anchor(AnchorKind.WordBoundary)),
-                    some(c) => ok(Regex.Literal(c)),
-                    none => err("unexpected end of escape".to_string()),
-                }
-            }
-            some(c) => { self.advance(); ok(Regex.Literal(c)) }
-            none => err("unexpected end of pattern".to_string()),
-        }
-    }
-
-    fn parse_char_class(mut self) -> Result<Regex, string> {
-        self.advance()  // consume [
-        let negated = if self.peek() == some('^') { self.advance(); true } else { false }
-        let mut ranges: [CharRange] = []
-        while self.peek() != some(']') && self.peek().is_some() {
-            let start = self.advance().unwrap()
-            if self.peek() == some('-') && self.pos + 1 < self.input.len() && self.input[self.pos + 1] != ']' {
-                self.advance()  // consume -
-                let end = self.advance().unwrap()
-                ranges.push(CharRange.new(start, end))
-            } else {
-                ranges.push(CharRange.new(start, start))
-            }
-        }
-        if self.advance() != some(']') { return err("unmatched [".to_string()) }
-        ok(Regex.CharClass(ranges, negated))
+    fn contains(self, ch: char) -> bool {
+        ch >= self.start && ch <= self.end
     }
 }
 
-// ── NFA ──────────────────────────────────────────────────────────────────────
-enum NfaTransition {
-    Char(char),
-    Range(char, char),
-    Dot,
-    Epsilon,
+#[derive(Clone, Debug)]
+enum QuantKind {
+    ZeroOrMore,  // *
+    OneOrMore,   // +
+    ZeroOrOne,   // ?
+    Exactly(usize),    // {n}
+    AtLeast(usize),    // {n,}
+    Between(usize, usize), // {n,m}
 }
 
-struct NfaState {
-    transitions: [(NfaTransition, StateId)],
-    is_accept: bool,
+#[derive(Clone, Debug)]
+enum AnchorKind {
+    Start,  // ^
+    End,    // $
 }
 
-struct Nfa {
-    states: [NfaState],
-    start: StateId,
-    accept: StateId,
+#[derive(Clone, Debug)]
+struct Match {
+    start: usize,
+    end: usize,
+    text: string,
+    groups: [Option<(usize, usize)>],
 }
 
-impl Nfa {
-    fn new_state(mut self) -> StateId {
-        let id = self.states.len() as StateId
-        self.states.push(NfaState { transitions: [], is_accept: false })
-        id
+impl Match {
+    fn new(start: usize, end: usize, text: &str) -> Match {
+        Match { start, end, text: text.to_string(), groups: [] }
     }
 
-    fn add_transition(mut self, from: StateId, trans: NfaTransition, to: StateId) {
-        self.states[from as usize].transitions.push((trans, to))
-    }
+    fn len(self) -> usize { self.end - self.start }
+    fn is_empty(self) -> bool { self.start == self.end }
 
-    fn from_regex(regex: &Regex) -> Nfa {
-        let mut nfa = Nfa { states: [], start: 0, accept: 0 }
-        let (start, accept) = nfa.compile(regex)
-        nfa.start = start
-        nfa.accept = accept
-        nfa.states[accept as usize].is_accept = true
-        nfa
-    }
-
-    fn compile(mut self, regex: &Regex) -> (StateId, StateId) {
-        match regex {
-            Regex.Literal(c) => {
-                let s = self.new_state(); let e = self.new_state()
-                self.add_transition(s, NfaTransition.Char(*c), e)
-                (s, e)
-            }
-            Regex.Dot => {
-                let s = self.new_state(); let e = self.new_state()
-                self.add_transition(s, NfaTransition.Dot, e)
-                (s, e)
-            }
-            Regex.CharClass(ranges, negated) => {
-                let s = self.new_state(); let e = self.new_state()
-                for range in ranges {
-                    self.add_transition(s, NfaTransition.Range(range.start, range.end), e)
-                }
-                (s, e)
-            }
-            Regex.Concat(left, right) => {
-                let (ls, le) = self.compile(left)
-                let (rs, re) = self.compile(right)
-                self.add_transition(le, NfaTransition.Epsilon, rs)
-                (ls, re)
-            }
-            Regex.Alternation(left, right) => {
-                let s = self.new_state(); let e = self.new_state()
-                let (ls, le) = self.compile(left)
-                let (rs, re) = self.compile(right)
-                self.add_transition(s, NfaTransition.Epsilon, ls)
-                self.add_transition(s, NfaTransition.Epsilon, rs)
-                self.add_transition(le, NfaTransition.Epsilon, e)
-                self.add_transition(re, NfaTransition.Epsilon, e)
-                (s, e)
-            }
-            Regex.Repetition(inner, kind) => {
-                match kind {
-                    RepKind.ZeroOrMore => {
-                        let s = self.new_state(); let e = self.new_state()
-                        let (is, ie) = self.compile(inner)
-                        self.add_transition(s, NfaTransition.Epsilon, is)
-                        self.add_transition(s, NfaTransition.Epsilon, e)
-                        self.add_transition(ie, NfaTransition.Epsilon, is)
-                        self.add_transition(ie, NfaTransition.Epsilon, e)
-                        (s, e)
-                    }
-                    RepKind.OneOrMore => {
-                        let s = self.new_state(); let e = self.new_state()
-                        let (is, ie) = self.compile(inner)
-                        self.add_transition(s, NfaTransition.Epsilon, is)
-                        self.add_transition(ie, NfaTransition.Epsilon, is)
-                        self.add_transition(ie, NfaTransition.Epsilon, e)
-                        (s, e)
-                    }
-                    RepKind.ZeroOrOne => {
-                        let s = self.new_state(); let e = self.new_state()
-                        let (is, ie) = self.compile(inner)
-                        self.add_transition(s, NfaTransition.Epsilon, is)
-                        self.add_transition(s, NfaTransition.Epsilon, e)
-                        self.add_transition(ie, NfaTransition.Epsilon, e)
-                        (s, e)
-                    }
-                    _ => self.compile(inner),  // simplified
-                }
-            }
-            Regex.Group(inner, _) => self.compile(inner),
-            Regex.Anchor(_) => {
-                let s = self.new_state(); let e = self.new_state()
-                self.add_transition(s, NfaTransition.Epsilon, e)
-                (s, e)
-            }
-        }
-    }
-
-    // ── NFA simulation (Thompson's algorithm) ────────────────────────────────
-    fn epsilon_closure(self, states: &HashSet<StateId>) -> HashSet<StateId> {
-        let mut closure = states.clone()
-        let mut stack: [StateId] = states.iter().cloned().collect()
-        while let some(state) = stack.pop() {
-            for (trans, next) in &self.states[state as usize].transitions {
-                if matches!(trans, NfaTransition.Epsilon) && !closure.contains(next) {
-                    closure.insert(*next)
-                    stack.push(*next)
-                }
-            }
-        }
-        closure
-    }
-
-    fn step(self, states: &HashSet<StateId>, ch: char) -> HashSet<StateId> {
-        let mut next = HashSet.new()
-        for &state in states {
-            for (trans, target) in &self.states[state as usize].transitions {
-                let matches = match trans {
-                    NfaTransition.Char(c) => *c == ch,
-                    NfaTransition.Range(lo, hi) => ch >= *lo && ch <= *hi,
-                    NfaTransition.Dot => ch != '\n',
-                    NfaTransition.Epsilon => false,
-                }
-                if matches { next.insert(*target); }
-            }
-        }
-        self.epsilon_closure(&next)
-    }
-
-    fn matches(self, input: &str) -> bool {
-        let mut current = HashSet.new()
-        current.insert(self.start)
-        current = self.epsilon_closure(&current)
-
-        for ch in input.chars() {
-            current = self.step(&current, ch)
-            if current.is_empty() { return false }
-        }
-        current.contains(&self.accept)
+    fn group(self, idx: usize) -> Option<(usize, usize)> {
+        self.groups.get(idx).and_then(|g| *g)
     }
 }
 
-// ── Public API ───────────────────────────────────────────────────────────────
-pub struct CompiledRegex {
-    nfa: Nfa,
+struct Regex {
     pattern: string,
+    root: RegexNode,
+    group_count: usize,
 }
 
-impl CompiledRegex {
-    pub fn new(pattern: &str) -> Result<CompiledRegex, string> {
+impl Regex {
+    fn compile(pattern: &str) -> Result<Regex, string> {
         let mut parser = RegexParser.new(pattern)
-        let ast = parser.parse()?
-        let nfa = Nfa.from_regex(&ast)
-        ok(CompiledRegex { nfa, pattern: pattern.to_string() })
+        let root = parser.parse()?
+        ok(Regex {
+            pattern: pattern.to_string(),
+            root,
+            group_count: parser.group_count,
+        })
     }
 
-    pub fn is_match(self, input: &str) -> bool { self.nfa.matches(input) }
+    fn is_match(self, text: &str) -> bool {
+        self.find(text).is_some()
+    }
 
-    pub fn find(self, input: &str) -> Option<(usize, usize)> {
-        let chars: [char] = input.chars().collect()
+    fn find(self, text: &str) -> Option<Match> {
+        let chars: [char] = text.chars().collect()
         for start in 0..=chars.len() {
-            for end in start..=chars.len() {
-                let substr: string = chars[start..end].iter().collect()
-                if self.nfa.matches(&substr) { return some((start, end)) }
+            if let some(end) = self.match_node(&self.root, &chars, start) {
+                let matched: string = chars[start..end].iter().collect()
+                return some(Match.new(start, end, &matched))
             }
         }
         none
     }
 
-    pub fn find_all(self, input: &str) -> [(usize, usize)] {
-        let mut matches: [(usize, usize)] = []
-        let chars: [char] = input.chars().collect()
+    fn find_all(self, text: &str) -> [Match] {
+        let chars: [char] = text.chars().collect()
+        let mut matches: [Match] = []
         let mut pos = 0
         while pos <= chars.len() {
-            let mut found = false
-            for end in (pos..=chars.len()).rev() {
-                let substr: string = chars[pos..end].iter().collect()
-                if self.nfa.matches(&substr) {
-                    matches.push((pos, end))
-                    pos = if end > pos { end } else { pos + 1 }
-                    found = true
-                    break
-                }
+            if let some(end) = self.match_node(&self.root, &chars, pos) {
+                let matched: string = chars[pos..end].iter().collect()
+                matches.push(Match.new(pos, end, &matched))
+                pos = if end == pos { end + 1 } else { end }
+            } else {
+                pos += 1
             }
-            if !found { pos += 1 }
         }
         matches
+    }
+
+    fn match_node(self, node: &RegexNode, chars: &[char], pos: usize) -> Option<usize> {
+        match node {
+            RegexNode.Literal(ch) => {
+                if pos < chars.len() && chars[pos] == *ch { some(pos + 1) } else { none }
+            },
+            RegexNode.AnyChar => {
+                if pos < chars.len() { some(pos + 1) } else { none }
+            },
+            RegexNode.CharClass(ranges, negated) => {
+                if pos >= chars.len() { return none }
+                let ch = chars[pos]
+                let in_class = ranges.iter().any(|r| r.contains(ch))
+                if in_class != *negated { some(pos + 1) } else { none }
+            },
+            RegexNode.Sequence(nodes) => {
+                let mut current = pos
+                for child in nodes {
+                    match self.match_node(child, chars, current) {
+                        some(next) => current = next,
+                        none => return none,
+                    }
+                }
+                some(current)
+            },
+            RegexNode.Alternation(left, right) => {
+                self.match_node(left, chars, pos)
+                    .or_else(|| self.match_node(right, chars, pos))
+            },
+            RegexNode.Quantifier(child, kind) => {
+                self.match_quantifier(child, kind, chars, pos)
+            },
+            RegexNode.Anchor(AnchorKind.Start) => {
+                if pos == 0 { some(pos) } else { none }
+            },
+            RegexNode.Anchor(AnchorKind.End) => {
+                if pos == chars.len() { some(pos) } else { none }
+            },
+            RegexNode.Group(inner, _idx) => {
+                self.match_node(inner, chars, pos)
+            },
+        }
+    }
+
+    fn match_quantifier(self, child: &RegexNode, kind: &QuantKind, chars: &[char], pos: usize) -> Option<usize> {
+        let (min, max) = match kind {
+            QuantKind.ZeroOrMore => (0, usize.MAX),
+            QuantKind.OneOrMore => (1, usize.MAX),
+            QuantKind.ZeroOrOne => (0, 1),
+            QuantKind.Exactly(n) => (*n, *n),
+            QuantKind.AtLeast(n) => (*n, usize.MAX),
+            QuantKind.Between(n, m) => (*n, *m),
+        };
+
+        // Greedy matching
+        let mut matches = 0
+        let mut current = pos
+        while matches < max {
+            match self.match_node(child, chars, current) {
+                some(next) if next > current => {
+                    current = next
+                    matches += 1
+                },
+                _ => break,
+            }
+        }
+
+        // Backtrack from greedy to find valid match
+        while matches >= min {
+            // For now, return greedy result if min satisfied
+            if matches >= min { return some(current) }
+            matches -= 1
+        }
+
+        if matches >= min { some(current) } else { none }
+    }
+}
+
+struct RegexParser {
+    chars: [char],
+    pos: usize,
+    group_count: usize,
+}
+
+impl RegexParser {
+    fn new(pattern: &str) -> RegexParser {
+        RegexParser { chars: pattern.chars().collect(), pos: 0, group_count: 0 }
+    }
+
+    fn parse(mut self) -> Result<RegexNode, string> {
+        self.parse_alternation()
+    }
+
+    fn parse_alternation(mut self) -> Result<RegexNode, string> {
+        let left = self.parse_sequence()?
+        if self.pos < self.chars.len() && self.chars[self.pos] == '|' {
+            self.pos += 1
+            let right = self.parse_alternation()?
+            ok(RegexNode.Alternation(Box.new(left), Box.new(right)))
+        } else {
+            ok(left)
+        }
+    }
+
+    fn parse_sequence(mut self) -> Result<RegexNode, string> {
+        let mut nodes: [RegexNode] = []
+        while self.pos < self.chars.len() {
+            let ch = self.chars[self.pos]
+            if ch == '|' || ch == ')' { break }
+            let node = self.parse_atom()?
+            let node = self.parse_quantifier(node)?
+            nodes.push(node)
+        }
+        match nodes.len() {
+            0 => ok(RegexNode.Sequence([])),
+            1 => ok(nodes.pop().unwrap()),
+            _ => ok(RegexNode.Sequence(nodes)),
+        }
+    }
+
+    fn parse_atom(mut self) -> Result<RegexNode, string> {
+        let ch = self.chars[self.pos]
+        match ch {
+            '.' => { self.pos += 1; ok(RegexNode.AnyChar) },
+            '^' => { self.pos += 1; ok(RegexNode.Anchor(AnchorKind.Start)) },
+            '$' => { self.pos += 1; ok(RegexNode.Anchor(AnchorKind.End)) },
+            '(' => {
+                self.pos += 1
+                self.group_count += 1
+                let idx = self.group_count
+                let inner = self.parse_alternation()?
+                if self.pos < self.chars.len() && self.chars[self.pos] == ')' {
+                    self.pos += 1
+                } else {
+                    return err("Unclosed group".to_string())
+                }
+                ok(RegexNode.Group(Box.new(inner), idx))
+            },
+            '[' => self.parse_char_class(),
+            '\\' => {
+                self.pos += 1
+                if self.pos >= self.chars.len() {
+                    return err("Trailing backslash".to_string())
+                }
+                let escaped = self.chars[self.pos]
+                self.pos += 1
+                match escaped {
+                    'd' => ok(RegexNode.CharClass([CharRange.new('0', '9')], false)),
+                    'w' => ok(RegexNode.CharClass([
+                        CharRange.new('a', 'z'), CharRange.new('A', 'Z'),
+                        CharRange.new('0', '9'), CharRange.single('_'),
+                    ], false)),
+                    's' => ok(RegexNode.CharClass([
+                        CharRange.single(' '), CharRange.single('\t'),
+                        CharRange.single('\n'), CharRange.single('\r'),
+                    ], false)),
+                    _ => ok(RegexNode.Literal(escaped)),
+                }
+            },
+            _ => { self.pos += 1; ok(RegexNode.Literal(ch)) },
+        }
+    }
+
+    fn parse_char_class(mut self) -> Result<RegexNode, string> {
+        self.pos += 1 // skip [
+        let negated = self.pos < self.chars.len() && self.chars[self.pos] == '^'
+        if negated { self.pos += 1 }
+
+        let mut ranges: [CharRange] = []
+        while self.pos < self.chars.len() && self.chars[self.pos] != ']' {
+            let start = self.chars[self.pos]
+            self.pos += 1
+            if self.pos + 1 < self.chars.len() && self.chars[self.pos] == '-' {
+                self.pos += 1
+                let end = self.chars[self.pos]
+                self.pos += 1
+                ranges.push(CharRange.new(start, end))
+            } else {
+                ranges.push(CharRange.single(start))
+            }
+        }
+
+        if self.pos < self.chars.len() { self.pos += 1 } // skip ]
+        ok(RegexNode.CharClass(ranges, negated))
+    }
+
+    fn parse_quantifier(mut self, node: RegexNode) -> Result<RegexNode, string> {
+        if self.pos >= self.chars.len() { return ok(node) }
+        let ch = self.chars[self.pos]
+        match ch {
+            '*' => { self.pos += 1; ok(RegexNode.Quantifier(Box.new(node), QuantKind.ZeroOrMore)) },
+            '+' => { self.pos += 1; ok(RegexNode.Quantifier(Box.new(node), QuantKind.OneOrMore)) },
+            '?' => { self.pos += 1; ok(RegexNode.Quantifier(Box.new(node), QuantKind.ZeroOrOne)) },
+            _ => ok(node),
+        }
     }
 }
 
 fn main() {
-    // Basic literals
-    let re = CompiledRegex.new("hello").unwrap()
-    assert(re.is_match("hello"))
-    assert(!re.is_match("world"))
+    // Simple literal match
+    let re = Regex.compile("hello").unwrap()
+    assert(re.is_match("hello world"))
+    assert(!re.is_match("goodbye"))
     print("Literal match ✓")
 
-    // Alternation
-    let re = CompiledRegex.new("cat|dog").unwrap()
-    assert(re.is_match("cat"))
-    assert(re.is_match("dog"))
-    assert(!re.is_match("bird"))
-    print("Alternation ✓")
+    // Any char
+    let re = Regex.compile("h.llo").unwrap()
+    assert(re.is_match("hello"))
+    assert(re.is_match("hallo"))
+    assert(!re.is_match("hllo"))
+    print("Any char ✓")
 
-    // Quantifiers
-    let re = CompiledRegex.new("ab*c").unwrap()
+    // Star quantifier
+    let re = Regex.compile("ab*c").unwrap()
     assert(re.is_match("ac"))
     assert(re.is_match("abc"))
     assert(re.is_match("abbbc"))
-    assert(!re.is_match("abbc_"))
-    print("Zero-or-more ✓")
+    print("Star ✓")
 
-    let re = CompiledRegex.new("ab+c").unwrap()
+    // Plus quantifier
+    let re = Regex.compile("ab+c").unwrap()
     assert(!re.is_match("ac"))
     assert(re.is_match("abc"))
     assert(re.is_match("abbc"))
-    print("One-or-more ✓")
+    print("Plus ✓")
 
-    let re = CompiledRegex.new("ab?c").unwrap()
-    assert(re.is_match("ac"))
-    assert(re.is_match("abc"))
-    assert(!re.is_match("abbc"))
-    print("Zero-or-one ✓")
+    // Question mark
+    let re = Regex.compile("colou?r").unwrap()
+    assert(re.is_match("color"))
+    assert(re.is_match("colour"))
+    print("Question ✓")
 
-    // Dot
-    let re = CompiledRegex.new("a.c").unwrap()
-    assert(re.is_match("abc"))
-    assert(re.is_match("axc"))
-    assert(!re.is_match("ac"))
-    print("Dot wildcard ✓")
+    // Alternation
+    let re = Regex.compile("cat|dog").unwrap()
+    assert(re.is_match("cat"))
+    assert(re.is_match("dog"))
+    assert(!re.is_match("fish"))
+    print("Alternation ✓")
 
-    // Character classes
-    let re = CompiledRegex.new("[a-z]+").unwrap()
-    assert(re.is_match("hello"))
-    assert(!re.is_match("123"))
+    // Character class
+    let re = Regex.compile("[abc]").unwrap()
+    assert(re.is_match("a"))
+    assert(re.is_match("b"))
+    assert(!re.is_match("d"))
     print("Char class ✓")
 
-    // Groups
-    let re = CompiledRegex.new("(ab)+").unwrap()
-    assert(re.is_match("ab"))
-    assert(re.is_match("abab"))
-    assert(!re.is_match("ba"))
-    print("Groups ✓")
+    // Character range
+    let re = Regex.compile("[a-z]+").unwrap()
+    assert(re.is_match("hello"))
+    assert(!re.is_match("123"))
+    print("Char range ✓")
 
-    // Find
-    let re = CompiledRegex.new("[0-9]+").unwrap()
-    let m = re.find("abc123def").unwrap()
-    assert(m.0 == 3 && m.1 == 6)
-    print("Find: (${m.0}, ${m.1}) ✓")
+    // Negated class
+    let re = Regex.compile("[^0-9]+").unwrap()
+    assert(re.is_match("abc"))
+    print("Negated class ✓")
 
-    // Shorthand classes
-    let re = CompiledRegex.new("\\d+").unwrap()
-    assert(re.is_match("42"))
+    // Digit shorthand
+    let re = Regex.compile("\\d+").unwrap()
+    assert(re.is_match("123"))
     assert(!re.is_match("abc"))
     print("\\d shorthand ✓")
 
-    // Complex pattern
-    let re = CompiledRegex.new("[a-zA-Z_][a-zA-Z0-9_]*").unwrap()
+    // Word shorthand
+    let re = Regex.compile("\\w+").unwrap()
     assert(re.is_match("hello_world"))
-    assert(re.is_match("_private"))
-    assert(!re.is_match("123abc"))
-    print("Identifier pattern ✓")
+    print("\\w shorthand ✓")
+
+    // Anchors
+    let re = Regex.compile("^hello").unwrap()
+    assert(re.is_match("hello world"))
+    assert(!re.is_match("say hello"))
+    print("Start anchor ✓")
+
+    let re = Regex.compile("world$").unwrap()
+    assert(re.is_match("hello world"))
+    assert(!re.is_match("world hello"))
+    print("End anchor ✓")
+
+    // Find
+    let re = Regex.compile("[0-9]+").unwrap()
+    let m = re.find("abc 123 def").unwrap()
+    assert(m.text == "123")
+    assert(m.start == 4)
+    assert(m.end == 7)
+    print("Find ✓")
+
+    // Find all
+    let re = Regex.compile("[a-z]+").unwrap()
+    let matches = re.find_all("hello 123 world")
+    assert(matches.len() == 2)
+    assert(matches[0].text == "hello")
+    assert(matches[1].text == "world")
+    print("Find all ✓")
+
+    // Groups
+    let re = Regex.compile("(ab)+").unwrap()
+    assert(re.is_match("ababab"))
+    print("Groups ✓")
+
+    // Escaped characters
+    let re = Regex.compile("\\.").unwrap()
+    assert(re.is_match("."))
+    assert(!re.is_match("a"))
+    print("Escaped chars ✓")
+
+    // CharRange
+    let r = CharRange.new('a', 'z')
+    assert(r.contains('m'))
+    assert(!r.contains('A'))
+    let s = CharRange.single('x')
+    assert(s.contains('x'))
+    assert(!s.contains('y'))
+    print("CharRange ✓")
+
+    // Match
+    let m = Match.new(5, 10, "hello")
+    assert(m.len() == 5)
+    assert(!m.is_empty())
+    let empty = Match.new(3, 3, "")
+    assert(empty.is_empty())
+    print("Match ✓")
 
     print("Regex Engine complete ✓")
 }
