@@ -1,0 +1,174 @@
+// lsp_server.ltl — Language Server Protocol server skeleton for Lateralus
+use std.io.{stdin, stdout, BufReader}
+use std.encoding.json.{parse, stringify, JsonValue}
+
+// LSP message framing: Content-Length: N
+
+{json}
+fn read_message(reader: mut BufReader) -> Result<JsonValue, string> {
+    let mut header = ""
+    loop {
+        let line = reader.read_line()?
+        if line == "
+" || line == "
+" { break }
+        header += line
+    }
+    let content_length = header.lines()
+        |> find(|l| l.starts_with("Content-Length:"))
+        |> map(|l| l.split(":")[1].trim().parse_int())
+        |> flatten()
+        .ok_or("missing Content-Length")?
+    let mut buf = [0u8; content_length]
+    reader.read_exact(mut buf)?
+    parse(string.from_utf8(buf)?)
+}
+
+fn send_message(msg: JsonValue) {
+    let body  = stringify(msg)
+    let bytes = body.as_bytes()
+    stdout().write_all("Content-Length: ${bytes.len()}
+
+".as_bytes())
+    stdout().write_all(bytes)
+    stdout().flush()
+}
+
+fn make_response(id: JsonValue, result: JsonValue) -> JsonValue {
+    JsonValue.Object({
+        "jsonrpc": JsonValue.Str("2.0"),
+        "id":      id,
+        "result":  result,
+    })
+}
+
+fn make_notification(method: string, params: JsonValue) -> JsonValue {
+    JsonValue.Object({
+        "jsonrpc": JsonValue.Str("2.0"),
+        "method":  JsonValue.Str(method),
+        "params":  params,
+    })
+}
+
+struct LspState {
+    root_uri:    string,
+    open_docs:   dict<string, string>,
+    initialized: bool,
+}
+
+impl LspState {
+    fn new() -> LspState {
+        LspState { root_uri: "", open_docs: {}, initialized: false }
+    }
+
+    fn handle(mut self, msg: JsonValue) -> JsonValue? {
+        let method = msg["method"].as_str() ?? ""
+        let id     = msg.get("id").cloned() ?? JsonValue.Null
+        let params = msg.get("params").cloned() ?? JsonValue.Null
+
+        match method.as_str() {
+            "initialize" => {
+                self.initialized = true
+                some(make_response(id, JsonValue.Object({
+                    "capabilities": JsonValue.Object({
+                        "textDocumentSync":          JsonValue.Number(1.0),
+                        "hoverProvider":             JsonValue.Bool(true),
+                        "completionProvider":        JsonValue.Object({"triggerCharacters": JsonValue.Array([JsonValue.Str(".")])}),
+                        "definitionProvider":        JsonValue.Bool(true),
+                        "documentSymbolProvider":    JsonValue.Bool(true),
+                        "diagnosticProvider":        JsonValue.Object({"interFileDependencies": JsonValue.Bool(true), "workspaceDiagnostics": JsonValue.Bool(false)}),
+                    }),
+                    "serverInfo": JsonValue.Object({"name": JsonValue.Str("lateralus-lsp"), "version": JsonValue.Str("0.1.0")}),
+                })))
+            },
+            "initialized" => none,
+            "shutdown"    => some(make_response(id, JsonValue.Null)),
+            "exit"        => { std.process.exit(0); none },
+
+            "textDocument/didOpen" => {
+                let uri  = params["textDocument"]["uri"].as_str() ?? ""
+                let text = params["textDocument"]["text"].as_str() ?? ""
+                self.open_docs[uri] = text
+                let diags = self.diagnose(uri, text)
+                some(make_notification("textDocument/publishDiagnostics", JsonValue.Object({
+                    "uri":         JsonValue.Str(uri),
+                    "diagnostics": diags,
+                })))
+            },
+
+            "textDocument/hover" => {
+                let uri  = params["textDocument"]["uri"].as_str() ?? ""
+                let line = params["position"]["line"].as_int() ?? 0
+                let col  = params["position"]["character"].as_int() ?? 0
+                let word = self.word_at(uri, line, col)
+                some(make_response(id, JsonValue.Object({
+                    "contents": JsonValue.Object({
+                        "kind":  JsonValue.Str("markdown"),
+                        "value": JsonValue.Str("**${word}** — Lateralus symbol"),
+                    })
+                })))
+            },
+
+            "textDocument/completion" => {
+                let keywords = ["fn","let","mut","struct","enum","impl","match","if","else","for","while","return","async","await","use","pub","trait","type"]
+                let items = keywords |> map(|kw| JsonValue.Object({
+                    "label":  JsonValue.Str(kw),
+                    "kind":   JsonValue.Number(14.0),  // Keyword
+                })) |> collect()
+                some(make_response(id, JsonValue.Object({
+                    "isIncomplete": JsonValue.Bool(false),
+                    "items":        JsonValue.Array(items),
+                })))
+            },
+
+            _ => none,
+        }
+    }
+
+    fn diagnose(self, _uri: string, text: string) -> JsonValue {
+        let mut diags = []
+        for (i, line) in text.lines().enumerate() {
+            if line.contains("TODO") {
+                diags.push(JsonValue.Object({
+                    "range":    make_range(i, 0, i, line.len()),
+                    "severity": JsonValue.Number(3.0),  // Information
+                    "message":  JsonValue.Str("TODO comment"),
+                    "source":   JsonValue.Str("lateralus-lsp"),
+                }))
+            }
+        }
+        JsonValue.Array(diags)
+    }
+
+    fn word_at(self, uri: string, line: int, col: int) -> string {
+        let text  = self.open_docs.get(uri) ?? return ""
+        let lines = text.lines() |> collect()
+        if line >= lines.len() { return "" }
+        let src   = lines[line]
+        let chars = src.chars() |> collect()
+        let mut start = col
+        let mut end   = col
+        while start > 0 && chars[start-1].is_alphanumeric() { start -= 1 }
+        while end < chars.len() && chars[end].is_alphanumeric() { end += 1 }
+        chars[start..end] |> collect_string()
+    }
+}
+
+fn make_range(sl: int, sc: int, el: int, ec: int) -> JsonValue {
+    JsonValue.Object({
+        "start": JsonValue.Object({"line": JsonValue.Number(sl as float), "character": JsonValue.Number(sc as float)}),
+        "end":   JsonValue.Object({"line": JsonValue.Number(el as float), "character": JsonValue.Number(ec as float)}),
+    })
+}
+
+fn main() {
+    let mut state  = LspState.new()
+    let mut reader = BufReader.new(stdin())
+    print("lateralus-lsp ready", stderr: true)
+    loop {
+        match read_message(mut reader) {
+            ok(msg)  => { if let some(resp) = state.handle(msg) { send_message(resp) } },
+            err(e)   => { print("read error: ${e}", stderr: true); break },
+        }
+    }
+}
