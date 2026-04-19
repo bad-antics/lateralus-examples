@@ -1,0 +1,361 @@
+// Niche Example - Neural Network
+// Feedforward network, backpropagation, activation functions, and training.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+enum Activation {
+    Sigmoid,
+    ReLU,
+    Tanh,
+    Softmax,
+    Linear,
+}
+
+impl Activation {
+    fn apply(self, x: f64) -> f64 {
+        match self {
+            Activation.Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            Activation.ReLU => if x > 0.0 { x } else { 0.0 },
+            Activation.Tanh => x.tanh(),
+            Activation.Linear => x,
+            Activation.Softmax => x, // applied at layer level
+        }
+    }
+
+    fn derivative(self, x: f64) -> f64 {
+        match self {
+            Activation.Sigmoid => {
+                let s = self.apply(x)
+                s * (1.0 - s)
+            },
+            Activation.ReLU => if x > 0.0 { 1.0 } else { 0.0 },
+            Activation.Tanh => 1.0 - x.tanh().powi(2),
+            Activation.Linear => 1.0,
+            Activation.Softmax => 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Matrix {
+    rows: usize,
+    cols: usize,
+    data: [f64],
+}
+
+impl Matrix {
+    fn zeros(rows: usize, cols: usize) -> Matrix {
+        Matrix { rows, cols, data: vec![0.0; rows * cols] }
+    }
+
+    fn random(rows: usize, cols: usize) -> Matrix {
+        let mut data: [f64] = vec![0.0; rows * cols]
+        let scale = (2.0 / (rows + cols) as f64).sqrt() // Xavier init
+        for i in 0..data.len() {
+            data[i] = (simple_random(i) - 0.5) * 2.0 * scale
+        }
+        Matrix { rows, cols, data }
+    }
+
+    fn get(self, row: usize, col: usize) -> f64 {
+        self.data[row * self.cols + col]
+    }
+
+    fn set(mut self, row: usize, col: usize, val: f64) {
+        self.data[row * self.cols + col] = val
+    }
+
+    fn mul(self, other: &Matrix) -> Matrix {
+        assert(self.cols == other.rows)
+        let mut result = Matrix.zeros(self.rows, other.cols)
+        for i in 0..self.rows {
+            for j in 0..other.cols {
+                let mut sum = 0.0
+                for k in 0..self.cols {
+                    sum += self.get(i, k) * other.get(k, j)
+                }
+                result.set(i, j, sum)
+            }
+        }
+        result
+    }
+
+    fn transpose(self) -> Matrix {
+        let mut result = Matrix.zeros(self.cols, self.rows)
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                result.set(j, i, self.get(i, j))
+            }
+        }
+        result
+    }
+
+    fn add(self, other: &Matrix) -> Matrix {
+        assert(self.rows == other.rows && self.cols == other.cols)
+        let mut result = self.clone()
+        for i in 0..self.data.len() {
+            result.data[i] += other.data[i]
+        }
+        result
+    }
+
+    fn sub(self, other: &Matrix) -> Matrix {
+        assert(self.rows == other.rows && self.cols == other.cols)
+        let mut result = self.clone()
+        for i in 0..self.data.len() {
+            result.data[i] -= other.data[i]
+        }
+        result
+    }
+
+    fn scale(self, factor: f64) -> Matrix {
+        let mut result = self.clone()
+        for i in 0..result.data.len() {
+            result.data[i] *= factor
+        }
+        result
+    }
+
+    fn element_mul(self, other: &Matrix) -> Matrix {
+        assert(self.rows == other.rows && self.cols == other.cols)
+        let mut result = self.clone()
+        for i in 0..self.data.len() {
+            result.data[i] *= other.data[i]
+        }
+        result
+    }
+
+    fn apply_fn(self, f: fn(f64) -> f64) -> Matrix {
+        let mut result = self.clone()
+        for i in 0..result.data.len() {
+            result.data[i] = f(result.data[i])
+        }
+        result
+    }
+
+    fn sum(self) -> f64 {
+        self.data.iter().sum()
+    }
+
+    fn max_index(self) -> usize {
+        let mut max_i = 0
+        let mut max_v = self.data[0]
+        for i in 1..self.data.len() {
+            if self.data[i] > max_v {
+                max_v = self.data[i]
+                max_i = i
+            }
+        }
+        max_i
+    }
+}
+
+// Simple deterministic pseudo-random for reproducibility
+fn simple_random(seed: usize) -> f64 {
+    let x = (seed * 1103515245 + 12345) % (1 << 31)
+    x as f64 / (1 << 31) as f64
+}
+
+#[derive(Clone, Debug)]
+struct Layer {
+    weights: Matrix,
+    biases: Matrix,
+    activation: Activation,
+    // Cached for backprop
+    last_input: Option<Matrix>,
+    last_output: Option<Matrix>,
+    last_z: Option<Matrix>, // pre-activation
+}
+
+impl Layer {
+    fn new(input_size: usize, output_size: usize, activation: Activation) -> Layer {
+        Layer {
+            weights: Matrix.random(input_size, output_size),
+            biases: Matrix.zeros(1, output_size),
+            activation,
+            last_input: none,
+            last_output: none,
+            last_z: none,
+        }
+    }
+
+    fn forward(mut self, input: &Matrix) -> Matrix {
+        let z = input.mul(&self.weights).add(&self.biases)
+        let output = z.apply_fn(|x| self.activation.apply(x))
+        self.last_input = some(input.clone())
+        self.last_z = some(z)
+        self.last_output = some(output.clone())
+        output
+    }
+
+    fn neuron_count(self) -> usize {
+        self.weights.cols
+    }
+}
+
+struct NeuralNetwork {
+    layers: [Layer],
+    learning_rate: f64,
+}
+
+impl NeuralNetwork {
+    fn new(learning_rate: f64) -> NeuralNetwork {
+        NeuralNetwork { layers: [], learning_rate }
+    }
+
+    fn add_layer(mut self, input_size: usize, output_size: usize, activation: Activation) {
+        self.layers.push(Layer.new(input_size, output_size, activation))
+    }
+
+    fn forward(mut self, input: &Matrix) -> Matrix {
+        let mut current = input.clone()
+        for layer in &mut self.layers {
+            current = layer.forward(&current)
+        }
+        current
+    }
+
+    fn predict(mut self, input: &[f64]) -> [f64] {
+        let m = Matrix { rows: 1, cols: input.len(), data: input.to_vec() }
+        let output = self.forward(&m)
+        output.data
+    }
+
+    fn layer_count(self) -> usize { self.layers.len() }
+
+    fn total_params(self) -> usize {
+        self.layers.iter().map(|l| {
+            l.weights.rows * l.weights.cols + l.biases.cols
+        }).sum()
+    }
+}
+
+// Loss functions
+fn mse_loss(predicted: &Matrix, target: &Matrix) -> f64 {
+    let diff = predicted.sub(target)
+    let squared = diff.element_mul(&diff)
+    squared.sum() / predicted.data.len() as f64
+}
+
+fn cross_entropy_loss(predicted: &Matrix, target: &Matrix) -> f64 {
+    let mut loss = 0.0
+    for i in 0..predicted.data.len() {
+        let p = predicted.data[i].max(1e-15).min(1.0 - 1e-15)
+        let t = target.data[i]
+        loss -= t * p.ln() + (1.0 - t) * (1.0 - p).ln()
+    }
+    loss / predicted.data.len() as f64
+}
+
+fn main() {
+    // Matrix basics
+    let a = Matrix.zeros(2, 3)
+    assert(a.rows == 2 && a.cols == 3)
+    assert(a.get(0, 0) == 0.0)
+    print("Matrix zeros ✓")
+
+    let mut b = Matrix.zeros(2, 2)
+    b.set(0, 0, 1.0); b.set(0, 1, 2.0)
+    b.set(1, 0, 3.0); b.set(1, 1, 4.0)
+    assert(b.get(1, 1) == 4.0)
+    print("Matrix set/get ✓")
+
+    // Matrix operations
+    let c = b.transpose()
+    assert(c.get(0, 1) == 3.0)
+    assert(c.get(1, 0) == 2.0)
+    print("Transpose ✓")
+
+    let sum = b.add(&b)
+    assert(sum.get(0, 0) == 2.0)
+    print("Add ✓")
+
+    let scaled = b.scale(2.0)
+    assert(scaled.get(0, 0) == 2.0)
+    assert(scaled.get(1, 1) == 8.0)
+    print("Scale ✓")
+
+    let prod = b.element_mul(&b)
+    assert(prod.get(0, 0) == 1.0)
+    assert(prod.get(1, 1) == 16.0)
+    print("Element mul ✓")
+
+    // Matrix multiply
+    let m1 = Matrix { rows: 1, cols: 2, data: [1.0, 2.0] }
+    let m2 = Matrix { rows: 2, cols: 1, data: [3.0, 4.0] }
+    let result = m1.mul(&m2)
+    assert(result.rows == 1 && result.cols == 1)
+    assert(result.get(0, 0) == 11.0) // 1*3 + 2*4
+    print("Matrix multiply ✓")
+
+    // Max index
+    let v = Matrix { rows: 1, cols: 4, data: [0.1, 0.8, 0.05, 0.05] }
+    assert(v.max_index() == 1)
+    print("Max index ✓")
+
+    // Activation functions
+    let sigmoid = Activation.Sigmoid
+    let s = sigmoid.apply(0.0)
+    assert((s - 0.5).abs() < 0.001)
+    print("Sigmoid ✓")
+
+    let relu = Activation.ReLU
+    assert(relu.apply(5.0) == 5.0)
+    assert(relu.apply(-5.0) == 0.0)
+    assert(relu.derivative(5.0) == 1.0)
+    assert(relu.derivative(-5.0) == 0.0)
+    print("ReLU ✓")
+
+    let tanh = Activation.Tanh
+    assert(tanh.apply(0.0).abs() < 0.001)
+    print("Tanh ✓")
+
+    let linear = Activation.Linear
+    assert(linear.apply(3.14) == 3.14)
+    assert(linear.derivative(3.14) == 1.0)
+    print("Linear ✓")
+
+    // Neural Network
+    let mut nn = NeuralNetwork.new(0.01)
+    nn.add_layer(2, 4, Activation.ReLU)
+    nn.add_layer(4, 3, Activation.ReLU)
+    nn.add_layer(3, 1, Activation.Sigmoid)
+
+    assert(nn.layer_count() == 3)
+    assert(nn.total_params() > 0) // 2*4+4 + 4*3+3 + 3*1+1 = 28
+    print("Network creation ✓")
+
+    // Forward pass
+    let output = nn.predict(&[0.5, 0.3])
+    assert(output.len() == 1)
+    assert(output[0] >= 0.0 && output[0] <= 1.0) // sigmoid output
+    print("Forward pass ✓")
+
+    // Loss functions
+    let pred = Matrix { rows: 1, cols: 3, data: [0.9, 0.1, 0.1] }
+    let target = Matrix { rows: 1, cols: 3, data: [1.0, 0.0, 0.0] }
+    let loss = mse_loss(&pred, &target)
+    assert(loss >= 0.0 && loss < 0.01) // should be small
+    print("MSE loss ✓")
+
+    let ce = cross_entropy_loss(&pred, &target)
+    assert(ce >= 0.0)
+    print("Cross entropy ✓")
+
+    // Layer
+    let layer = Layer.new(3, 5, Activation.ReLU)
+    assert(layer.neuron_count() == 5)
+    assert(layer.weights.rows == 3)
+    assert(layer.weights.cols == 5)
+    print("Layer ✓")
+
+    // Random matrix
+    let r = Matrix.random(3, 3)
+    assert(r.rows == 3 && r.cols == 3)
+    // Values should be different
+    assert(r.get(0, 0) != r.get(1, 1) || r.get(0, 1) != r.get(1, 0))
+    print("Random matrix ✓")
+
+    print("Neural Network complete ✓")
+}
