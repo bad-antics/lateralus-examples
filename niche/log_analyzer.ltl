@@ -1,0 +1,346 @@
+// Niche Example - Log Analyzer
+// Parse, filter, aggregate, and query structured log files.
+
+use std.collections.{HashMap, BTreeMap}
+use std.io.{BufReader, File, Read, BufRead}
+use std.time.Instant
+
+#[derive(Clone, Debug)]
+enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+}
+
+impl LogLevel {
+    fn from_str(s: &str) -> Option<LogLevel> {
+        match s.to_uppercase().as_str() {
+            "TRACE" => some(LogLevel.Trace),
+            "DEBUG" => some(LogLevel.Debug),
+            "INFO"  => some(LogLevel.Info),
+            "WARN" | "WARNING" => some(LogLevel.Warn),
+            "ERROR" => some(LogLevel.Error),
+            "FATAL" => some(LogLevel.Fatal),
+            _ => none,
+        }
+    }
+
+    fn severity(self) -> u8 {
+        match self {
+            LogLevel.Trace => 0,
+            LogLevel.Debug => 1,
+            LogLevel.Info => 2,
+            LogLevel.Warn => 3,
+            LogLevel.Error => 4,
+            LogLevel.Fatal => 5,
+        }
+    }
+
+    fn to_string(self) -> string {
+        match self {
+            LogLevel.Trace => "TRACE",
+            LogLevel.Debug => "DEBUG",
+            LogLevel.Info => "INFO",
+            LogLevel.Warn => "WARN",
+            LogLevel.Error => "ERROR",
+            LogLevel.Fatal => "FATAL",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LogEntry {
+    timestamp: string,
+    level: LogLevel,
+    source: string,
+    message: string,
+    fields: HashMap<string, string>,
+    line_number: usize,
+}
+
+impl LogEntry {
+    fn parse(line: &str, line_number: usize) -> Option<LogEntry> {
+        // Format: [TIMESTAMP] LEVEL [SOURCE] message key=value ...
+        let parts: [&str] = line.splitn(4, ' ').collect()
+        if parts.len() < 4 { return none }
+
+        let timestamp = parts[0].trim_matches(|c| c == '[' || c == ']').to_string()
+        let level = LogLevel.from_str(parts[1])?
+        let source = parts[2].trim_matches(|c| c == '[' || c == ']').to_string()
+        let rest = parts[3]
+
+        // Parse key=value pairs from the end
+        let mut fields: HashMap<string, string> = HashMap.new()
+        let mut message_parts: [string] = []
+
+        for token in rest.split(' ') {
+            if token.contains('=') {
+                let kv: [&str] = token.splitn(2, '=').collect()
+                if kv.len() == 2 {
+                    fields.insert(kv[0].to_string(), kv[1].to_string())
+                }
+            } else {
+                message_parts.push(token.to_string())
+            }
+        }
+
+        some(LogEntry {
+            timestamp,
+            level,
+            source,
+            message: message_parts.join(" "),
+            fields,
+            line_number,
+        })
+    }
+}
+
+struct LogFilter {
+    min_level: Option<LogLevel>,
+    source_pattern: Option<string>,
+    message_contains: Option<string>,
+    time_after: Option<string>,
+    time_before: Option<string>,
+    field_filters: HashMap<string, string>,
+}
+
+impl LogFilter {
+    fn new() -> LogFilter {
+        LogFilter {
+            min_level: none,
+            source_pattern: none,
+            message_contains: none,
+            time_after: none,
+            time_before: none,
+            field_filters: HashMap.new(),
+        }
+    }
+
+    fn with_min_level(mut self, level: LogLevel) -> LogFilter {
+        self.min_level = some(level); self
+    }
+
+    fn with_source(mut self, pattern: &str) -> LogFilter {
+        self.source_pattern = some(pattern.to_string()); self
+    }
+
+    fn with_message(mut self, contains: &str) -> LogFilter {
+        self.message_contains = some(contains.to_string()); self
+    }
+
+    fn with_field(mut self, key: &str, value: &str) -> LogFilter {
+        self.field_filters.insert(key.to_string(), value.to_string()); self
+    }
+
+    fn matches(self, entry: &LogEntry) -> bool {
+        if let some(ref min) = self.min_level {
+            if entry.level.severity() < min.severity() { return false }
+        }
+        if let some(ref pat) = self.source_pattern {
+            if !entry.source.contains(pat.as_str()) { return false }
+        }
+        if let some(ref msg) = self.message_contains {
+            if !entry.message.contains(msg.as_str()) { return false }
+        }
+        if let some(ref after) = self.time_after {
+            if entry.timestamp < *after { return false }
+        }
+        if let some(ref before) = self.time_before {
+            if entry.timestamp > *before { return false }
+        }
+        for (key, value) in &self.field_filters {
+            match entry.fields.get(key) {
+                some(v) if v == value => {},
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+struct LogStats {
+    total: usize,
+    by_level: HashMap<string, usize>,
+    by_source: HashMap<string, usize>,
+    errors_per_minute: BTreeMap<string, usize>,
+    top_messages: HashMap<string, usize>,
+}
+
+impl LogStats {
+    fn new() -> LogStats {
+        LogStats {
+            total: 0,
+            by_level: HashMap.new(),
+            by_source: HashMap.new(),
+            errors_per_minute: BTreeMap.new(),
+            top_messages: HashMap.new(),
+        }
+    }
+
+    fn ingest(mut self, entry: &LogEntry) {
+        self.total += 1
+        *self.by_level.entry(entry.level.to_string()).or_insert(0) += 1
+        *self.by_source.entry(entry.source.clone()).or_insert(0) += 1
+
+        if entry.level.severity() >= LogLevel.Error.severity() {
+            let minute = if entry.timestamp.len() >= 16 {
+                entry.timestamp[..16].to_string()
+            } else {
+                entry.timestamp.clone()
+            }
+            *self.errors_per_minute.entry(minute).or_insert(0) += 1
+        }
+
+        // Track top messages (first 50 chars)
+        let key = if entry.message.len() > 50 {
+            entry.message[..50].to_string()
+        } else {
+            entry.message.clone()
+        }
+        *self.top_messages.entry(key).or_insert(0) += 1
+    }
+
+    fn error_rate(self) -> f64 {
+        if self.total == 0 { return 0.0 }
+        let errors = *self.by_level.get("ERROR").unwrap_or(&0)
+            + *self.by_level.get("FATAL").unwrap_or(&0)
+        errors as f64 / self.total as f64
+    }
+
+    fn top_n_sources(self, n: usize) -> [(string, usize)] {
+        let mut entries: [(string, usize)] = self.by_source.iter()
+            .map(|(k, v)| (k.clone(), *v)).collect()
+        entries.sort_by(|a, b| b.1.cmp(&a.1))
+        entries.truncate(n)
+        entries
+    }
+
+    fn top_n_messages(self, n: usize) -> [(string, usize)] {
+        let mut entries: [(string, usize)] = self.top_messages.iter()
+            .map(|(k, v)| (k.clone(), *v)).collect()
+        entries.sort_by(|a, b| b.1.cmp(&a.1))
+        entries.truncate(n)
+        entries
+    }
+}
+
+struct LogAnalyzer {
+    entries: [LogEntry],
+    stats: LogStats,
+}
+
+impl LogAnalyzer {
+    fn new() -> LogAnalyzer {
+        LogAnalyzer { entries: [], stats: LogStats.new() }
+    }
+
+    fn parse_line(mut self, line: &str, line_number: usize) {
+        if let some(entry) = LogEntry.parse(line, line_number) {
+            self.stats.ingest(&entry)
+            self.entries.push(entry)
+        }
+    }
+
+    fn parse_text(mut self, text: &str) {
+        for (i, line) in text.lines().enumerate() {
+            self.parse_line(line, i + 1)
+        }
+    }
+
+    fn filter(self, filter: &LogFilter) -> [&LogEntry] {
+        self.entries.iter().filter(|e| filter.matches(e)).collect()
+    }
+
+    fn search(self, query: &str) -> [&LogEntry] {
+        self.entries.iter().filter(|e|
+            e.message.contains(query) || e.source.contains(query)
+        ).collect()
+    }
+
+    fn entries_between(self, start: &str, end: &str) -> [&LogEntry] {
+        self.entries.iter().filter(|e|
+            e.timestamp >= start.to_string() && e.timestamp <= end.to_string()
+        ).collect()
+    }
+
+    fn count(self) -> usize { self.entries.len() }
+}
+
+fn main() {
+    let mut analyzer = LogAnalyzer.new()
+
+    // Parse sample logs
+    let logs = "[2024-01-15T10:00:01] INFO [web] Request started path=/api/users\n\
+                [2024-01-15T10:00:02] DEBUG [db] Query executed duration=15ms\n\
+                [2024-01-15T10:00:03] WARN [web] Slow response time=2500ms\n\
+                [2024-01-15T10:00:04] ERROR [auth] Authentication failed user=admin\n\
+                [2024-01-15T10:00:05] INFO [web] Request completed status=200\n\
+                [2024-01-15T10:00:06] ERROR [db] Connection timeout host=db1\n\
+                [2024-01-15T10:00:07] FATAL [app] Out of memory bytes=0\n\
+                [2024-01-15T10:00:08] INFO [web] Health check ok\n\
+                [2024-01-15T10:00:09] TRACE [net] Packet received size=1500\n\
+                [2024-01-15T10:00:10] DEBUG [cache] Cache miss key=user:42"
+
+    analyzer.parse_text(logs)
+    assert(analyzer.count() == 10)
+    print("Parse logs ✓")
+
+    // Stats
+    assert(analyzer.stats.total == 10)
+    assert(*analyzer.stats.by_level.get("INFO").unwrap() == 3)
+    assert(*analyzer.stats.by_level.get("ERROR").unwrap() == 2)
+    assert(*analyzer.stats.by_level.get("FATAL").unwrap() == 1)
+    print("Stats ✓")
+
+    // Error rate
+    let rate = analyzer.stats.error_rate()
+    assert(rate > 0.2 && rate < 0.4) // 3/10
+    print("Error rate ✓")
+
+    // Filter by level
+    let filter = LogFilter.new().with_min_level(LogLevel.Error)
+    let errors = analyzer.filter(&filter)
+    assert(errors.len() == 3) // 2 ERROR + 1 FATAL
+    print("Filter by level ✓")
+
+    // Filter by source
+    let web_filter = LogFilter.new().with_source("web")
+    let web_entries = analyzer.filter(&web_filter)
+    assert(web_entries.len() == 4)
+    print("Filter by source ✓")
+
+    // Filter by field
+    let field_filter = LogFilter.new().with_field("user", "admin")
+    let admin = analyzer.filter(&field_filter)
+    assert(admin.len() == 1)
+    assert(admin[0].source == "auth")
+    print("Filter by field ✓")
+
+    // Search
+    let results = analyzer.search("timeout")
+    assert(results.len() == 1)
+    print("Search ✓")
+
+    // Top sources
+    let top = analyzer.stats.top_n_sources(3)
+    assert(top[0].0 == "web")
+    assert(top[0].1 == 4)
+    print("Top sources ✓")
+
+    // LogLevel parsing
+    assert(LogLevel.from_str("INFO").unwrap().severity() == 2)
+    assert(LogLevel.from_str("WARNING").unwrap().severity() == 3)
+    assert(LogLevel.from_str("unknown").is_none())
+    print("LogLevel parsing ✓")
+
+    // Entry fields
+    let entry = &analyzer.entries[0]
+    assert(entry.fields.get("path").unwrap() == "/api/users")
+    assert(entry.line_number == 1)
+    print("Entry fields ✓")
+
+    print("Log Analyzer complete ✓")
+}
