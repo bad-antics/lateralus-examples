@@ -1,0 +1,330 @@
+// Niche Example - HTTP Proxy Server
+// Forward and reverse proxy with connection pooling and caching.
+
+use std.net.{TcpListener, TcpStream}
+use std.io.{Read, Write, BufRead, BufReader}
+use std.sync.{Arc, Mutex}
+use std.thread
+use std.collections.{HashMap, LruCache}
+use std.time.{Duration, Instant}
+
+#[derive(Clone)]
+struct ProxyConfig {
+    listen_addr: string,
+    mode: ProxyMode,
+    max_connections: usize,
+    connection_timeout: Duration,
+    cache_enabled: bool,
+    cache_max_size: usize,
+    allowed_hosts: Option<[string]>,
+    blocked_hosts: [string],
+}
+
+#[derive(Clone)]
+enum ProxyMode {
+    Forward,
+    Reverse(string),  // upstream server address
+    Transparent,
+}
+
+impl ProxyConfig {
+    fn default_forward() -> ProxyConfig {
+        ProxyConfig {
+            listen_addr: "0.0.0.0:8080".to_string(),
+            mode: ProxyMode.Forward,
+            max_connections: 1000,
+            connection_timeout: Duration.from_secs(30),
+            cache_enabled: true,
+            cache_max_size: 100,
+            allowed_hosts: none,
+            blocked_hosts: [],
+        }
+    }
+
+    fn default_reverse(upstream: &str) -> ProxyConfig {
+        ProxyConfig {
+            listen_addr: "0.0.0.0:80".to_string(),
+            mode: ProxyMode.Reverse(upstream.to_string()),
+            max_connections: 5000,
+            connection_timeout: Duration.from_secs(60),
+            cache_enabled: true,
+            cache_max_size: 500,
+            allowed_hosts: none,
+            blocked_hosts: [],
+        }
+    }
+}
+
+struct HttpRequest {
+    method: string,
+    url: string,
+    version: string,
+    headers: HashMap<string, string>,
+    body: Option<[u8]>,
+}
+
+impl HttpRequest {
+    fn parse(reader: &mut BufReader<TcpStream>) -> Result<HttpRequest, string> {
+        let mut request_line = string.new()
+        reader.read_line(&mut request_line).map_err(|e| e.to_string())?
+        let parts: [&str] = request_line.trim().split(' ').collect()
+        if parts.len() < 3 { return err("invalid request line".to_string()) }
+
+        let method = parts[0].to_string()
+        let url = parts[1].to_string()
+        let version = parts[2].to_string()
+
+        let mut headers = HashMap.new()
+        loop {
+            let mut line = string.new()
+            reader.read_line(&mut line).map_err(|e| e.to_string())?
+            let trimmed = line.trim()
+            if trimmed.is_empty() { break }
+            if let some(colon) = trimmed.find(':') {
+                let key = trimmed[..colon].trim().to_lowercase()
+                let val = trimmed[colon+1..].trim().to_string()
+                headers.insert(key, val)
+            }
+        }
+
+        let body = if let some(len_str) = headers.get("content-length") {
+            let len: usize = len_str.parse().map_err(|e| e.to_string())?
+            let mut buf = vec![0u8; len]
+            reader.read_exact(&mut buf).map_err(|e| e.to_string())?
+            some(buf)
+        } else { none }
+
+        ok(HttpRequest { method, url, version, headers, body })
+    }
+
+    fn host(self) -> Option<&str> { self.headers.get("host").map(|s| s.as_str()) }
+
+    fn to_bytes(self) -> [u8] {
+        let mut buf = format!("{} {} {}\r\n", self.method, self.url, self.version)
+        for (key, val) in &self.headers {
+            buf.push_str(&format!("{}: {}\r\n", key, val))
+        }
+        buf.push_str("\r\n")
+        let mut bytes = buf.into_bytes()
+        if let some(body) = &self.body {
+            bytes.extend(body)
+        }
+        bytes
+    }
+}
+
+struct HttpResponse {
+    version: string,
+    status: u16,
+    reason: string,
+    headers: HashMap<string, string>,
+    body: [u8],
+}
+
+impl HttpResponse {
+    fn parse(reader: &mut BufReader<TcpStream>) -> Result<HttpResponse, string> {
+        let mut status_line = string.new()
+        reader.read_line(&mut status_line).map_err(|e| e.to_string())?
+        let parts: [&str] = status_line.trim().splitn(3, ' ').collect()
+        if parts.len() < 2 { return err("invalid status line".to_string()) }
+
+        let version = parts[0].to_string()
+        let status: u16 = parts[1].parse().map_err(|e| e.to_string())?
+        let reason = if parts.len() > 2 { parts[2].to_string() } else { "".to_string() }
+
+        let mut headers = HashMap.new()
+        loop {
+            let mut line = string.new()
+            reader.read_line(&mut line).map_err(|e| e.to_string())?
+            let trimmed = line.trim()
+            if trimmed.is_empty() { break }
+            if let some(colon) = trimmed.find(':') {
+                let key = trimmed[..colon].trim().to_lowercase()
+                let val = trimmed[colon+1..].trim().to_string()
+                headers.insert(key, val)
+            }
+        }
+
+        let mut body: [u8] = []
+        if let some(len_str) = headers.get("content-length") {
+            let len: usize = len_str.parse().map_err(|e| e.to_string())?
+            body = vec![0u8; len]
+            reader.read_exact(&mut body).map_err(|e| e.to_string())?
+        }
+
+        ok(HttpResponse { version, status, reason, headers, body })
+    }
+
+    fn to_bytes(self) -> [u8] {
+        let mut buf = format!("{} {} {}\r\n", self.version, self.status, self.reason)
+        for (key, val) in &self.headers {
+            buf.push_str(&format!("{}: {}\r\n", key, val))
+        }
+        buf.push_str("\r\n")
+        let mut bytes = buf.into_bytes()
+        bytes.extend(&self.body)
+        bytes
+    }
+
+    fn is_cacheable(self) -> bool {
+        self.status == 200 && !self.headers.contains_key("set-cookie")
+    }
+}
+
+struct CacheEntry {
+    response: [u8],
+    inserted_at: Instant,
+    ttl: Duration,
+}
+
+impl CacheEntry {
+    fn is_expired(self) -> bool {
+        self.inserted_at.elapsed() > self.ttl
+    }
+}
+
+struct ConnectionPool {
+    pools: HashMap<string, [TcpStream]>,
+    max_per_host: usize,
+}
+
+impl ConnectionPool {
+    fn new(max_per_host: usize) -> ConnectionPool {
+        ConnectionPool { pools: HashMap.new(), max_per_host }
+    }
+
+    fn get(mut self, addr: &str) -> Option<TcpStream> {
+        if let some(pool) = self.pools.get_mut(addr) {
+            pool.pop()
+        } else { none }
+    }
+
+    fn put(mut self, addr: &str, stream: TcpStream) {
+        let pool = self.pools.entry(addr.to_string()).or_insert_with(|| [])
+        if pool.len() < self.max_per_host {
+            pool.push(stream)
+        }
+    }
+}
+
+struct ProxyStats {
+    total_requests: u64,
+    active_connections: u32,
+    cache_hits: u64,
+    cache_misses: u64,
+    bytes_transferred: u64,
+    errors: u64,
+}
+
+impl ProxyStats {
+    fn new() -> ProxyStats {
+        ProxyStats {
+            total_requests: 0, active_connections: 0,
+            cache_hits: 0, cache_misses: 0,
+            bytes_transferred: 0, errors: 0,
+        }
+    }
+
+    fn hit_rate(self) -> f64 {
+        let total = self.cache_hits + self.cache_misses
+        if total == 0 { 0.0 } else { self.cache_hits as f64 / total as f64 }
+    }
+}
+
+fn is_host_allowed(config: &ProxyConfig, host: &str) -> bool {
+    if config.blocked_hosts.iter().any(|h| h == host) { return false }
+    match &config.allowed_hosts {
+        some(allowed) => allowed.iter().any(|h| h == host),
+        none => true,
+    }
+}
+
+fn parse_url_host(url: &str) -> Option<(string, u16)> {
+    let url = if url.starts_with("http://") { &url[7..] }
+              else if url.starts_with("https://") { &url[8..] }
+              else { url }
+    let host_part = url.split('/').next()?
+    if let some(colon) = host_part.find(':') {
+        let host = host_part[..colon].to_string()
+        let port: u16 = host_part[colon+1..].parse().ok()?
+        some((host, port))
+    } else {
+        some((host_part.to_string(), 80))
+    }
+}
+
+fn main() {
+    // ProxyConfig
+    let fwd = ProxyConfig.default_forward()
+    assert(fwd.listen_addr == "0.0.0.0:8080")
+    assert(fwd.cache_enabled)
+    match fwd.mode { ProxyMode.Forward => {} _ => panic!("wrong mode") }
+    print("Forward config ✓")
+
+    let rev = ProxyConfig.default_reverse("10.0.0.1:8080")
+    match rev.mode { ProxyMode.Reverse(addr) => assert(addr == "10.0.0.1:8080"), _ => panic!("wrong") }
+    print("Reverse config ✓")
+
+    // URL parsing
+    let (host, port) = parse_url_host("http://example.com:8080/path").unwrap()
+    assert(host == "example.com")
+    assert(port == 8080)
+    print("URL parse with port ✓")
+
+    let (host2, port2) = parse_url_host("http://example.com/path").unwrap()
+    assert(host2 == "example.com")
+    assert(port2 == 80)
+    print("URL parse default port ✓")
+
+    // Host filtering
+    let mut config = ProxyConfig.default_forward()
+    config.blocked_hosts = vec!["evil.com".to_string()]
+    assert(is_host_allowed(&config, "good.com"))
+    assert(!is_host_allowed(&config, "evil.com"))
+    print("Host blocking ✓")
+
+    config.allowed_hosts = some(vec!["allowed.com".to_string()])
+    assert(is_host_allowed(&config, "allowed.com"))
+    assert(!is_host_allowed(&config, "other.com"))
+    print("Host allowlist ✓")
+
+    // ConnectionPool
+    let mut pool = ConnectionPool.new(5)
+    assert(pool.get("host:80").is_none())
+    print("Empty pool ✓")
+
+    // ProxyStats
+    let mut stats = ProxyStats.new()
+    assert(stats.hit_rate() == 0.0)
+    stats.cache_hits = 75
+    stats.cache_misses = 25
+    assert(stats.hit_rate() == 0.75)
+    print("Stats hit rate ✓")
+
+    // CacheEntry expiry
+    let entry = CacheEntry {
+        response: b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+        inserted_at: Instant.now(),
+        ttl: Duration.from_secs(300),
+    }
+    assert(!entry.is_expired())
+    print("Cache entry ✓")
+
+    // HttpResponse cacheable
+    let resp = HttpResponse {
+        version: "HTTP/1.1".to_string(), status: 200, reason: "OK".to_string(),
+        headers: HashMap.new(), body: [],
+    }
+    assert(resp.is_cacheable())
+    print("Response cacheable ✓")
+
+    let mut resp2 = HttpResponse {
+        version: "HTTP/1.1".to_string(), status: 200, reason: "OK".to_string(),
+        headers: HashMap.new(), body: [],
+    }
+    resp2.headers.insert("set-cookie".to_string(), "session=abc".to_string())
+    assert(!resp2.is_cacheable())
+    print("Response not cacheable ✓")
+
+    print("Proxy Server complete ✓")
+}
