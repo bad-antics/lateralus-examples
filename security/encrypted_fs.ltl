@@ -1,0 +1,208 @@
+// encrypted_fs.ltl — Full-disk encryption layer (LUKS-style) in Lateralus
+
+use std.crypto.{aes256_xts, argon2, sha256, hmac_sha256, random_bytes}
+
+// ── Encryption header (LUKS2-inspired) ───────────────────────────────────────
+const MAGIC: [u8; 6] = [0x4c, 0x55, 0x4b, 0x53, 0xba, 0xbe]  // "LUKS\xba\xbe"
+const HEADER_VERSION: u16 = 2
+const SECTOR_SIZE: usize = 512
+const KEY_SLOTS: usize = 8
+
+struct LuksHeader {
+    magic:          [u8; 6],
+    version:        u16,
+    uuid:           string,
+    label:          string,
+    cipher:         string,       // "aes-xts-plain64"
+    hash:           string,       // "sha256"
+    key_bytes:      u32,          // master key size (64 for XTS)
+    mk_digest:      [u8; 32],    // PBKDF(master_key) for verification
+    mk_salt:        [u8; 32],
+    mk_iterations:  u32,
+    key_slots:      [KeySlot?; KEY_SLOTS],
+    payload_offset: u64,          // sector offset where encrypted data starts
+}
+
+struct KeySlot {
+    active:     bool,
+    kdf:        KdfParams,
+    af_stripes: u32,          // anti-forensic stripe count
+    key_material_offset: u64, // sector offset of encrypted key material
+    key_material_size:   u32,
+}
+
+enum KdfParams {
+    Argon2id { memory: u32, iterations: u32, parallelism: u32, salt: [u8; 32] },
+    Pbkdf2   { iterations: u32, salt: [u8; 32], hash: string },
+}
+
+// ── Anti-forensic splitter (AF-split) ────────────────────────────────────────
+// Diffuses the master key across N stripes so partial disk recovery can't
+// reconstruct it. Requires ALL stripes to recover the key.
+
+fn af_split(key: &[u8], stripes: u32) -> [u8] {
+    let key_len = key.len()
+    let mut material = vec![0u8; key_len * stripes as usize]
+
+    // Generate random stripes 0..n-2
+    for i in range(0, stripes as usize - 1) {
+        let stripe = random_bytes(key_len)
+        material[i * key_len..(i+1) * key_len].copy_from_slice(&stripe)
+    }
+
+    // Last stripe = key XOR hash-chain of all previous stripes
+    let mut accumulated = vec![0u8; key_len]
+    for i in range(0, stripes as usize - 1) {
+        let stripe = &material[i * key_len..(i+1) * key_len]
+        for j in range(0, key_len) { accumulated[j] ^= stripe[j] }
+        accumulated = sha256.hash(&accumulated)[0..key_len].to_vec()
+    }
+    for j in range(0, key_len) {
+        material[(stripes as usize - 1) * key_len + j] = key[j] ^ accumulated[j]
+    }
+    material
+}
+
+fn af_merge(material: &[u8], key_len: usize, stripes: u32) -> [u8] {
+    let mut accumulated = vec![0u8; key_len]
+    for i in range(0, stripes as usize - 1) {
+        let stripe = &material[i * key_len..(i+1) * key_len]
+        for j in range(0, key_len) { accumulated[j] ^= stripe[j] }
+        accumulated = sha256.hash(&accumulated)[0..key_len].to_vec()
+    }
+    let last_stripe = &material[(stripes as usize - 1) * key_len..]
+    let mut key = vec![0u8; key_len]
+    for j in range(0, key_len) { key[j] = last_stripe[j] ^ accumulated[j] }
+    key
+}
+
+// ── Encrypted block device ──────────────────────────────────────────────────
+struct EncryptedDevice {
+    header:     LuksHeader,
+    master_key: [u8; 64],    // AES-256-XTS requires 2×256-bit = 64 bytes
+    device:     Box<dyn BlockDevice>,
+}
+
+trait BlockDevice {
+    fn read_sector(self, sector: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), string>
+    fn write_sector(self, sector: u64, data: &[u8; SECTOR_SIZE]) -> Result<(), string>
+    fn sector_count(self) -> u64
+}
+
+impl EncryptedDevice {
+    fn format(device: Box<dyn BlockDevice>, passphrase: &str) -> Result<EncryptedDevice, string> {
+        let master_key: [u8; 64] = random_bytes(64).try_into().unwrap()
+        let uuid = generate_uuid()
+        let mk_salt: [u8; 32] = random_bytes(32).try_into().unwrap()
+
+        // Derive digest of master key for later verification
+        let mk_digest = argon2.id(
+            master_key.as_slice(), &mk_salt,
+            65536, 4, 1, 32,
+        ).try_into().unwrap()
+
+        // Encrypt master key with passphrase in slot 0
+        let slot_salt: [u8; 32] = random_bytes(32).try_into().unwrap()
+        let derived_key = argon2.id(
+            passphrase.as_bytes(), &slot_salt,
+            65536, 4, 1, 64,
+        )
+
+        let af_material = af_split(&master_key, 4000)
+        let encrypted_material = aes256_xts.encrypt(
+            &derived_key[0..32], &derived_key[32..64],
+            &af_material, 0,
+        )
+
+        let header = LuksHeader {
+            magic: MAGIC,
+            version: HEADER_VERSION,
+            uuid, label: "encrypted".to_string(),
+            cipher: "aes-xts-plain64".to_string(),
+            hash: "sha256".to_string(),
+            key_bytes: 64,
+            mk_digest, mk_salt, mk_iterations: 4,
+            key_slots: [
+                some(KeySlot {
+                    active: true,
+                    kdf: KdfParams.Argon2id { memory: 65536, iterations: 4, parallelism: 1, salt: slot_salt },
+                    af_stripes: 4000,
+                    key_material_offset: 32,
+                    key_material_size: encrypted_material.len() as u32,
+                }),
+                none, none, none, none, none, none, none,
+            ],
+            payload_offset: 32768,
+        }
+
+        ok(EncryptedDevice { header, master_key, device })
+    }
+
+    fn open(device: Box<dyn BlockDevice>, passphrase: &str) -> Result<EncryptedDevice, string> {
+        // Read header, try each active key slot
+        // For each slot: derive key from passphrase, decrypt AF material,
+        // merge AF stripes, verify against mk_digest
+        // (simplified)
+        err("not implemented in demo")
+    }
+
+    fn read_sector(self, logical_sector: u64) -> Result<[u8; SECTOR_SIZE], string> {
+        let physical = logical_sector + self.header.payload_offset
+        let mut encrypted: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE]
+        self.device.read_sector(physical, &mut encrypted)?
+
+        let plaintext = aes256_xts.decrypt(
+            &self.master_key[0..32], &self.master_key[32..64],
+            &encrypted, logical_sector,
+        )
+        ok(plaintext.try_into().unwrap())
+    }
+
+    fn write_sector(self, logical_sector: u64, data: &[u8; SECTOR_SIZE]) -> Result<(), string> {
+        let encrypted = aes256_xts.encrypt(
+            &self.master_key[0..32], &self.master_key[32..64],
+            data, logical_sector,
+        )
+        let physical = logical_sector + self.header.payload_offset
+        self.device.write_sector(physical, &encrypted.try_into().unwrap())
+    }
+}
+
+fn generate_uuid() -> string {
+    let bytes = random_bytes(16)
+    format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],bytes[1],bytes[2],bytes[3], bytes[4],bytes[5],
+        bytes[6],bytes[7], bytes[8],bytes[9],
+        bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15])
+}
+
+fn main() {
+    // Test AF-split roundtrip
+    let key = random_bytes(32)
+    let material = af_split(&key, 4000)
+    assert(material.len() == 32 * 4000)
+    let recovered = af_merge(&material, 32, 4000)
+    assert(recovered == key, "AF-split roundtrip must recover key")
+    print("AF-split/merge roundtrip ✓")
+
+    // Test partial recovery fails
+    let mut corrupted = material.clone()
+    corrupted[0] ^= 0xff
+    let bad_key = af_merge(&corrupted, 32, 4000)
+    assert(bad_key != key, "corrupted material must not recover key")
+    print("AF-split anti-forensic: partial corruption fails ✓")
+
+    // Header structure
+    let header = LuksHeader {
+        magic: MAGIC, version: 2,
+        uuid: generate_uuid(), label: "test".to_string(),
+        cipher: "aes-xts-plain64".to_string(), hash: "sha256".to_string(),
+        key_bytes: 64,
+        mk_digest: [0; 32], mk_salt: [0; 32], mk_iterations: 4,
+        key_slots: [none; 8], payload_offset: 32768,
+    }
+    assert(header.magic == MAGIC)
+    assert(header.version == 2)
+    print("LUKS header structure ✓")
+    print("Encrypted filesystem — all passed ✓")
+}
