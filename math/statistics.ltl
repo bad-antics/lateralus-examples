@@ -1,0 +1,87 @@
+// statistics.ltl — Descriptive statistics
+// Run: lateralus run math/statistics.ltl
+
+fn mean(xs: [float]) -> float {
+    xs |> sum() / xs.len().float()
+}
+
+fn median(xs: [float]) -> float {
+    let sorted = xs |> sort() |> collect()
+    let n = sorted.len()
+    if n % 2 == 0 {
+        (sorted[n/2 - 1] + sorted[n/2]) / 2.0
+    } else {
+        sorted[n/2]
+    }
+}
+
+fn mode(xs: [float]) -> [float] {
+    let counts = xs |> fold({}, |acc, x| {
+        acc[x] = acc.get(x) ?? 0 + 1
+        acc
+    })
+    let max_count = counts.values() |> max() |> unwrap()
+    counts.iter()
+        |> filter(|(_, c)| c == max_count)
+        |> map(|(v, _)| v)
+        |> sort()
+        |> collect()
+}
+
+fn variance(xs: [float]) -> float {
+    let m = mean(xs)
+    xs |> map(x => (x - m).powi(2)) |> mean()
+}
+
+fn std_dev(xs: [float]) -> float { variance(xs).sqrt() }
+
+fn percentile(xs: [float], p: float) -> float {
+    let sorted = xs |> sort() |> collect()
+    let idx = (p / 100.0 * (sorted.len() - 1).float()).round() as int
+    sorted[idx.clamp(0, sorted.len() - 1)]
+}
+
+fn iqr(xs: [float]) -> float {
+    percentile(xs, 75.0) - percentile(xs, 25.0)
+}
+
+fn z_scores(xs: [float]) -> [float] {
+    let m = mean(xs)
+    let s = std_dev(xs)
+    if s == 0.0 { return xs |> map(_ => 0.0) |> collect() }
+    xs |> map(x => (x - m) / s) |> collect()
+}
+
+fn outliers(xs: [float], threshold: float = 3.0) -> [float] {
+    let zs = z_scores(xs)
+    xs.zip(zs)
+        |> filter(|(_, z)| z.abs() > threshold)
+        |> map(|(x, _)| x)
+        |> collect()
+}
+
+fn summary(xs: [float]) {
+    print("  n:      ${xs.len()}")
+    print("  mean:   ${mean(xs).round(4)}")
+    print("  median: ${median(xs).round(4)}")
+    print("  std:    ${std_dev(xs).round(4)}")
+    print("  min:    ${xs |> min() |> unwrap()}")
+    print("  max:    ${xs |> max() |> unwrap()}")
+    print("  p25:    ${percentile(xs, 25.0).round(4)}")
+    print("  p75:    ${percentile(xs, 75.0).round(4)}")
+    print("  IQR:    ${iqr(xs).round(4)}")
+}
+
+fn main() {
+    let data = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+    print("Dataset: ${data}")
+    summary(data)
+    assert_eq(mean(data),    5.0)
+    assert_eq(std_dev(data), 2.0)
+
+    let with_outlier = [2.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0, 100.0]
+    print("
+Outliers (z > 2): ${outliers(with_outlier, 2.0)}")
+}
+
+main()
