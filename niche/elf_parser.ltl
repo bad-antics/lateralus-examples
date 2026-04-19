@@ -1,0 +1,407 @@
+// Niche Example — ELF Binary Parser
+// Parses ELF32/ELF64 headers, sections, segments, symbol tables.
+
+use std.collections.HashMap
+
+// ── ELF Constants ────────────────────────────────────────────────────────────
+const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F']
+
+enum ElfClass { Elf32 = 1, Elf64 = 2 }
+enum ElfEndian { Little = 1, Big = 2 }
+enum ElfType { None = 0, Rel = 1, Exec = 2, Dyn = 3, Core = 4 }
+enum ElfMachine { None = 0, X86 = 3, ARM = 40, X86_64 = 62, AArch64 = 183, RISCV = 243 }
+
+enum SectionType {
+    Null = 0, ProgBits = 1, SymTab = 2, StrTab = 3, Rela = 4,
+    Hash = 5, Dynamic = 6, Note = 7, NoBits = 8, Rel = 9,
+    DynSym = 11,
+}
+
+enum SegmentType { Null = 0, Load = 1, Dynamic = 2, Interp = 3, Note = 4, Phdr = 6, Tls = 7 }
+
+// Flags
+const SHF_WRITE: u64 = 0x1
+const SHF_ALLOC: u64 = 0x2
+const SHF_EXECINSTR: u64 = 0x4
+
+const PF_X: u32 = 0x1
+const PF_W: u32 = 0x2
+const PF_R: u32 = 0x4
+
+// ── ELF Header ───────────────────────────────────────────────────────────────
+struct ElfHeader {
+    class: ElfClass,
+    endian: ElfEndian,
+    elf_type: ElfType,
+    machine: ElfMachine,
+    entry_point: u64,
+    ph_offset: u64,
+    sh_offset: u64,
+    ph_entry_size: u16,
+    ph_count: u16,
+    sh_entry_size: u16,
+    sh_count: u16,
+    sh_str_index: u16,
+}
+
+impl ElfHeader {
+    fn parse(data: &[u8]) -> Result<ElfHeader, string> {
+        if data.len() < 64 { return err("file too small".to_string()) }
+        if data[0..4] != ELF_MAGIC { return err("not an ELF file".to_string()) }
+
+        let class = match data[4] {
+            1 => ElfClass.Elf32, 2 => ElfClass.Elf64,
+            _ => return err("unknown ELF class".to_string()),
+        }
+        let endian = match data[5] {
+            1 => ElfEndian.Little, 2 => ElfEndian.Big,
+            _ => return err("unknown endian".to_string()),
+        }
+
+        // Parse as 64-bit (simplification)
+        let elf_type = match read_u16_le(data, 16) {
+            0 => ElfType.None, 1 => ElfType.Rel, 2 => ElfType.Exec,
+            3 => ElfType.Dyn, 4 => ElfType.Core,
+            _ => ElfType.None,
+        }
+        let machine = match read_u16_le(data, 18) {
+            3 => ElfMachine.X86, 40 => ElfMachine.ARM,
+            62 => ElfMachine.X86_64, 183 => ElfMachine.AArch64,
+            243 => ElfMachine.RISCV, _ => ElfMachine.None,
+        }
+
+        ok(ElfHeader {
+            class, endian, elf_type, machine,
+            entry_point: read_u64_le(data, 24),
+            ph_offset: read_u64_le(data, 32),
+            sh_offset: read_u64_le(data, 40),
+            ph_entry_size: read_u16_le(data, 54),
+            ph_count: read_u16_le(data, 56),
+            sh_entry_size: read_u16_le(data, 58),
+            sh_count: read_u16_le(data, 60),
+            sh_str_index: read_u16_le(data, 62),
+        })
+    }
+
+    fn type_name(self) -> &str {
+        match self.elf_type {
+            ElfType.None => "NONE", ElfType.Rel => "REL", ElfType.Exec => "EXEC",
+            ElfType.Dyn => "DYN", ElfType.Core => "CORE",
+        }
+    }
+
+    fn machine_name(self) -> &str {
+        match self.machine {
+            ElfMachine.None => "None", ElfMachine.X86 => "x86",
+            ElfMachine.ARM => "ARM", ElfMachine.X86_64 => "x86-64",
+            ElfMachine.AArch64 => "AArch64", ElfMachine.RISCV => "RISC-V",
+        }
+    }
+}
+
+// ── Section Header ───────────────────────────────────────────────────────────
+struct SectionHeader {
+    name_offset: u32,
+    name: string,
+    section_type: u32,
+    flags: u64,
+    addr: u64,
+    offset: u64,
+    size: u64,
+    link: u32,
+    info: u32,
+    addralign: u64,
+    entsize: u64,
+}
+
+impl SectionHeader {
+    fn parse(data: &[u8], offset: usize) -> SectionHeader {
+        SectionHeader {
+            name_offset: read_u32_le(data, offset),
+            name: string.new(),
+            section_type: read_u32_le(data, offset + 4),
+            flags: read_u64_le(data, offset + 8),
+            addr: read_u64_le(data, offset + 16),
+            offset: read_u64_le(data, offset + 24),
+            size: read_u64_le(data, offset + 32),
+            link: read_u32_le(data, offset + 40),
+            info: read_u32_le(data, offset + 44),
+            addralign: read_u64_le(data, offset + 48),
+            entsize: read_u64_le(data, offset + 56),
+        }
+    }
+
+    fn type_name(self) -> &str {
+        match self.section_type {
+            0 => "NULL", 1 => "PROGBITS", 2 => "SYMTAB", 3 => "STRTAB",
+            4 => "RELA", 5 => "HASH", 6 => "DYNAMIC", 7 => "NOTE",
+            8 => "NOBITS", 9 => "REL", 11 => "DYNSYM",
+            _ => "UNKNOWN",
+        }
+    }
+
+    fn flags_str(self) -> string {
+        let mut s = string.new()
+        if self.flags & SHF_WRITE != 0 { s.push('W') }
+        if self.flags & SHF_ALLOC != 0 { s.push('A') }
+        if self.flags & SHF_EXECINSTR != 0 { s.push('X') }
+        if s.is_empty() { "---".to_string() } else { s }
+    }
+
+    fn is_executable(self) -> bool { self.flags & SHF_EXECINSTR != 0 }
+    fn is_writable(self) -> bool { self.flags & SHF_WRITE != 0 }
+    fn is_allocated(self) -> bool { self.flags & SHF_ALLOC != 0 }
+}
+
+// ── Program Header (Segment) ────────────────────────────────────────────────
+struct ProgramHeader {
+    segment_type: u32,
+    flags: u32,
+    offset: u64,
+    vaddr: u64,
+    paddr: u64,
+    filesz: u64,
+    memsz: u64,
+    align: u64,
+}
+
+impl ProgramHeader {
+    fn parse(data: &[u8], offset: usize) -> ProgramHeader {
+        ProgramHeader {
+            segment_type: read_u32_le(data, offset),
+            flags: read_u32_le(data, offset + 4),
+            offset: read_u64_le(data, offset + 8),
+            vaddr: read_u64_le(data, offset + 16),
+            paddr: read_u64_le(data, offset + 24),
+            filesz: read_u64_le(data, offset + 32),
+            memsz: read_u64_le(data, offset + 40),
+            align: read_u64_le(data, offset + 48),
+        }
+    }
+
+    fn type_name(self) -> &str {
+        match self.segment_type {
+            0 => "NULL", 1 => "LOAD", 2 => "DYNAMIC", 3 => "INTERP",
+            4 => "NOTE", 6 => "PHDR", 7 => "TLS",
+            _ => "UNKNOWN",
+        }
+    }
+
+    fn flags_str(self) -> string {
+        let mut s = string.new()
+        if self.flags & PF_R != 0 { s.push('R') } else { s.push('-') }
+        if self.flags & PF_W != 0 { s.push('W') } else { s.push('-') }
+        if self.flags & PF_X != 0 { s.push('X') } else { s.push('-') }
+        s
+    }
+}
+
+// ── Symbol ───────────────────────────────────────────────────────────────────
+struct ElfSymbol {
+    name: string,
+    value: u64,
+    size: u64,
+    sym_type: u8,
+    binding: u8,
+    section_index: u16,
+}
+
+impl ElfSymbol {
+    fn parse(data: &[u8], offset: usize, strtab: &[u8]) -> ElfSymbol {
+        let name_offset = read_u32_le(data, offset) as usize
+        let name = read_str(strtab, name_offset)
+        let info = data[offset + 4]
+
+        ElfSymbol {
+            name,
+            sym_type: info & 0xF,
+            binding: info >> 4,
+            section_index: read_u16_le(data, offset + 6),
+            value: read_u64_le(data, offset + 8),
+            size: read_u64_le(data, offset + 16),
+        }
+    }
+
+    fn type_name(self) -> &str {
+        match self.sym_type {
+            0 => "NOTYPE", 1 => "OBJECT", 2 => "FUNC", 3 => "SECTION",
+            4 => "FILE", _ => "UNKNOWN",
+        }
+    }
+
+    fn binding_name(self) -> &str {
+        match self.binding { 0 => "LOCAL", 1 => "GLOBAL", 2 => "WEAK", _ => "UNKNOWN" }
+    }
+
+    fn is_function(self) -> bool { self.sym_type == 2 }
+    fn is_defined(self) -> bool { self.section_index != 0 }
+}
+
+// ── Parsed ELF ───────────────────────────────────────────────────────────────
+struct Elf {
+    header: ElfHeader,
+    sections: [SectionHeader],
+    segments: [ProgramHeader],
+    symbols: [ElfSymbol],
+}
+
+impl Elf {
+    fn parse(data: &[u8]) -> Result<Elf, string> {
+        let header = ElfHeader.parse(data)?
+
+        // Parse sections
+        let mut sections: [SectionHeader] = []
+        for i in 0..header.sh_count as usize {
+            let offset = header.sh_offset as usize + i * header.sh_entry_size as usize
+            sections.push(SectionHeader.parse(data, offset))
+        }
+
+        // Resolve section names from .shstrtab
+        if (header.sh_str_index as usize) < sections.len() {
+            let strtab = &sections[header.sh_str_index as usize]
+            let str_data = &data[strtab.offset as usize..(strtab.offset + strtab.size) as usize]
+            for section in &mut sections {
+                section.name = read_str(str_data, section.name_offset as usize)
+            }
+        }
+
+        // Parse segments
+        let mut segments: [ProgramHeader] = []
+        for i in 0..header.ph_count as usize {
+            let offset = header.ph_offset as usize + i * header.ph_entry_size as usize
+            segments.push(ProgramHeader.parse(data, offset))
+        }
+
+        // Parse symbols
+        let mut symbols: [ElfSymbol] = []
+        for section in &sections {
+            if section.section_type == 2 || section.section_type == 11 {  // SYMTAB or DYNSYM
+                let strtab_section = &sections[section.link as usize]
+                let str_data = &data[strtab_section.offset as usize..(strtab_section.offset + strtab_section.size) as usize]
+                let sym_count = section.size as usize / section.entsize as usize
+                for i in 0..sym_count {
+                    let offset = section.offset as usize + i * section.entsize as usize
+                    symbols.push(ElfSymbol.parse(data, offset, str_data))
+                }
+            }
+        }
+
+        ok(Elf { header, sections, segments, symbols })
+    }
+
+    fn find_section(self, name: &str) -> Option<&SectionHeader> {
+        self.sections.iter().find(|s| s.name == name)
+    }
+
+    fn find_symbol(self, name: &str) -> Option<&ElfSymbol> {
+        self.symbols.iter().find(|s| s.name == name)
+    }
+
+    fn functions(self) -> [&ElfSymbol] {
+        self.symbols.iter().filter(|s| s.is_function() && s.is_defined()).collect()
+    }
+
+    fn load_segments(self) -> [&ProgramHeader] {
+        self.segments.iter().filter(|s| s.segment_type == 1).collect()
+    }
+}
+
+// ── Read helpers ─────────────────────────────────────────────────────────────
+fn read_u16_le(data: &[u8], offset: usize) -> u16 {
+    u16.from_le_bytes([data[offset], data[offset + 1]])
+}
+fn read_u32_le(data: &[u8], offset: usize) -> u32 {
+    u32.from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]])
+}
+fn read_u64_le(data: &[u8], offset: usize) -> u64 {
+    u64.from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3],
+                       data[offset+4], data[offset+5], data[offset+6], data[offset+7]])
+}
+fn read_str(data: &[u8], offset: usize) -> string {
+    let mut end = offset
+    while end < data.len() && data[end] != 0 { end += 1 }
+    string.from_utf8_lossy(&data[offset..end]).to_string()
+}
+
+fn main() {
+    // Build a minimal ELF64 header for testing
+    let mut elf_data = [0u8; 128]
+    // Magic
+    elf_data[0] = 0x7F; elf_data[1] = b'E'; elf_data[2] = b'L'; elf_data[3] = b'F'
+    elf_data[4] = 2  // ELF64
+    elf_data[5] = 1  // Little endian
+    elf_data[6] = 1  // ELF version
+    // Type: ET_EXEC
+    elf_data[16] = 2; elf_data[17] = 0
+    // Machine: x86-64
+    elf_data[18] = 62; elf_data[19] = 0
+    // Entry point
+    elf_data[24] = 0x00; elf_data[25] = 0x10; elf_data[26] = 0x40; elf_data[27] = 0
+
+    let header = ElfHeader.parse(&elf_data).unwrap()
+    assert(header.elf_type as u16 == 2)
+    assert(header.machine_name() == "x86-64")
+    assert(header.type_name() == "EXEC")
+    assert(header.entry_point == 0x401000)
+    print("ELF header parse ✓")
+
+    // Class/endian
+    match header.class { ElfClass.Elf64 => {} _ => panic("expected ELF64") }
+    match header.endian { ElfEndian.Little => {} _ => panic("expected little endian") }
+    print("ELF class/endian ✓")
+
+    // Section flags
+    let section = SectionHeader {
+        name_offset: 0, name: ".text".to_string(), section_type: 1,
+        flags: SHF_ALLOC | SHF_EXECINSTR,
+        addr: 0x401000, offset: 0x1000, size: 256,
+        link: 0, info: 0, addralign: 16, entsize: 0,
+    }
+    assert(section.is_executable())
+    assert(section.is_allocated())
+    assert(!section.is_writable())
+    assert(section.flags_str() == "AX")
+    assert(section.type_name() == "PROGBITS")
+    print("Section header ✓")
+
+    // Program header flags
+    let segment = ProgramHeader {
+        segment_type: 1, flags: PF_R | PF_X,
+        offset: 0, vaddr: 0x400000, paddr: 0x400000,
+        filesz: 4096, memsz: 4096, align: 0x200000,
+    }
+    assert(segment.type_name() == "LOAD")
+    assert(segment.flags_str() == "R-X")
+    print("Program header ✓")
+
+    // Symbol
+    let sym = ElfSymbol {
+        name: "main".to_string(), value: 0x401000, size: 64,
+        sym_type: 2, binding: 1, section_index: 1,
+    }
+    assert(sym.is_function())
+    assert(sym.is_defined())
+    assert(sym.type_name() == "FUNC")
+    assert(sym.binding_name() == "GLOBAL")
+    print("Symbol ✓")
+
+    // Magic check
+    let bad_data = [0u8; 64]
+    let result = ElfHeader.parse(&bad_data)
+    assert(result.is_err())
+    print("Bad magic rejected ✓")
+
+    // Read helpers
+    let test_data = [0x34, 0x12, 0x78, 0x56, 0xAB, 0x00, 0x00, 0x00]
+    assert(read_u16_le(&test_data, 0) == 0x1234)
+    assert(read_u32_le(&test_data, 0) == 0x56781234)
+    print("Read helpers ✓")
+
+    // String reading
+    let str_data = [b'h', b'e', b'l', b'l', b'o', 0, b'w', b'o', b'r', b'l', b'd', 0]
+    assert(read_str(&str_data, 0) == "hello")
+    assert(read_str(&str_data, 6) == "world")
+    print("String table reading ✓")
+
+    print("ELF Parser complete ✓")
+}
