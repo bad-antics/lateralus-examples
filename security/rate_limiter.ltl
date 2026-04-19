@@ -1,0 +1,85 @@
+// rate_limiter.ltl — IP-based rate limiting middleware
+use std.time.{unix_now_ms, Instant}
+use std.sync.{Arc, Mutex}
+
+struct RateLimitEntry {
+    tokens:     float,
+    last_refill: int,  // unix ms
+}
+
+struct RateLimiter {
+    entries:   dict<string, RateLimitEntry>,
+    rate:      float,   // tokens per second
+    capacity:  float,   // max tokens
+}
+
+impl RateLimiter {
+    fn new(rate: float, capacity: float) -> RateLimiter {
+        RateLimiter { entries: {}, rate, capacity }
+    }
+
+    fn check(mut self, key: string) -> bool {
+        let now = unix_now_ms()
+        let entry = self.entries.entry(key).or_insert(RateLimitEntry {
+            tokens: self.capacity,
+            last_refill: now,
+        })
+        let elapsed_sec = (now - entry.last_refill) as float / 1000.0
+        entry.tokens     = (entry.tokens + elapsed_sec * self.rate).min(self.capacity)
+        entry.last_refill = now
+        if entry.tokens >= 1.0 {
+            entry.tokens -= 1.0
+            true
+        } else {
+            false
+        }
+    }
+
+    fn tokens_for(self, key: string) -> float {
+        self.entries.get(key) |> map(|e| e.tokens) ?? self.capacity
+    }
+}
+
+// Sliding window rate limiter
+struct SlidingWindow {
+    windows:  dict<string, [int]>,
+    limit:    int,
+    window_ms: int,
+}
+
+impl SlidingWindow {
+    fn new(limit: int, window_ms: int) -> SlidingWindow {
+        SlidingWindow { windows: {}, limit, window_ms }
+    }
+
+    fn check(mut self, key: string) -> bool {
+        let now    = unix_now_ms()
+        let cutoff = now - self.window_ms
+        let wins   = self.windows.entry(key).or_insert([])
+        *wins = wins |> filter(|&t| t > cutoff) |> collect()
+        if wins.len() < self.limit {
+            wins.push(now)
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn main() {
+    mut rl = RateLimiter.new(10.0, 5.0)
+    let mut allowed = 0
+    for _ in range(0, 10) {
+        if rl.check("192.168.1.1") { allowed += 1 }
+    }
+    assert(allowed == 5)
+    print("Token bucket: allowed ${allowed}/10 (capacity=5) ✓")
+
+    mut sw = SlidingWindow.new(3, 1000)
+    let mut ok_count = 0
+    for _ in range(0, 5) {
+        if sw.check("user:1") { ok_count += 1 }
+    }
+    assert(ok_count == 3)
+    print("Sliding window: allowed ${ok_count}/5 (limit=3) ✓")
+}
