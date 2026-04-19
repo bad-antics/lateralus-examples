@@ -1,0 +1,322 @@
+// Niche Example - IRC Client
+// Internet Relay Chat client with channels, messages, and commands.
+
+use std.net.TcpStream
+use std.io.{Read, Write, BufReader, BufRead}
+use std.collections.HashMap
+use std.time.{Instant, Duration}
+
+#[derive(Clone, Debug)]
+struct IrcMessage {
+    prefix: Option<string>,
+    command: string,
+    params: [string],
+    trailing: Option<string>,
+}
+
+impl IrcMessage {
+    fn parse(raw: &str) -> Result<IrcMessage, string> {
+        let mut input = raw.trim()
+        let prefix = if input.starts_with(':') {
+            let end = input.find(' ').ok_or("malformed prefix")?
+            let p = input[1..end].to_string()
+            input = &input[end + 1..]
+            some(p)
+        } else { none }
+
+        let (cmd_params, trailing) = if let some(idx) = input.find(" :") {
+            (input[..idx].to_string(), some(input[idx + 2..].to_string()))
+        } else {
+            (input.to_string(), none)
+        }
+
+        let parts: [&str] = cmd_params.split(' ').collect()
+        if parts.is_empty() { return err("no command".to_string()) }
+        let command = parts[0].to_uppercase()
+        let params = parts[1..].iter().map(|s| s.to_string()).collect()
+        ok(IrcMessage { prefix, command, params, trailing })
+    }
+
+    fn to_raw(self) -> string {
+        let mut s = string.new()
+        if let some(ref p) = self.prefix {
+            s.push_str(&format!(":{} ", p))
+        }
+        s.push_str(&self.command)
+        for param in &self.params {
+            s.push(' ')
+            s.push_str(param)
+        }
+        if let some(ref t) = self.trailing {
+            s.push_str(" :")
+            s.push_str(t)
+        }
+        s
+    }
+
+    fn nick(self) -> Option<string> {
+        self.prefix.as_ref().map(|p| {
+            p.split('!').next().unwrap_or(p).to_string()
+        })
+    }
+
+    fn is_numeric(self) -> bool {
+        self.command.chars().all(|c| c.is_ascii_digit())
+    }
+}
+
+#[derive(Clone)]
+struct Channel {
+    name: string,
+    topic: Option<string>,
+    users: [string],
+    messages: [(string, string, Instant)],  // (nick, msg, time)
+}
+
+impl Channel {
+    fn new(name: &str) -> Channel {
+        Channel { name: name.to_string(), topic: none, users: [], messages: [] }
+    }
+
+    fn add_message(mut self, nick: &str, msg: &str) {
+        self.messages.push((nick.to_string(), msg.to_string(), Instant.now()))
+        if self.messages.len() > 1000 {
+            self.messages.remove(0)
+        }
+    }
+
+    fn add_user(mut self, nick: &str) {
+        if !self.users.contains(&nick.to_string()) {
+            self.users.push(nick.to_string())
+        }
+    }
+
+    fn remove_user(mut self, nick: &str) {
+        self.users.retain(|n| n != nick)
+    }
+
+    fn user_count(self) -> usize { self.users.len() }
+}
+
+struct IrcClient {
+    nick: string,
+    username: string,
+    realname: string,
+    server: string,
+    port: u16,
+    channels: HashMap<string, Channel>,
+    connected: bool,
+    stream: Option<TcpStream>,
+    on_message: Option<fn(&IrcMessage)>,
+}
+
+impl IrcClient {
+    fn new(nick: &str, server: &str, port: u16) -> IrcClient {
+        IrcClient {
+            nick: nick.to_string(), username: nick.to_string(),
+            realname: nick.to_string(), server: server.to_string(),
+            port, channels: HashMap.new(), connected: false,
+            stream: none, on_message: none,
+        }
+    }
+
+    fn connect(mut self) -> Result<(), string> {
+        let addr = format!("{}:{}", self.server, self.port)
+        let stream = TcpStream.connect(&addr).map_err(|e| e.to_string())?
+        self.stream = some(stream)
+        self.send_raw(&format!("NICK {}", self.nick))?
+        self.send_raw(&format!("USER {} 0 * :{}", self.username, self.realname))?
+        self.connected = true
+        ok(())
+    }
+
+    fn send_raw(mut self, line: &str) -> Result<(), string> {
+        if let some(ref mut stream) = self.stream {
+            let data = format!("{}\r\n", line)
+            stream.write_all(data.as_bytes()).map_err(|e| e.to_string())?
+            stream.flush().map_err(|e| e.to_string())?
+            ok(())
+        } else {
+            err("not connected".to_string())
+        }
+    }
+
+    fn join(mut self, channel: &str) -> Result<(), string> {
+        self.send_raw(&format!("JOIN {}", channel))?
+        self.channels.insert(channel.to_string(), Channel.new(channel))
+        ok(())
+    }
+
+    fn part(mut self, channel: &str, reason: Option<&str>) -> Result<(), string> {
+        let msg = match reason {
+            some(r) => format!("PART {} :{}", channel, r),
+            none => format!("PART {}", channel),
+        }
+        self.send_raw(&msg)?
+        self.channels.remove(channel)
+        ok(())
+    }
+
+    fn privmsg(mut self, target: &str, message: &str) -> Result<(), string> {
+        self.send_raw(&format!("PRIVMSG {} :{}", target, message))?
+        if let some(chan) = self.channels.get_mut(target) {
+            chan.add_message(&self.nick, message)
+        }
+        ok(())
+    }
+
+    fn notice(mut self, target: &str, message: &str) -> Result<(), string> {
+        self.send_raw(&format!("NOTICE {} :{}", target, message))
+    }
+
+    fn nick_change(mut self, new_nick: &str) -> Result<(), string> {
+        self.send_raw(&format!("NICK {}", new_nick))?
+        self.nick = new_nick.to_string()
+        ok(())
+    }
+
+    fn quit(mut self, reason: Option<&str>) -> Result<(), string> {
+        let msg = match reason {
+            some(r) => format!("QUIT :{}", r),
+            none => "QUIT".to_string(),
+        }
+        self.send_raw(&msg)?
+        self.connected = false
+        ok(())
+    }
+
+    fn handle_message(mut self, msg: &IrcMessage) {
+        match msg.command.as_str() {
+            "PING" => {
+                let resp = msg.trailing.as_ref().unwrap_or(&"".to_string()).clone()
+                let _ = self.send_raw(&format!("PONG :{}", resp))
+            },
+            "PRIVMSG" => {
+                if let (some(target), some(ref text)) = (msg.params.first(), &msg.trailing) {
+                    if let some(nick) = msg.nick() {
+                        if let some(chan) = self.channels.get_mut(target.as_str()) {
+                            chan.add_message(&nick, text)
+                        }
+                    }
+                }
+            },
+            "JOIN" => {
+                let channel = msg.params.first().or(msg.trailing.as_ref())
+                if let (some(chan_name), some(nick)) = (channel, msg.nick()) {
+                    if let some(chan) = self.channels.get_mut(chan_name.as_str()) {
+                        chan.add_user(&nick)
+                    }
+                }
+            },
+            "PART" | "QUIT" => {
+                if let some(nick) = msg.nick() {
+                    for (_, chan) in self.channels.iter_mut() {
+                        chan.remove_user(&nick)
+                    }
+                }
+            },
+            "332" => {  // RPL_TOPIC
+                if msg.params.len() >= 2 {
+                    let chan_name = &msg.params[1]
+                    if let some(chan) = self.channels.get_mut(chan_name.as_str()) {
+                        chan.topic = msg.trailing.clone()
+                    }
+                }
+            },
+            _ => {},
+        }
+        if let some(handler) = self.on_message { handler(msg) }
+    }
+
+    fn channel_list(self) -> [&str] {
+        self.channels.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+fn main() {
+    // Parse message
+    let raw = ":nick!user@host PRIVMSG #channel :Hello, world!"
+    let msg = IrcMessage.parse(raw).unwrap()
+    assert(msg.prefix == some("nick!user@host".to_string()))
+    assert(msg.command == "PRIVMSG")
+    assert(msg.params == ["#channel".to_string()])
+    assert(msg.trailing == some("Hello, world!".to_string()))
+    print("Parse PRIVMSG ✓")
+
+    // Nick extraction
+    assert(msg.nick() == some("nick".to_string()))
+    print("Nick extraction ✓")
+
+    // Parse PING
+    let ping = IrcMessage.parse("PING :server.example.com").unwrap()
+    assert(ping.command == "PING")
+    assert(ping.trailing == some("server.example.com".to_string()))
+    assert(ping.prefix.is_none())
+    print("Parse PING ✓")
+
+    // To raw
+    let rebuilt = msg.to_raw()
+    assert(rebuilt.contains("PRIVMSG"))
+    assert(rebuilt.contains("#channel"))
+    assert(rebuilt.contains(":Hello, world!"))
+    print("to_raw ✓")
+
+    // Numeric
+    let numeric = IrcMessage { prefix: some("srv".to_string()), command: "001".to_string(),
+        params: ["nick".to_string()], trailing: some("Welcome".to_string()) }
+    assert(numeric.is_numeric())
+    assert(!msg.is_numeric())
+    print("is_numeric ✓")
+
+    // Channel
+    let mut chan = Channel.new("#test")
+    assert(chan.name == "#test")
+    assert(chan.topic.is_none())
+    assert(chan.user_count() == 0)
+    print("Channel new ✓")
+
+    chan.add_user("alice")
+    chan.add_user("bob")
+    assert(chan.user_count() == 2)
+    chan.add_user("alice")  // duplicate
+    assert(chan.user_count() == 2)
+    print("Add users ✓")
+
+    chan.remove_user("bob")
+    assert(chan.user_count() == 1)
+    print("Remove user ✓")
+
+    chan.add_message("alice", "hello")
+    assert(chan.messages.len() == 1)
+    assert(chan.messages[0].0 == "alice")
+    assert(chan.messages[0].1 == "hello")
+    print("Channel messages ✓")
+
+    // Client creation
+    let client = IrcClient.new("lateralus_bot", "irc.libera.chat", 6667)
+    assert(client.nick == "lateralus_bot")
+    assert(client.server == "irc.libera.chat")
+    assert(client.port == 6667)
+    assert(!client.connected)
+    assert(client.channels.is_empty())
+    print("IrcClient new ✓")
+
+    // Parse edge cases
+    let simple = IrcMessage.parse("QUIT").unwrap()
+    assert(simple.command == "QUIT")
+    assert(simple.params.is_empty())
+    assert(simple.trailing.is_none())
+    print("Parse simple ✓")
+
+    let with_params = IrcMessage.parse("MODE #chan +o nick").unwrap()
+    assert(with_params.command == "MODE")
+    assert(with_params.params.len() == 3)
+    print("Parse with params ✓")
+
+    // No prefix nick
+    let no_prefix = IrcMessage { prefix: none, command: "PING".to_string(), params: [], trailing: none }
+    assert(no_prefix.nick().is_none())
+    print("No prefix nick ✓")
+
+    print("IRC Client complete ✓")
+}
