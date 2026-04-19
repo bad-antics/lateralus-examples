@@ -1,0 +1,105 @@
+// two048.ltl — 2048 in the terminal
+use std.io.{read_char, stdout}
+use std.random.rand_range
+
+const N: int = 4
+
+struct Board { tiles: [[int]] }
+
+impl Board {
+    fn new() -> Board {
+        let mut b = Board { tiles: range(0, N) |> map(|_| [0; N]) |> collect() }
+        b.add_random()
+        b.add_random()
+        b
+    }
+
+    fn add_random(mut self) {
+        let empties = range(0, N) |> flat_map(|y| range(0, N) |> map(|x| (x, y))) |> filter(|(x,y)| self.tiles[y][x] == 0) |> collect()
+        if empties.is_empty() { return }
+        let (x, y) = empties[rand_range(0, empties.len())]
+        self.tiles[y][x] = if rand_range(0, 10) < 9 { 2 } else { 4 }
+    }
+
+    fn slide_row(row: [int]) -> ([int], int) {
+        let mut cells = row |> filter(|x| x != 0) |> collect()
+        let mut score = 0
+        let mut i = 0
+        while i + 1 < cells.len() {
+            if cells[i] == cells[i+1] {
+                cells[i] *= 2
+                score += cells[i]
+                cells.remove(i+1)
+            }
+            i += 1
+        }
+        while cells.len() < N { cells.push(0) }
+        (cells, score)
+    }
+
+    fn move_left(mut self) -> (Board, int) {
+        let mut score = 0
+        for y in range(0, N) {
+            let (new_row, s) = Self.slide_row(self.tiles[y])
+            self.tiles[y] = new_row
+            score += s
+        }
+        (self, score)
+    }
+
+    fn rotate(self) -> Board {
+        let mut t = Board { tiles: [[0; N]; N] }
+        for y in range(0, N) { for x in range(0, N) { t.tiles[x][N-1-y] = self.tiles[y][x] } }
+        t
+    }
+
+    fn do_move(self, dir: char) -> (Board, int) {
+        let (b, s) = match dir {
+            'a' => self.move_left(),
+            'd' => { let (b, s) = self.rotate().rotate().move_left(); (b.rotate().rotate(), s) },
+            'w' => { let (b, s) = self.rotate().rotate().rotate().move_left(); (b.rotate(), s) },
+            's' => { let (b, s) = self.rotate().move_left(); (b.rotate().rotate().rotate(), s) },
+            _   => (self, 0),
+        }
+        let mut b2 = b
+        b2.add_random()
+        (b2, s)
+    }
+
+    fn render(self, score: int) -> string {
+        let sep = "+------" * N + "+
+"
+        let mut out = "[H2048  score: ${score}
+" + sep
+        for row in self.tiles {
+            out += "|"
+            for v in row { out += if v == 0 { "      " } else { "${v}".pad_start(6) } + "|" }
+            out += "
+" + sep
+        }
+        out
+    }
+
+    fn max_tile(self) -> int {
+        self.tiles |> flat_map(|r| r) |> max() ?? 0
+    }
+}
+
+fn main() {
+    let mut board = Board.new()
+    let mut score = 0
+    print("[2J[?25l")
+    loop {
+        stdout().write(board.render(score))
+        let ch = read_char()
+        if ch == 'q' { break }
+        let (nb, ns) = board.do_move(ch)
+        board = nb
+        score += ns
+        if board.max_tile() >= 2048 {
+            print("You win! Final score: ${score}")
+            break
+        }
+    }
+    print("[?25h")
+}
