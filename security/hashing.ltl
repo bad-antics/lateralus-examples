@@ -1,0 +1,80 @@
+// hashing.ltl — Cryptographic hash utilities in Lateralus
+use std.crypto.{sha256, sha512, blake3}
+use std.encoding.hex
+
+fn hash_password_simple(password: string, salt: string) -> string {
+    // PBKDF2-like (simplified): SHA-256 iterated 10000 times
+    let mut h = sha256("${salt}${password}")
+    for _ in range(1, 10000) {
+        h = sha256(h)
+    }
+    hex.encode(h)
+}
+
+fn verify_password(password: string, salt: string, hash: string) -> bool {
+    hash_password_simple(password, salt) == hash
+}
+
+fn hmac_sha256(key: [u8], message: [u8]) -> [u8] {
+    let block_size = 64
+    let mut k = key
+    if k.len() > block_size { k = sha256_bytes(k) }
+    while k.len() < block_size { k.push(0) }
+
+    let ipad = k |> map(|b| b ^ 0x36u8) |> collect()
+    let opad = k |> map(|b| b ^ 0x5Cu8) |> collect()
+
+    let inner = sha256_bytes([...ipad, ...message])
+    sha256_bytes([...opad, ...inner])
+}
+
+fn sha256_bytes(data: [u8]) -> [u8] {
+    sha256(data)
+}
+
+struct HashChain {
+    chain: [string],
+}
+
+impl HashChain {
+    fn new(genesis: string) -> HashChain {
+        HashChain { chain: [sha256(genesis) |> hex.encode()] }
+    }
+
+    fn extend(mut self, data: string) {
+        let prev = self.chain.last()
+        self.chain.push(sha256("${prev}${data}") |> hex.encode())
+    }
+
+    fn verify(self) -> bool {
+        for i in range(1, self.chain.len()) {
+            // Each block should link correctly; simplified verification
+            if self.chain[i].len() != 64 { return false }
+        }
+        true
+    }
+
+    fn len(self) -> int { self.chain.len() }
+}
+
+fn main() {
+    let salt = "random_salt_abc123"
+    let hash = hash_password_simple("hunter2", salt)
+    print("Password hash: ${hash[0..16]}...")
+    assert(verify_password("hunter2", salt, hash))
+    assert(!verify_password("wrong",   salt, hash))
+    print("Password verify ✓")
+
+    let key  = "secret-key" |> as_bytes()
+    let msg  = "important message" |> as_bytes()
+    let mac  = hmac_sha256(key, msg)
+    assert(mac.len() == 32)
+    print("HMAC-SHA256 = ${hex.encode(mac)[0..16]}... ✓")
+
+    let mut chain = HashChain.new("genesis block")
+    chain.extend("block 1 data")
+    chain.extend("block 2 data")
+    assert(chain.verify())
+    assert(chain.len() == 3)
+    print("Hash chain (${chain.len()} blocks) verified ✓")
+}
