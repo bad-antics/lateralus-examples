@@ -1,0 +1,425 @@
+// niche/ray_tracer.ltl — Path tracer with BVH acceleration
+use std.math.{sqrt, sin, cos, tan, PI, INFINITY}
+
+// ── Vector math ──────────────────────────────────────────────────────────────
+struct Vec3 { x: f64, y: f64, z: f64 }
+
+impl Vec3 {
+    fn new(x: f64, y: f64, z: f64) -> Vec3 { Vec3 { x, y, z } }
+    fn zero() -> Vec3 { Vec3 { x: 0.0, y: 0.0, z: 0.0 } }
+    fn one()  -> Vec3 { Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+
+    fn add(self, o: Vec3) -> Vec3 { Vec3 { x: self.x + o.x, y: self.y + o.y, z: self.z + o.z } }
+    fn sub(self, o: Vec3) -> Vec3 { Vec3 { x: self.x - o.x, y: self.y - o.y, z: self.z - o.z } }
+    fn mul_scalar(self, t: f64) -> Vec3 { Vec3 { x: self.x * t, y: self.y * t, z: self.z * t } }
+    fn mul(self, o: Vec3) -> Vec3 { Vec3 { x: self.x * o.x, y: self.y * o.y, z: self.z * o.z } }
+    fn div_scalar(self, t: f64) -> Vec3 { self.mul_scalar(1.0 / t) }
+    fn neg(self) -> Vec3 { Vec3 { x: -self.x, y: -self.y, z: -self.z } }
+
+    fn dot(self, o: Vec3) -> f64 { self.x * o.x + self.y * o.y + self.z * o.z }
+    fn cross(self, o: Vec3) -> Vec3 {
+        Vec3 { x: self.y * o.z - self.z * o.y, y: self.z * o.x - self.x * o.z, z: self.x * o.y - self.y * o.x }
+    }
+    fn length_squared(self) -> f64 { self.dot(self) }
+    fn length(self) -> f64 { sqrt(self.length_squared()) }
+    fn normalize(self) -> Vec3 { self.div_scalar(self.length()) }
+    fn reflect(self, n: Vec3) -> Vec3 { self.sub(n.mul_scalar(2.0 * self.dot(n))) }
+    fn refract(self, n: Vec3, eta: f64) -> Option<Vec3> {
+        let cos_i = self.neg().dot(n)
+        let sin2_t = eta * eta * (1.0 - cos_i * cos_i)
+        if sin2_t > 1.0 { return none }
+        let cos_t = sqrt(1.0 - sin2_t)
+        some(self.mul_scalar(eta).add(n.mul_scalar(eta * cos_i - cos_t)))
+    }
+    fn near_zero(self) -> bool {
+        let s = 1e-8
+        self.x.abs() < s && self.y.abs() < s && self.z.abs() < s
+    }
+}
+
+// ── Ray ──────────────────────────────────────────────────────────────────────
+struct Ray { origin: Vec3, dir: Vec3 }
+impl Ray {
+    fn at(self, t: f64) -> Vec3 { self.origin.add(self.dir.mul_scalar(t)) }
+}
+
+// ── Hit record ───────────────────────────────────────────────────────────────
+struct HitRecord {
+    point:      Vec3,
+    normal:     Vec3,
+    t:          f64,
+    front_face: bool,
+    material:   MaterialId,
+}
+
+type MaterialId = usize
+
+// ── AABB for BVH ─────────────────────────────────────────────────────────────
+struct AABB { min: Vec3, max: Vec3 }
+
+impl AABB {
+    fn hit(self, ray: &Ray, t_min: f64, t_max: f64) -> bool {
+        let mut tmin = t_min; let mut tmax = t_max
+        for axis in 0..3 {
+            let (origin, dir, bmin, bmax) = match axis {
+                0 => (ray.origin.x, ray.dir.x, self.min.x, self.max.x),
+                1 => (ray.origin.y, ray.dir.y, self.min.y, self.max.y),
+                _ => (ray.origin.z, ray.dir.z, self.min.z, self.max.z),
+            }
+            let inv_d = 1.0 / dir
+            let mut t0 = (bmin - origin) * inv_d
+            let mut t1 = (bmax - origin) * inv_d
+            if inv_d < 0.0 { let tmp = t0; t0 = t1; t1 = tmp }
+            tmin = if t0 > tmin { t0 } else { tmin }
+            tmax = if t1 < tmax { t1 } else { tmax }
+            if tmax <= tmin { return false }
+        }
+        true
+    }
+
+    fn surrounding(a: AABB, b: AABB) -> AABB {
+        AABB {
+            min: Vec3.new(a.min.x.min(b.min.x), a.min.y.min(b.min.y), a.min.z.min(b.min.z)),
+            max: Vec3.new(a.max.x.max(b.max.x), a.max.y.max(b.max.y), a.max.z.max(b.max.z)),
+        }
+    }
+}
+
+// ── Shapes ───────────────────────────────────────────────────────────────────
+enum Shape {
+    Sphere { center: Vec3, radius: f64, material: MaterialId },
+    Triangle { v0: Vec3, v1: Vec3, v2: Vec3, material: MaterialId },
+    Plane { point: Vec3, normal: Vec3, material: MaterialId },
+}
+
+impl Shape {
+    fn hit(self, ray: &Ray, t_min: f64, t_max: f64) -> Option<HitRecord> {
+        match self {
+            Shape.Sphere { center, radius, material } => {
+                let oc = ray.origin.sub(center)
+                let a = ray.dir.length_squared()
+                let half_b = oc.dot(ray.dir)
+                let c = oc.length_squared() - radius * radius
+                let discriminant = half_b * half_b - a * c
+                if discriminant < 0.0 { return none }
+
+                let sqrtd = sqrt(discriminant)
+                let mut root = (-half_b - sqrtd) / a
+                if root < t_min || root > t_max {
+                    root = (-half_b + sqrtd) / a
+                    if root < t_min || root > t_max { return none }
+                }
+
+                let point = ray.at(root)
+                let outward_normal = point.sub(center).div_scalar(radius)
+                let front_face = ray.dir.dot(outward_normal) < 0.0
+                let normal = if front_face { outward_normal } else { outward_normal.neg() }
+                some(HitRecord { point, normal, t: root, front_face, material })
+            }
+            Shape.Triangle { v0, v1, v2, material } => {
+                // Möller–Trumbore intersection
+                let edge1 = v1.sub(v0)
+                let edge2 = v2.sub(v0)
+                let h = ray.dir.cross(edge2)
+                let a = edge1.dot(h)
+                if a.abs() < 1e-8 { return none }
+                let f = 1.0 / a
+                let s = ray.origin.sub(v0)
+                let u = f * s.dot(h)
+                if u < 0.0 || u > 1.0 { return none }
+                let q = s.cross(edge1)
+                let v = f * ray.dir.dot(q)
+                if v < 0.0 || u + v > 1.0 { return none }
+                let t = f * edge2.dot(q)
+                if t < t_min || t > t_max { return none }
+                let normal = edge1.cross(edge2).normalize()
+                let front_face = ray.dir.dot(normal) < 0.0
+                some(HitRecord { point: ray.at(t), normal: if front_face { normal } else { normal.neg() }, t, front_face, material })
+            }
+            Shape.Plane { point, normal, material } => {
+                let denom = normal.dot(ray.dir)
+                if denom.abs() < 1e-8 { return none }
+                let t = point.sub(ray.origin).dot(normal) / denom
+                if t < t_min || t > t_max { return none }
+                let front_face = denom < 0.0
+                some(HitRecord { point: ray.at(t), normal: if front_face { normal } else { normal.neg() }, t, front_face, material })
+            }
+        }
+    }
+
+    fn bounding_box(self) -> AABB {
+        match self {
+            Shape.Sphere { center, radius, .. } => AABB {
+                min: center.sub(Vec3.new(radius, radius, radius)),
+                max: center.add(Vec3.new(radius, radius, radius)),
+            },
+            Shape.Triangle { v0, v1, v2, .. } => AABB {
+                min: Vec3.new(v0.x.min(v1.x).min(v2.x) - 0.001, v0.y.min(v1.y).min(v2.y) - 0.001, v0.z.min(v1.z).min(v2.z) - 0.001),
+                max: Vec3.new(v0.x.max(v1.x).max(v2.x) + 0.001, v0.y.max(v1.y).max(v2.y) + 0.001, v0.z.max(v1.z).max(v2.z) + 0.001),
+            },
+            Shape.Plane { .. } => AABB { min: Vec3.new(-1e10, -1e10, -1e10), max: Vec3.new(1e10, 1e10, 1e10) },
+        }
+    }
+}
+
+// ── BVH tree ─────────────────────────────────────────────────────────────────
+enum BVHNode {
+    Leaf { shape_idx: usize, bbox: AABB },
+    Interior { left: Box<BVHNode>, right: Box<BVHNode>, bbox: AABB },
+}
+
+impl BVHNode {
+    fn build(shapes: &[Shape], indices: &mut [usize]) -> BVHNode {
+        if indices.len() == 1 {
+            let idx = indices[0]
+            return BVHNode.Leaf { shape_idx: idx, bbox: shapes[idx].bounding_box() }
+        }
+
+        // Choose split axis (longest extent)
+        let mut overall = shapes[indices[0]].bounding_box()
+        for &i in &indices[1..] { overall = AABB.surrounding(overall, shapes[i].bounding_box()) }
+
+        let extent = overall.max.sub(overall.min)
+        let axis = if extent.x > extent.y && extent.x > extent.z { 0 }
+                   else if extent.y > extent.z { 1 } else { 2 }
+
+        indices.sort_by(|a, b| {
+            let ca = shapes[*a].bounding_box().min
+            let cb = shapes[*b].bounding_box().min
+            let va = match axis { 0 => ca.x, 1 => ca.y, _ => ca.z }
+            let vb = match axis { 0 => cb.x, 1 => cb.y, _ => cb.z }
+            va.partial_cmp(&vb).unwrap()
+        })
+
+        let mid = indices.len() / 2
+        let (left_indices, right_indices) = indices.split_at_mut(mid)
+        let left = BVHNode.build(shapes, left_indices)
+        let right = BVHNode.build(shapes, right_indices)
+
+        let bbox = AABB.surrounding(left.bbox(), right.bbox())
+        BVHNode.Interior { left: Box.new(left), right: Box.new(right), bbox }
+    }
+
+    fn bbox(self) -> AABB {
+        match self {
+            BVHNode.Leaf { bbox, .. } | BVHNode.Interior { bbox, .. } => bbox,
+        }
+    }
+
+    fn hit(self, shapes: &[Shape], ray: &Ray, t_min: f64, t_max: f64) -> Option<HitRecord> {
+        match self {
+            BVHNode.Leaf { shape_idx, bbox } => {
+                if !bbox.hit(ray, t_min, t_max) { return none }
+                shapes[shape_idx].hit(ray, t_min, t_max)
+            }
+            BVHNode.Interior { left, right, bbox } => {
+                if !bbox.hit(ray, t_min, t_max) { return none }
+                let hit_left = left.hit(shapes, ray, t_min, t_max)
+                let max_t = hit_left.as_ref().map(|h| h.t).unwrap_or(t_max)
+                let hit_right = right.hit(shapes, ray, t_min, max_t)
+                hit_right.or(hit_left)
+            }
+        }
+    }
+}
+
+// ── Materials ────────────────────────────────────────────────────────────────
+enum Material {
+    Lambertian { albedo: Vec3 },
+    Metal { albedo: Vec3, fuzz: f64 },
+    Dielectric { ior: f64 },
+    Emissive { color: Vec3, intensity: f64 },
+}
+
+fn random_unit_vec() -> Vec3 {
+    // Rejection sampling
+    loop {
+        let v = Vec3.new(
+            std.random.f64() * 2.0 - 1.0,
+            std.random.f64() * 2.0 - 1.0,
+            std.random.f64() * 2.0 - 1.0,
+        )
+        if v.length_squared() < 1.0 { return v.normalize() }
+    }
+}
+
+fn schlick(cosine: f64, ior: f64) -> f64 {
+    let r0 = ((1.0 - ior) / (1.0 + ior)).powi(2)
+    r0 + (1.0 - r0) * (1.0 - cosine).powi(5)
+}
+
+// ── Camera ───────────────────────────────────────────────────────────────────
+struct Camera {
+    origin: Vec3, lower_left: Vec3, horizontal: Vec3, vertical: Vec3,
+    u: Vec3, v: Vec3, lens_radius: f64,
+}
+
+impl Camera {
+    fn new(lookfrom: Vec3, lookat: Vec3, vup: Vec3, vfov: f64, aspect: f64, aperture: f64, focus_dist: f64) -> Camera {
+        let theta = vfov * PI / 180.0
+        let h = tan(theta / 2.0)
+        let viewport_h = 2.0 * h
+        let viewport_w = aspect * viewport_h
+
+        let w = lookfrom.sub(lookat).normalize()
+        let u = vup.cross(w).normalize()
+        let v = w.cross(u)
+
+        let horizontal = u.mul_scalar(viewport_w * focus_dist)
+        let vertical = v.mul_scalar(viewport_h * focus_dist)
+        let lower_left = lookfrom.sub(horizontal.div_scalar(2.0))
+            .sub(vertical.div_scalar(2.0)).sub(w.mul_scalar(focus_dist))
+
+        Camera { origin: lookfrom, lower_left, horizontal, vertical, u, v, lens_radius: aperture / 2.0 }
+    }
+
+    fn get_ray(self, s: f64, t: f64) -> Ray {
+        Ray {
+            origin: self.origin,
+            dir: self.lower_left
+                .add(self.horizontal.mul_scalar(s))
+                .add(self.vertical.mul_scalar(t))
+                .sub(self.origin)
+                .normalize(),
+        }
+    }
+}
+
+// ── Scene & rendering ────────────────────────────────────────────────────────
+struct Scene {
+    shapes:    [Shape],
+    materials: [Material],
+    bvh:       Option<BVHNode>,
+    sky_color: Vec3,
+}
+
+impl Scene {
+    fn new() -> Scene {
+        Scene { shapes: [], materials: [], bvh: none, sky_color: Vec3.new(0.5, 0.7, 1.0) }
+    }
+
+    fn add_material(mut self, mat: Material) -> MaterialId {
+        self.materials.push(mat)
+        self.materials.len() - 1
+    }
+
+    fn add_shape(mut self, shape: Shape) {
+        self.shapes.push(shape)
+    }
+
+    fn build_bvh(mut self) {
+        let mut indices: [usize] = (0..self.shapes.len()).collect()
+        self.bvh = some(BVHNode.build(&self.shapes, &mut indices))
+    }
+
+    fn trace(self, ray: &Ray, depth: u32) -> Vec3 {
+        if depth == 0 { return Vec3.zero() }
+
+        let hit = match &self.bvh {
+            some(bvh) => bvh.hit(&self.shapes, ray, 0.001, INFINITY),
+            none => {
+                let mut closest: Option<HitRecord> = none
+                for shape in &self.shapes {
+                    let t_max = closest.as_ref().map(|h| h.t).unwrap_or(INFINITY)
+                    if let some(h) = shape.hit(ray, 0.001, t_max) { closest = some(h) }
+                }
+                closest
+            }
+        }
+
+        match hit {
+            none => {
+                // Sky gradient
+                let t = 0.5 * (ray.dir.normalize().y + 1.0)
+                Vec3.one().mul_scalar(1.0 - t).add(self.sky_color.mul_scalar(t))
+            }
+            some(rec) => {
+                let mat = &self.materials[rec.material]
+                match mat {
+                    Material.Lambertian { albedo } => {
+                        let target = rec.normal.add(random_unit_vec())
+                        let scattered = Ray { origin: rec.point, dir: if target.near_zero() { rec.normal } else { target } }
+                        albedo.mul(self.trace(&scattered, depth - 1))
+                    }
+                    Material.Metal { albedo, fuzz } => {
+                        let reflected = ray.dir.normalize().reflect(rec.normal)
+                        let scattered = Ray { origin: rec.point, dir: reflected.add(random_unit_vec().mul_scalar(*fuzz)) }
+                        if scattered.dir.dot(rec.normal) > 0.0 {
+                            albedo.mul(self.trace(&scattered, depth - 1))
+                        } else { Vec3.zero() }
+                    }
+                    Material.Dielectric { ior } => {
+                        let ratio = if rec.front_face { 1.0 / ior } else { *ior }
+                        let unit_dir = ray.dir.normalize()
+                        let cos_theta = unit_dir.neg().dot(rec.normal).min(1.0)
+                        let sin_theta = sqrt(1.0 - cos_theta * cos_theta)
+                        let cannot_refract = ratio * sin_theta > 1.0
+                        let dir = if cannot_refract || schlick(cos_theta, ratio) > std.random.f64() {
+                            unit_dir.reflect(rec.normal)
+                        } else {
+                            unit_dir.refract(rec.normal, ratio).unwrap()
+                        }
+                        self.trace(&Ray { origin: rec.point, dir }, depth - 1)
+                    }
+                    Material.Emissive { color, intensity } => color.mul_scalar(*intensity),
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    // Vec3 tests
+    let a = Vec3.new(1.0, 2.0, 3.0)
+    let b = Vec3.new(4.0, 5.0, 6.0)
+    assert((a.dot(b) - 32.0).abs() < 1e-10)
+    print("Vec3 dot product ✓")
+
+    let c = a.cross(b)
+    assert((c.x - (-3.0)).abs() < 1e-10)
+    print("Vec3 cross product ✓")
+
+    let n = a.normalize()
+    assert((n.length() - 1.0).abs() < 1e-10)
+    print("Vec3 normalize ✓")
+
+    // Ray-sphere intersection
+    let sphere = Shape.Sphere { center: Vec3.new(0.0, 0.0, -1.0), radius: 0.5, material: 0 }
+    let ray = Ray { origin: Vec3.zero(), dir: Vec3.new(0.0, 0.0, -1.0) }
+    let hit = sphere.hit(&ray, 0.001, INFINITY)
+    assert(hit.is_some())
+    assert((hit.unwrap().t - 0.5).abs() < 1e-10)
+    print("Ray-sphere intersection ✓")
+
+    // AABB
+    let bbox = AABB { min: Vec3.new(-1.0, -1.0, -1.0), max: Vec3.new(1.0, 1.0, 1.0) }
+    assert(bbox.hit(&ray, 0.0, 100.0))
+    print("AABB hit ✓")
+
+    // Build scene
+    let mut scene = Scene.new()
+    let ground = scene.add_material(Material.Lambertian { albedo: Vec3.new(0.5, 0.5, 0.5) })
+    let metal = scene.add_material(Material.Metal { albedo: Vec3.new(0.8, 0.6, 0.2), fuzz: 0.0 })
+    let glass = scene.add_material(Material.Dielectric { ior: 1.5 })
+
+    scene.add_shape(Shape.Sphere { center: Vec3.new(0.0, -100.5, -1.0), radius: 100.0, material: ground })
+    scene.add_shape(Shape.Sphere { center: Vec3.new(0.0, 0.0, -1.0), radius: 0.5, material: metal })
+    scene.add_shape(Shape.Sphere { center: Vec3.new(-1.0, 0.0, -1.0), radius: 0.5, material: glass })
+
+    scene.build_bvh()
+    print("BVH built for ${scene.shapes.len()} shapes ✓")
+
+    // Camera
+    let cam = Camera.new(Vec3.new(0.0, 0.0, 0.0), Vec3.new(0.0, 0.0, -1.0), Vec3.new(0.0, 1.0, 0.0), 90.0, 16.0/9.0, 0.0, 1.0)
+    let ray = cam.get_ray(0.5, 0.5)
+    let color = scene.trace(&ray, 10)
+    assert(color.x >= 0.0 && color.y >= 0.0 && color.z >= 0.0)
+    print("Path trace sample: (${color.x:.3}, ${color.y:.3}, ${color.z:.3}) ✓")
+
+    // Schlick reflectance
+    let r = schlick(1.0, 1.5)
+    assert((r - 0.04).abs() < 0.01)
+    print("Schlick approximation ✓")
+
+    print("Ray tracer — all passed ✓")
+}
