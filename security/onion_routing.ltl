@@ -1,0 +1,181 @@
+// onion_routing.ltl — Onion routing / Tor-like anonymous relay network
+
+use std.crypto.{x25519, aes256_ctr, sha256, random_bytes}
+
+struct RelayNode {
+    id:         string,
+    sk:         [u8; 32],
+    pk:         [u8; 32],
+    address:    string,
+}
+
+impl RelayNode {
+    fn new(id: string, address: string) -> RelayNode {
+        let sk = random_bytes(32).try_into().unwrap()
+        let pk = x25519.base_point_mul(sk)
+        RelayNode { id, sk, pk, address }
+    }
+}
+
+struct Circuit {
+    hops: [CircuitHop],
+}
+
+struct CircuitHop {
+    node:       RelayNode,
+    shared_key: [u8; 32],
+    send_iv:    [u8; 16],
+    recv_iv:    [u8; 16],
+}
+
+struct OnionLayer {
+    next_address: string,
+    payload:      [u8],
+}
+
+fn build_circuit(nodes: [RelayNode], final_dest: string) -> Circuit {
+    let mut hops = []
+    for node in nodes {
+        let ephemeral_sk = random_bytes(32).try_into().unwrap()
+        let shared = x25519.scalar_mult(ephemeral_sk, node.pk)
+        let derived = sha256.hash(&shared)
+        let send_iv: [u8; 16] = sha256.hash(&[&derived[..], b"send"].concat())[0..16].try_into().unwrap()
+        let recv_iv: [u8; 16] = sha256.hash(&[&derived[..], b"recv"].concat())[0..16].try_into().unwrap()
+        hops.push(CircuitHop { node, shared_key: derived, send_iv, recv_iv })
+    }
+    Circuit { hops }
+}
+
+fn wrap_onion(circuit: Circuit, plaintext: &[u8], destination: string) -> [u8] {
+    let mut payload = plaintext.to_vec()
+    let mut next = destination
+
+    // Wrap layers from innermost (exit) to outermost (guard)
+    for hop in circuit.hops.iter().rev() {
+        let layer = OnionLayer { next_address: next.clone(), payload: payload.clone() }
+        let serialized = serialize_layer(layer)
+        payload = aes256_ctr.encrypt(hop.shared_key, hop.send_iv, &serialized)
+        next = hop.node.address.clone()
+    }
+    payload
+}
+
+fn peel_layer(hop: CircuitHop, encrypted: &[u8]) -> OnionLayer {
+    let decrypted = aes256_ctr.decrypt(hop.shared_key, hop.recv_iv, encrypted)
+    deserialize_layer(decrypted)
+}
+
+fn serialize_layer(layer: OnionLayer) -> [u8] {
+    let addr_bytes = layer.next_address.as_bytes()
+    let mut out: [u8] = []
+    out.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes())
+    out.extend_from_slice(addr_bytes)
+    out.extend_from_slice(&(layer.payload.len() as u32).to_le_bytes())
+    out.extend_from_slice(&layer.payload)
+    out
+}
+
+fn deserialize_layer(data: [u8]) -> OnionLayer {
+    let addr_len = u32_from_le_bytes(&data[0..4]) as usize
+    let addr = string.from_utf8(&data[4..4+addr_len]).unwrap()
+    let payload_len = u32_from_le_bytes(&data[4+addr_len..8+addr_len]) as usize
+    let payload = data[8+addr_len..8+addr_len+payload_len].to_vec()
+    OnionLayer { next_address: addr, payload }
+}
+
+fn u32_from_le_bytes(b: &[u8]) -> u32 {
+    b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16 | (b[3] as u32) << 24
+}
+
+// ── Directory authority (simplified) ──────────────────────────────────────────
+struct DirectoryAuthority {
+    relays: [RelayNode],
+}
+
+impl DirectoryAuthority {
+    fn new() -> DirectoryAuthority { DirectoryAuthority { relays: [] } }
+
+    fn register(mut self, node: RelayNode) { self.relays.push(node) }
+
+    fn select_circuit(self, num_hops: int) -> [RelayNode] {
+        // In real Tor: weighted random selection avoiding same /16 subnet
+        assert(self.relays.len() >= num_hops)
+        let mut selected = []
+        let mut used: set<string> = set()
+        let mut seed: u64 = std.time.now_ms() as u64
+        while selected.len() < num_hops {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1)
+            let idx = (seed % self.relays.len() as u64) as usize
+            let relay = self.relays[idx].clone()
+            if !used.contains(&relay.id) {
+                used.insert(relay.id.clone())
+                selected.push(relay)
+            }
+        }
+        selected
+    }
+}
+
+// ── Hidden service (.onion) ──────────────────────────────────────────────────
+struct HiddenService {
+    service_key: [u8; 32],
+    intro_points: [RelayNode],
+}
+
+impl HiddenService {
+    fn new() -> HiddenService {
+        let sk = random_bytes(32).try_into().unwrap()
+        HiddenService { service_key: sk, intro_points: [] }
+    }
+
+    fn onion_address(self) -> string {
+        let pk = x25519.base_point_mul(self.service_key)
+        let hash = sha256.hash(&pk)
+        base32_encode(&hash[0..16]) + ".onion"
+    }
+}
+
+fn base32_encode(data: &[u8]) -> string {
+    let alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+    let mut result = "".to_string()
+    let mut buffer: u64 = 0; let mut bits = 0
+    for byte in data {
+        buffer = (buffer << 8) | *byte as u64; bits += 8
+        while bits >= 5 { bits -= 5; result.push(alphabet.chars().nth(((buffer >> bits) & 0x1f) as usize).unwrap()) }
+    }
+    if bits > 0 { result.push(alphabet.chars().nth(((buffer << (5 - bits)) & 0x1f) as usize).unwrap()) }
+    result
+}
+
+fn main() {
+    // Set up relay network
+    let mut dir = DirectoryAuthority.new()
+    for i in range(0, 10) {
+        dir.register(RelayNode.new(format!("relay-{i}"), format!("10.0.0.{i+1}:9001")))
+    }
+    print("Directory: ${dir.relays.len()} relays registered")
+
+    // Build 3-hop circuit
+    let path = dir.select_circuit(3)
+    print("Circuit: ${path |> map(|n| n.id.clone()) |> join(\" → \")}")
+
+    let circuit = build_circuit(path.clone(), "example.com:443".to_string())
+
+    // Wrap message in onion layers
+    let msg = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".as_bytes()
+    let onion = wrap_onion(circuit.clone(), msg, "example.com:443".to_string())
+    print("Onion packet: ${onion.len()} bytes (${circuit.hops.len()} layers)")
+    assert(onion != msg.to_vec(), "onion must differ from plaintext")
+
+    // Peel first layer
+    let layer1 = peel_layer(circuit.hops[0].clone(), &onion)
+    print("After guard: next=${layer1.next_address}, ${layer1.payload.len()} bytes")
+
+    // Hidden service
+    let hs = HiddenService.new()
+    let addr = hs.onion_address()
+    print("Hidden service: ${addr}")
+    assert(addr.ends_with(".onion"))
+
+    print("Onion routing — all assertions passed ✓")
+}
