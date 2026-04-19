@@ -1,0 +1,303 @@
+// Niche Example - JSON-RPC 2.0 Implementation
+// Request/response protocol over JSON with method dispatch.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+pub enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(string),
+    Array([JsonValue]),
+    Object(HashMap<string, JsonValue>),
+}
+
+impl JsonValue {
+    pub fn as_str(self) -> Option<&str> {
+        match self { JsonValue.String(ref s) => some(s.as_str()), _ => none }
+    }
+    pub fn as_f64(self) -> Option<f64> {
+        match self { JsonValue.Number(n) => some(n), _ => none }
+    }
+    pub fn as_i64(self) -> Option<i64> {
+        match self { JsonValue.Number(n) => some(n as i64), _ => none }
+    }
+    pub fn as_bool(self) -> Option<bool> {
+        match self { JsonValue.Bool(b) => some(b), _ => none }
+    }
+    pub fn as_array(self) -> Option<&[JsonValue]> {
+        match self { JsonValue.Array(ref a) => some(a), _ => none }
+    }
+    pub fn as_object(self) -> Option<&HashMap<string, JsonValue>> {
+        match self { JsonValue.Object(ref o) => some(o), _ => none }
+    }
+    pub fn is_null(self) -> bool {
+        match self { JsonValue.Null => true, _ => false }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum RequestId {
+    Number(i64),
+    String(string),
+    Null,
+}
+
+impl RequestId {
+    fn to_json(self) -> JsonValue {
+        match self {
+            RequestId.Number(n) => JsonValue.Number(n as f64),
+            RequestId.String(s) => JsonValue.String(s),
+            RequestId.Null => JsonValue.Null,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Request {
+    pub jsonrpc: string,
+    pub method: string,
+    pub params: Option<JsonValue>,
+    pub id: Option<RequestId>,
+}
+
+impl Request {
+    pub fn new(method: &str, params: Option<JsonValue>, id: Option<RequestId>) -> Request {
+        Request { jsonrpc: "2.0".to_string(), method: method.to_string(), params, id }
+    }
+
+    pub fn notification(method: &str, params: Option<JsonValue>) -> Request {
+        Request { jsonrpc: "2.0".to_string(), method: method.to_string(), params, id: none }
+    }
+
+    pub fn is_notification(self) -> bool { self.id.is_none() }
+
+    pub fn to_json(self) -> JsonValue {
+        let mut obj = HashMap.new()
+        obj.insert("jsonrpc".to_string(), JsonValue.String(self.jsonrpc.clone()))
+        obj.insert("method".to_string(), JsonValue.String(self.method.clone()))
+        if let some(ref p) = self.params {
+            obj.insert("params".to_string(), p.clone())
+        }
+        if let some(ref id) = self.id {
+            obj.insert("id".to_string(), id.to_json())
+        }
+        JsonValue.Object(obj)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RpcError {
+    pub code: i32,
+    pub message: string,
+    pub data: Option<JsonValue>,
+}
+
+impl RpcError {
+    pub fn new(code: i32, message: &str) -> RpcError {
+        RpcError { code, message: message.to_string(), data: none }
+    }
+
+    pub fn parse_error() -> RpcError { RpcError.new(-32700, "Parse error") }
+    pub fn invalid_request() -> RpcError { RpcError.new(-32600, "Invalid Request") }
+    pub fn method_not_found() -> RpcError { RpcError.new(-32601, "Method not found") }
+    pub fn invalid_params() -> RpcError { RpcError.new(-32602, "Invalid params") }
+    pub fn internal_error() -> RpcError { RpcError.new(-32603, "Internal error") }
+
+    pub fn to_json(self) -> JsonValue {
+        let mut obj = HashMap.new()
+        obj.insert("code".to_string(), JsonValue.Number(self.code as f64))
+        obj.insert("message".to_string(), JsonValue.String(self.message.clone()))
+        if let some(ref d) = self.data { obj.insert("data".to_string(), d.clone()); }
+        JsonValue.Object(obj)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Response {
+    pub jsonrpc: string,
+    pub result: Option<JsonValue>,
+    pub error: Option<RpcError>,
+    pub id: RequestId,
+}
+
+impl Response {
+    pub fn success(id: RequestId, result: JsonValue) -> Response {
+        Response { jsonrpc: "2.0".to_string(), result: some(result), error: none, id }
+    }
+
+    pub fn error(id: RequestId, error: RpcError) -> Response {
+        Response { jsonrpc: "2.0".to_string(), result: none, error: some(error), id }
+    }
+
+    pub fn is_success(self) -> bool { self.error.is_none() }
+    pub fn is_error(self) -> bool { self.error.is_some() }
+
+    pub fn to_json(self) -> JsonValue {
+        let mut obj = HashMap.new()
+        obj.insert("jsonrpc".to_string(), JsonValue.String(self.jsonrpc.clone()))
+        if let some(ref r) = self.result { obj.insert("result".to_string(), r.clone()); }
+        if let some(ref e) = self.error { obj.insert("error".to_string(), e.to_json()); }
+        obj.insert("id".to_string(), self.id.to_json())
+        JsonValue.Object(obj)
+    }
+}
+
+type MethodHandler = fn(Option<JsonValue>) -> Result<JsonValue, RpcError>;
+
+pub struct RpcServer {
+    methods: HashMap<string, MethodHandler>,
+    notifications: HashMap<string, fn(Option<JsonValue>)>,
+}
+
+impl RpcServer {
+    pub fn new() -> RpcServer {
+        RpcServer { methods: HashMap.new(), notifications: HashMap.new() }
+    }
+
+    pub fn register(mut self, name: &str, handler: MethodHandler) {
+        self.methods.insert(name.to_string(), handler)
+    }
+
+    pub fn register_notification(mut self, name: &str, handler: fn(Option<JsonValue>)) {
+        self.notifications.insert(name.to_string(), handler)
+    }
+
+    pub fn handle_request(self, request: &Request) -> Option<Response> {
+        if request.jsonrpc != "2.0" {
+            return some(Response.error(
+                request.id.clone().unwrap_or(RequestId.Null),
+                RpcError.invalid_request(),
+            ))
+        }
+
+        if request.is_notification() {
+            if let some(handler) = self.notifications.get(&request.method) {
+                handler(request.params.clone())
+            }
+            return none  // no response for notifications
+        }
+
+        let id = request.id.clone().unwrap()
+        if let some(handler) = self.methods.get(&request.method) {
+            match handler(request.params.clone()) {
+                ok(result) => some(Response.success(id, result)),
+                err(e) => some(Response.error(id, e)),
+            }
+        } else {
+            some(Response.error(id, RpcError.method_not_found()))
+        }
+    }
+
+    pub fn handle_batch(self, requests: &[Request]) -> [Response] {
+        requests.iter()
+            .filter_map(|req| self.handle_request(req))
+            .collect()
+    }
+
+    pub fn method_count(self) -> usize { self.methods.len() }
+}
+
+fn main() {
+    // Request
+    let req = Request.new("add", some(JsonValue.Array(vec![
+        JsonValue.Number(1.0), JsonValue.Number(2.0),
+    ])), some(RequestId.Number(1)))
+    assert(req.method == "add")
+    assert(req.jsonrpc == "2.0")
+    assert(!req.is_notification())
+    print("Request ✓")
+
+    // Notification
+    let notif = Request.notification("log", some(JsonValue.String("hello".to_string())))
+    assert(notif.is_notification())
+    print("Notification ✓")
+
+    // Request to JSON
+    let json = req.to_json()
+    let obj = json.as_object().unwrap()
+    assert(obj.get("jsonrpc").unwrap().as_str() == some("2.0"))
+    assert(obj.get("method").unwrap().as_str() == some("add"))
+    assert(obj.contains_key("params"))
+    assert(obj.contains_key("id"))
+    print("Request to_json ✓")
+
+    // RpcError
+    let err = RpcError.method_not_found()
+    assert(err.code == -32601)
+    assert(err.message == "Method not found")
+    print("RpcError ✓")
+
+    let parse_err = RpcError.parse_error()
+    assert(parse_err.code == -32700)
+    print("Parse error ✓")
+
+    // Response
+    let resp = Response.success(RequestId.Number(1), JsonValue.Number(3.0))
+    assert(resp.is_success())
+    assert(!resp.is_error())
+    assert(resp.result.unwrap().as_f64() == some(3.0))
+    print("Response success ✓")
+
+    let err_resp = Response.error(RequestId.Number(1), RpcError.internal_error())
+    assert(err_resp.is_error())
+    assert(!err_resp.is_success())
+    print("Response error ✓")
+
+    // Response to_json
+    let rjson = resp.to_json()
+    let robj = rjson.as_object().unwrap()
+    assert(robj.contains_key("jsonrpc"))
+    assert(robj.contains_key("result"))
+    assert(robj.contains_key("id"))
+    print("Response to_json ✓")
+
+    // Server
+    let mut server = RpcServer.new()
+    server.register("add", |params| {
+        let arr = params.and_then(|p| p.as_array().map(|a| a.to_vec()))
+            .ok_or(RpcError.invalid_params())?
+        if arr.len() != 2 { return err(RpcError.invalid_params()) }
+        let a = arr[0].as_f64().ok_or(RpcError.invalid_params())?
+        let b = arr[1].as_f64().ok_or(RpcError.invalid_params())?
+        ok(JsonValue.Number(a + b))
+    })
+    assert(server.method_count() == 1)
+    print("Server register ✓")
+
+    // Handle valid request
+    let resp = server.handle_request(&req).unwrap()
+    assert(resp.is_success())
+    assert(resp.result.unwrap().as_f64() == some(3.0))
+    print("Server handle ✓")
+
+    // Handle unknown method
+    let unknown = Request.new("subtract", none, some(RequestId.Number(2)))
+    let resp2 = server.handle_request(&unknown).unwrap()
+    assert(resp2.is_error())
+    print("Unknown method ✓")
+
+    // Handle notification (no response)
+    let notif_resp = server.handle_request(&notif)
+    assert(notif_resp.is_none())
+    print("Notification no response ✓")
+
+    // Batch
+    let batch = vec![req.clone(), unknown.clone()]
+    let responses = server.handle_batch(&batch)
+    assert(responses.len() == 2)
+    print("Batch ✓")
+
+    // RequestId variants
+    let str_id = RequestId.String("abc".to_string())
+    let json_id = str_id.to_json()
+    assert(json_id.as_str() == some("abc"))
+    print("RequestId string ✓")
+
+    let null_id = RequestId.Null
+    assert(null_id.to_json().is_null())
+    print("RequestId null ✓")
+
+    print("JSON-RPC complete ✓")
+}
