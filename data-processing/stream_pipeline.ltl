@@ -1,0 +1,58 @@
+// stream_pipeline.ltl — Lazy stream processing with pipelines
+// Run: lateralus run data-processing/stream_pipeline.ltl
+
+use std.stream.Stream
+
+/// Infinite Fibonacci stream
+fn fibs() -> Stream<int> {
+    Stream.unfold((0, 1), |(a, b)| some((a, (b, a + b))))
+}
+
+/// Infinite prime stream using trial division
+fn primes() -> Stream<int> {
+    Stream.from(2)
+        |> filter(n => !Stream.from(2)
+            |> take_while(d => d * d <= n)
+            |> any(d => n % d == 0))
+}
+
+/// Running average over a numeric stream
+fn running_avg(s: Stream<float>) -> Stream<float> {
+    Stream.unfold((s, 0.0, 0), |(stream, sum, count)| {
+        match stream.next() {
+            none    => none,
+            some((v, rest)) => {
+                let new_sum   = sum + v
+                let new_count = count + 1
+                let avg       = new_sum / new_count.float()
+                some((avg, (rest, new_sum, new_count)))
+            },
+        }
+    })
+}
+
+fn main() {
+    // First 10 Fibonacci numbers
+    let fib10 = fibs() |> take(10) |> collect()
+    print("First 10 fibs: ${fib10}")
+
+    // Primes under 50
+    let small_primes = primes() |> take_while(p => p < 50) |> collect()
+    print("Primes < 50:   ${small_primes}")
+
+    // Sum of first 100 even Fibonacci numbers
+    let sum = fibs()
+        |> filter(n => n % 2 == 0)
+        |> take(100)
+        |> fold(0, (acc, x) => acc + x)
+    print("Sum of 100 even fibs: ${sum}")
+
+    // Running average of squares 1..10
+    let avgs = Stream.range(1, 11)
+        |> map(n => (n * n).float())
+        |> running_avg()
+        |> collect()
+    print("Running avg of 1²..10²: ${avgs |> map(f => f.round(2))}")
+}
+
+main()
