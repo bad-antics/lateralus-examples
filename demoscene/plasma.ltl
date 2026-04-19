@@ -1,0 +1,59 @@
+// plasma.ltl — Realtime plasma effect in the terminal (classic demoscene)
+use std.math.{sin, cos, sqrt, PI}
+use std.time.{Instant, sleep_ms}
+use std.io.stdout
+
+const W: int = 80
+const H: int = 40
+
+fn plasma_val(x: int, y: int, t: float) -> float {
+    let fx = x as float
+    let fy = y as float
+    let v1 = sin(fx / 5.0 + t)
+    let v2 = sin(fy / 3.0 + t * 0.7)
+    let v3 = sin((fx + fy) / 7.0 + t * 1.3)
+    let cx = fx + 20.0 * sin(t / 3.0)
+    let cy = fy + 10.0 * cos(t / 2.0)
+    let v4 = sin(sqrt(cx*cx + cy*cy + 1.0) / 4.0 - t)
+    (v1 + v2 + v3 + v4) / 4.0
+}
+
+const PALETTE_256: [string] = [
+    "[38;5;196m", "[38;5;202m", "[38;5;208m", "[38;5;214m",
+    "[38;5;220m", "[38;5;226m", "[38;5;190m", "[38;5;154m",
+    "[38;5;118m", "[38;5;82m",  "[38;5;46m",  "[38;5;47m",
+    "[38;5;48m",  "[38;5;51m",  "[38;5;45m",  "[38;5;39m",
+    "[38;5;33m",  "[38;5;27m",  "[38;5;21m",  "[38;5;57m",
+    "[38;5;93m",  "[38;5;129m", "[38;5;165m", "[38;5;201m",
+]
+
+const CHARS: string = " .:-=+*#%@"
+
+fn render_frame(t: float) -> string {
+    let mut out = "[H"   // cursor home
+    for y in range(0, H) {
+        for x in range(0, W) {
+            let v    = plasma_val(x * 2, y * 3, t)   // aspect ratio correction
+            let norm = ((v + 1.0) / 2.0).clamp(0.0, 0.9999)
+            let ci   = (norm * PALETTE_256.len() as float) as int
+            let ch   = CHARS[(norm * CHARS.len() as float) as usize]
+            out += PALETTE_256[ci] + ch.to_string()
+        }
+        out += "[0m
+"
+    }
+    out
+}
+
+fn main() {
+    print("[2J[?25l")  // clear + hide cursor
+    let start  = Instant.now()
+    let frames  = 120
+    for _ in range(0, frames) {
+        let t = start.elapsed_ms() as float / 400.0
+        stdout().write(render_frame(t))
+        sleep_ms(30)
+    }
+    print("[?25h[0m")  // restore
+    print("Plasma — ${frames} frames rendered ✓")
+}
