@@ -1,0 +1,296 @@
+// Niche Example - JSON Formatter / Pretty Printer
+// Parse JSON string, produce formatted output with configurable indentation.
+
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(string),
+    Array([JsonValue]),
+    Object([(string, JsonValue)]),
+}
+
+impl JsonValue {
+    fn is_null(self) -> bool { match self { JsonValue.Null => true, _ => false } }
+    fn is_scalar(self) -> bool {
+        match self { JsonValue.Array(_) | JsonValue.Object(_) => false, _ => true }
+    }
+}
+
+struct JsonParser {
+    input: [char],
+    pos: usize,
+}
+
+impl JsonParser {
+    fn new(input: &str) -> JsonParser { JsonParser { input: input.chars().collect(), pos: 0 } }
+
+    fn peek(self) -> Option<char> { self.input.get(self.pos).copied() }
+    fn advance(mut self) -> Option<char> {
+        let ch = self.input.get(self.pos).copied()?
+        self.pos += 1
+        some(ch)
+    }
+    fn skip_ws(mut self) {
+        while let some(ch) = self.peek() {
+            if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' { self.advance(); }
+            else { break }
+        }
+    }
+
+    fn parse(mut self) -> Result<JsonValue, string> {
+        self.skip_ws()
+        let val = self.parse_value()?
+        self.skip_ws()
+        if self.pos < self.input.len() { return err("trailing characters".to_string()) }
+        ok(val)
+    }
+
+    fn parse_value(mut self) -> Result<JsonValue, string> {
+        self.skip_ws()
+        match self.peek() {
+            some('"') => self.parse_string().map(|s| JsonValue.String(s)),
+            some('{') => self.parse_object(),
+            some('[') => self.parse_array(),
+            some('t') | some('f') => self.parse_bool(),
+            some('n') => self.parse_null(),
+            some(ch) if ch == '-' || ch.is_ascii_digit() => self.parse_number(),
+            some(ch) => err(format!("unexpected char: {}", ch)),
+            none => err("unexpected end of input".to_string()),
+        }
+    }
+
+    fn parse_string(mut self) -> Result<string, string> {
+        self.advance()  // opening "
+        let mut s = string.new()
+        loop {
+            match self.advance() {
+                some('"') => return ok(s),
+                some('\\') => {
+                    match self.advance() {
+                        some('"') => s.push('"'),
+                        some('\\') => s.push('\\'),
+                        some('/') => s.push('/'),
+                        some('n') => s.push('\n'),
+                        some('t') => s.push('\t'),
+                        some('r') => s.push('\r'),
+                        some('b') => s.push('\x08'),
+                        some('f') => s.push('\x0c'),
+                        some('u') => {
+                            let mut hex = string.new()
+                            for _ in 0..4 {
+                                hex.push(self.advance().ok_or("incomplete unicode escape")?)
+                            }
+                            let cp = u32.from_str_radix(&hex, 16).map_err(|_| "invalid unicode")?
+                            s.push(char.from_u32(cp).ok_or("invalid codepoint")?)
+                        }
+                        _ => return err("invalid escape".to_string()),
+                    }
+                }
+                some(ch) => s.push(ch),
+                none => return err("unterminated string".to_string()),
+            }
+        }
+    }
+
+    fn parse_number(mut self) -> Result<JsonValue, string> {
+        let mut s = string.new()
+        if self.peek() == some('-') { s.push(self.advance().unwrap()) }
+        while let some(ch) = self.peek() {
+            if ch.is_ascii_digit() || ch == '.' || ch == 'e' || ch == 'E' || ch == '+' || ch == '-' {
+                s.push(ch); self.advance();
+            } else { break }
+        }
+        let n: f64 = s.parse().map_err(|_| "invalid number")?
+        ok(JsonValue.Number(n))
+    }
+
+    fn parse_bool(mut self) -> Result<JsonValue, string> {
+        if self.input[self.pos..].starts_with(&['t','r','u','e']) {
+            self.pos += 4; ok(JsonValue.Bool(true))
+        } else if self.input[self.pos..].starts_with(&['f','a','l','s','e']) {
+            self.pos += 5; ok(JsonValue.Bool(false))
+        } else { err("invalid boolean".to_string()) }
+    }
+
+    fn parse_null(mut self) -> Result<JsonValue, string> {
+        if self.input[self.pos..].starts_with(&['n','u','l','l']) {
+            self.pos += 4; ok(JsonValue.Null)
+        } else { err("invalid null".to_string()) }
+    }
+
+    fn parse_array(mut self) -> Result<JsonValue, string> {
+        self.advance()  // [
+        let mut items: [JsonValue] = []
+        self.skip_ws()
+        if self.peek() == some(']') { self.advance(); return ok(JsonValue.Array(items)) }
+        loop {
+            items.push(self.parse_value()?)
+            self.skip_ws()
+            match self.peek() {
+                some(',') => { self.advance(); self.skip_ws(); }
+                some(']') => { self.advance(); return ok(JsonValue.Array(items)) }
+                _ => return err("expected , or ]".to_string()),
+            }
+        }
+    }
+
+    fn parse_object(mut self) -> Result<JsonValue, string> {
+        self.advance()  // {
+        let mut entries: [(string, JsonValue)] = []
+        self.skip_ws()
+        if self.peek() == some('}') { self.advance(); return ok(JsonValue.Object(entries)) }
+        loop {
+            self.skip_ws()
+            let key = self.parse_string()?
+            self.skip_ws()
+            if self.advance() != some(':') { return err("expected :".to_string()) }
+            let val = self.parse_value()?
+            entries.push((key, val))
+            self.skip_ws()
+            match self.peek() {
+                some(',') => { self.advance(); }
+                some('}') => { self.advance(); return ok(JsonValue.Object(entries)) }
+                _ => return err("expected , or }".to_string()),
+            }
+        }
+    }
+}
+
+struct JsonFormatter {
+    indent: string,
+    current_indent: usize,
+    sort_keys: bool,
+}
+
+impl JsonFormatter {
+    fn new() -> JsonFormatter { JsonFormatter { indent: "  ".into(), current_indent: 0, sort_keys: false } }
+    fn with_indent(mut self, indent: &str) -> JsonFormatter { self.indent = indent.to_string(); self }
+    fn with_sort_keys(mut self) -> JsonFormatter { self.sort_keys = true; self }
+
+    fn format(mut self, value: &JsonValue) -> string {
+        self.current_indent = 0
+        self.format_value(value)
+    }
+
+    fn format_value(mut self, value: &JsonValue) -> string {
+        match value {
+            JsonValue.Null => "null".into(),
+            JsonValue.Bool(b) => if *b { "true".into() } else { "false".into() },
+            JsonValue.Number(n) => {
+                if *n == (*n as i64) as f64 { format!("{}", *n as i64) }
+                else { format!("{}", n) }
+            }
+            JsonValue.String(s) => format!("\"{}\"", escape_json_string(s)),
+            JsonValue.Array(items) => {
+                if items.is_empty() { return "[]".into() }
+                if items.len() <= 3 && items.iter().all(|i| i.is_scalar()) {
+                    let inner: [string] = items.iter().map(|i| self.format_value(i)).collect()
+                    return format!("[{}]", inner.join(", "))
+                }
+                let mut out = "[\n".to_string()
+                self.current_indent += 1
+                for (i, item) in items.iter().enumerate() {
+                    out.push_str(&self.indent.repeat(self.current_indent))
+                    out.push_str(&self.format_value(item))
+                    if i < items.len() - 1 { out.push(',') }
+                    out.push('\n')
+                }
+                self.current_indent -= 1
+                out.push_str(&self.indent.repeat(self.current_indent))
+                out.push(']')
+                out
+            }
+            JsonValue.Object(entries) => {
+                if entries.is_empty() { return "{}".into() }
+                let mut sorted = entries.clone()
+                if self.sort_keys { sorted.sort_by(|a, b| a.0.cmp(&b.0)) }
+                let mut out = "{\n".to_string()
+                self.current_indent += 1
+                for (i, (key, val)) in sorted.iter().enumerate() {
+                    out.push_str(&self.indent.repeat(self.current_indent))
+                    out.push_str(&format!("\"{}\": ", escape_json_string(key)))
+                    out.push_str(&self.format_value(val))
+                    if i < sorted.len() - 1 { out.push(',') }
+                    out.push('\n')
+                }
+                self.current_indent -= 1
+                out.push_str(&self.indent.repeat(self.current_indent))
+                out.push('}')
+                out
+            }
+        }
+    }
+}
+
+fn escape_json_string(s: &str) -> string {
+    let mut out = string.new()
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn minify(value: &JsonValue) -> string {
+    match value {
+        JsonValue.Null => "null".into(),
+        JsonValue.Bool(b) => if *b { "true".into() } else { "false".into() },
+        JsonValue.Number(n) => format!("{}", n),
+        JsonValue.String(s) => format!("\"{}\"", escape_json_string(s)),
+        JsonValue.Array(items) => {
+            let inner: [string] = items.iter().map(|i| minify(i)).collect()
+            format!("[{}]", inner.join(","))
+        }
+        JsonValue.Object(entries) => {
+            let inner: [string] = entries.iter().map(|(k, v)| format!("\"{}\":{}", escape_json_string(k), minify(v))).collect()
+            format!("{{{}}}", inner.join(","))
+        }
+    }
+}
+
+fn main() {
+    let input = "{\"name\":\"Alice\",\"age\":30,\"scores\":[95,87,92],\"active\":true,\"address\":null}"
+    let parsed = JsonParser.new(input).parse().unwrap()
+    print("Parse \u2713")
+
+    let pretty = JsonFormatter.new().format(&parsed)
+    assert(pretty.contains("\"name\": \"Alice\""))
+    assert(pretty.contains("  "))
+    print("Pretty print \u2713")
+
+    let sorted = JsonFormatter.new().with_sort_keys().format(&parsed)
+    let lines: [&str] = sorted.lines().collect()
+    assert(lines[1].trim().starts_with("\"active\""))  // a before n
+    print("Sort keys \u2713")
+
+    let mini = minify(&parsed)
+    assert(!mini.contains(' '))
+    assert(!mini.contains('\n'))
+    print("Minify \u2713")
+
+    let tab_fmt = JsonFormatter.new().with_indent("\t").format(&parsed)
+    assert(tab_fmt.contains('\t'))
+    print("Tab indent \u2713")
+
+    let empty_obj = JsonParser.new("{}").parse().unwrap()
+    assert(JsonFormatter.new().format(&empty_obj) == "{}")
+    let empty_arr = JsonParser.new("[]").parse().unwrap()
+    assert(JsonFormatter.new().format(&empty_arr) == "[]")
+    print("Empty containers \u2713")
+
+    let nested = "{\"a\":{\"b\":{\"c\":1}}}"
+    let nested_parsed = JsonParser.new(nested).parse().unwrap()
+    let nested_pretty = JsonFormatter.new().format(&nested_parsed)
+    assert(nested_pretty.lines().count() > 3)
+    print("Nested objects \u2713")
+
+    print("JSON Formatter complete \u2713")
+}
