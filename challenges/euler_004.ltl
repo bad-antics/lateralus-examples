@@ -1,0 +1,21 @@
+// Project Euler #4 — Largest palindrome product of two 3-digit numbers
+// Run: lateralus run challenges/euler_004.ltl
+
+fn is_palindrome(n: int) -> bool {
+    let s = n.to_string()
+    s == s.chars() |> reverse() |> collect_string()
+}
+
+fn main() {
+    let result = range(100, 1000)
+        |> flat_map(a => range(a, 1000) |> map(b => a * b))
+        |> filter(is_palindrome)
+        |> max()
+        |> unwrap()
+
+    print("Largest palindrome product: ${result}")
+    assert_eq(result, 906609)
+    print("✓ Correct!")
+}
+
+main()
