@@ -1,0 +1,83 @@
+// heap.ltl — Min-heap (priority queue) in Lateralus
+// Run: lateralus run algorithms/heap.ltl
+
+struct MinHeap<T: Ord> {
+    data: [T],
+}
+
+impl MinHeap<T: Ord> {
+    fn new() -> MinHeap<T> {
+        MinHeap { data: [] }
+    }
+
+    fn push(mut self, val: T) {
+        self.data.push(val)
+        self.bubble_up(self.data.len() - 1)
+    }
+
+    fn pop(mut self) -> T? {
+        if self.data.is_empty() { return none }
+        let top = self.data[0]
+        let last = self.data.pop()
+        if !self.data.is_empty() {
+            self.data[0] = last
+            self.sink_down(0)
+        }
+        some(top)
+    }
+
+    fn peek(self) -> T? {
+        self.data.first()
+    }
+
+    fn len(self) -> int { self.data.len() }
+
+    fn bubble_up(mut self, mut i: int) {
+        while i > 0 {
+            let parent = (i - 1) / 2
+            if self.data[i] < self.data[parent] {
+                self.data.swap(i, parent)
+                i = parent
+            } else {
+                break
+            }
+        }
+    }
+
+    fn sink_down(mut self, mut i: int) {
+        let n = self.data.len()
+        loop {
+            let left  = 2 * i + 1
+            let right = 2 * i + 2
+            mut smallest = i
+            if left  < n && self.data[left]  < self.data[smallest] { smallest = left  }
+            if right < n && self.data[right] < self.data[smallest] { smallest = right }
+            if smallest == i { break }
+            self.data.swap(i, smallest)
+            i = smallest
+        }
+    }
+}
+
+fn heap_sort<T: Ord>(arr: [T]) -> [T] {
+    mut h = MinHeap.new()
+    arr |> each(x => h.push(x))
+    mut result = []
+    while h.len() > 0 {
+        result.push(h.pop().unwrap())
+    }
+    result
+}
+
+fn main() {
+    mut h: MinHeap<int> = MinHeap.new()
+    [5, 3, 8, 1, 9, 2, 7, 4, 6] |> each(x => h.push(x))
+
+    print("Heap size: ${h.len()}")
+    print("Min:       ${h.peek()}")
+
+    let sorted = heap_sort([5, 3, 8, 1, 9, 2, 7, 4, 6])
+    print("Sorted:    ${sorted}")
+}
+
+main()
