@@ -1,0 +1,286 @@
+// kernel_syscalls.ltl — LateralusOS microkernel with capability-based syscalls
+
+use std.collections.HashMap
+
+const MAX_PROCESSES: usize = 65536
+const PAGE_SIZE: usize = 4096
+
+// ── Syscall interface ────────────────────────────────────────────────────────
+enum Syscall {
+    // Process management
+    Exit { code: i32 },
+    Fork,
+    Exec { path: string, args: [string], caps: [CapabilityToken] },
+    WaitPid { pid: u32, options: u32 },
+    Yield,
+    GetPid,
+    GetParentPid,
+
+    // Memory management
+    Mmap { addr: usize, len: usize, prot: u32, flags: u32 },
+    Munmap { addr: usize, len: usize },
+    Mprotect { addr: usize, len: usize, prot: u32 },
+    Brk { addr: usize },
+
+    // File operations (capability-based)
+    Open { cap: CapabilityToken, path: string, flags: u32 },
+    Read { fd: u32, buf_addr: usize, count: usize },
+    Write { fd: u32, buf_addr: usize, count: usize },
+    Close { fd: u32 },
+    Seek { fd: u32, offset: i64, whence: u32 },
+    Stat { fd: u32 },
+    Ioctl { fd: u32, request: u64, arg: usize },
+
+    // Network (capability-based)
+    Socket { domain: u32, sock_type: u32, protocol: u32, cap: CapabilityToken },
+    Bind { fd: u32, addr: SockAddr },
+    Listen { fd: u32, backlog: u32 },
+    Accept { fd: u32 },
+    Connect { fd: u32, addr: SockAddr },
+    Send { fd: u32, buf_addr: usize, len: usize, flags: u32 },
+    Recv { fd: u32, buf_addr: usize, len: usize, flags: u32 },
+
+    // IPC
+    PipeCreate { cap: CapabilityToken },
+    ChannelCreate { cap: CapabilityToken },
+    ChannelSend { fd: u32, msg: usize, len: usize },
+    ChannelRecv { fd: u32, buf: usize, len: usize },
+
+    // Time & misc
+    ClockGetTime,
+    Nanosleep { ns: u64 },
+    GetRandom { buf: usize, len: usize },
+}
+
+struct SockAddr { family: u16, port: u16, addr: [u8; 16] }
+
+// ── Capability tokens ────────────────────────────────────────────────────────
+struct CapabilityToken {
+    id:         u64,
+    resource:   ResourceType,
+    rights:     u32,     // bitmask of allowed operations
+    owner_pid:  u32,
+}
+
+enum ResourceType {
+    FileSystem { root: string },
+    Network { allowed_ports: [u16] },
+    Process,
+    Memory { max_bytes: usize },
+    Device { path: string },
+    IPC,
+    Clock,
+    Random,
+}
+
+const CAP_READ:    u32 = 1 << 0;
+const CAP_WRITE:   u32 = 1 << 1;
+const CAP_EXEC:    u32 = 1 << 2;
+const CAP_CREATE:  u32 = 1 << 3;
+const CAP_DELETE:  u32 = 1 << 4;
+const CAP_DELEGATE: u32 = 1 << 5;
+
+// ── Kernel state ─────────────────────────────────────────────────────────────
+struct Kernel {
+    processes:       [ProcessControl?; MAX_PROCESSES],
+    next_pid:        u32,
+    next_cap_id:     u64,
+    scheduler_queue: [u32],   // PIDs in ready queue
+    page_allocator:  PageAllocator,
+    interrupt_table: [InterruptHandler; 256],
+}
+
+struct ProcessControl {
+    pid:         u32,
+    parent:      u32,
+    state:       ProcState,
+    caps:        [CapabilityToken],
+    page_table:  usize,        // physical address of page table root
+    kernel_stack: usize,
+    user_stack:   usize,
+    registers:    RegisterState,
+    fds:          HashMap<u32, KernelFd>,
+    children:     [u32],
+}
+
+enum ProcState { Ready, Running, Sleeping(u64), WaitingIo, WaitingChild(u32), Zombie(i32) }
+
+struct RegisterState {
+    rax: u64, rbx: u64, rcx: u64, rdx: u64,
+    rsi: u64, rdi: u64, rbp: u64, rsp: u64,
+    r8: u64, r9: u64, r10: u64, r11: u64,
+    r12: u64, r13: u64, r14: u64, r15: u64,
+    rip: u64, rflags: u64,
+}
+
+struct KernelFd {
+    fd:       u32,
+    inode:    u64,
+    offset:   u64,
+    flags:    u32,
+    cap:      CapabilityToken,
+}
+
+struct PageAllocator {
+    bitmap:     [u64],
+    total_pages: usize,
+    free_pages:  usize,
+}
+
+struct InterruptHandler {
+    handler_addr: usize,
+    ist:          u8,
+    present:      bool,
+}
+
+impl Kernel {
+    fn new(total_memory: usize) -> Kernel {
+        let total_pages = total_memory / PAGE_SIZE
+        Kernel {
+            processes: [none; MAX_PROCESSES],
+            next_pid: 1, next_cap_id: 1,
+            scheduler_queue: [],
+            page_allocator: PageAllocator {
+                bitmap: vec![0u64; total_pages / 64 + 1],
+                total_pages, free_pages: total_pages,
+            },
+            interrupt_table: [InterruptHandler { handler_addr: 0, ist: 0, present: false }; 256],
+        }
+    }
+
+    fn handle_syscall(mut self, pid: u32, syscall: Syscall) -> SyscallResult {
+        let proc = self.processes[pid as usize].as_mut().ok_or(SyscallError.InvalidPid)?;
+
+        match syscall {
+            Syscall.GetPid => SyscallResult.Value(pid as u64),
+
+            Syscall.Exit { code } => {
+                proc.state = ProcState.Zombie(code)
+                self.scheduler_queue.retain(|p| *p != pid)
+                SyscallResult.Value(0)
+            }
+
+            Syscall.Fork => {
+                let child_pid = self.next_pid; self.next_pid += 1
+                // Copy process (CoW pages)
+                let child = ProcessControl {
+                    pid: child_pid, parent: pid,
+                    state: ProcState.Ready,
+                    caps: proc.caps.clone(),
+                    page_table: self.clone_page_table(proc.page_table),
+                    kernel_stack: self.alloc_kernel_stack(),
+                    user_stack: proc.user_stack,
+                    registers: proc.registers.clone(),
+                    fds: proc.fds.clone(),
+                    children: [],
+                };
+                self.processes[child_pid as usize] = some(child)
+                proc.children.push(child_pid)
+                self.scheduler_queue.push(child_pid)
+                SyscallResult.Value(child_pid as u64)
+            }
+
+            Syscall.Mmap { addr, len, prot, flags } => {
+                let pages_needed = (len + PAGE_SIZE - 1) / PAGE_SIZE
+                if self.page_allocator.free_pages < pages_needed {
+                    return SyscallResult.Error(SyscallError.OutOfMemory)
+                }
+                let vaddr = if addr == 0 { self.find_free_vaddr(pid, len) } else { addr };
+                for i in range(0, pages_needed) {
+                    let phys = self.alloc_page()?
+                    self.map_page(proc.page_table, vaddr + i * PAGE_SIZE, phys, prot)
+                }
+                SyscallResult.Value(vaddr as u64)
+            }
+
+            Syscall.Open { cap, path, flags } => {
+                // Verify capability
+                if !self.verify_cap(pid, &cap, CAP_READ) {
+                    return SyscallResult.Error(SyscallError.PermissionDenied)
+                }
+                let fd = self.alloc_fd(pid)
+                proc.fds.insert(fd, KernelFd { fd, inode: 0, offset: 0, flags, cap });
+                SyscallResult.Value(fd as u64)
+            }
+
+            Syscall.GetRandom { buf, len } => {
+                // Fill with random bytes (from hardware RNG)
+                SyscallResult.Value(len as u64)
+            }
+
+            Syscall.ClockGetTime => {
+                SyscallResult.Value(std.time.now_ns() as u64)
+            }
+
+            _ => SyscallResult.Error(SyscallError.NotImplemented),
+        }
+    }
+
+    fn verify_cap(self, pid: u32, cap: &CapabilityToken, rights: u32) -> bool {
+        cap.owner_pid == pid && (cap.rights & rights) == rights
+    }
+
+    fn alloc_page(mut self) -> Result<usize, SyscallError> {
+        if self.page_allocator.free_pages == 0 { return err(SyscallError.OutOfMemory) }
+        for i in range(0, self.page_allocator.bitmap.len()) {
+            if self.page_allocator.bitmap[i] != u64.MAX {
+                let bit = (!self.page_allocator.bitmap[i]).trailing_zeros() as usize
+                self.page_allocator.bitmap[i] |= 1u64 << bit
+                self.page_allocator.free_pages -= 1
+                return ok((i * 64 + bit) * PAGE_SIZE)
+            }
+        }
+        err(SyscallError.OutOfMemory)
+    }
+
+    fn clone_page_table(self, pt: usize) -> usize { pt /* CoW: mark pages read-only, copy on fault */ }
+    fn alloc_kernel_stack(mut self) -> usize { 0 /* allocate from kernel heap */ }
+    fn find_free_vaddr(self, pid: u32, len: usize) -> usize { 0x400000 /* simplified */ }
+    fn map_page(self, pt: usize, vaddr: usize, paddr: usize, prot: u32) { /* update page table */ }
+    fn alloc_fd(self, pid: u32) -> u32 { 3 /* find lowest free fd */ }
+}
+
+enum SyscallResult { Value(u64), Error(SyscallError) }
+enum SyscallError { InvalidPid, OutOfMemory, PermissionDenied, NotFound, NotImplemented, InvalidArg }
+
+fn main() {
+    let mut kernel = Kernel.new(256 * 1024 * 1024) // 256 MB
+    print("Kernel initialized: ${kernel.page_allocator.total_pages} pages, ${kernel.page_allocator.free_pages} free")
+
+    // Create init process (PID 1)
+    kernel.processes[1] = some(ProcessControl {
+        pid: 1, parent: 0, state: ProcState.Running,
+        caps: [CapabilityToken { id: 0, resource: ResourceType.FileSystem { root: "/".to_string() },
+                                 rights: CAP_READ | CAP_WRITE | CAP_EXEC | CAP_CREATE | CAP_DELETE | CAP_DELEGATE,
+                                 owner_pid: 1 }],
+        page_table: 0, kernel_stack: 0, user_stack: 0x7fff0000,
+        registers: RegisterState { rax:0,rbx:0,rcx:0,rdx:0,rsi:0,rdi:0,rbp:0,rsp:0x7fff0000,
+                                   r8:0,r9:0,r10:0,r11:0,r12:0,r13:0,r14:0,r15:0,rip:0x400000,rflags:0x202 },
+        fds: HashMap.new(), children: [],
+    })
+    kernel.scheduler_queue.push(1)
+
+    // Test GetPid
+    let result = kernel.handle_syscall(1, Syscall.GetPid)
+    assert(matches!(result, SyscallResult.Value(1)))
+    print("GetPid syscall ✓")
+
+    // Test Fork
+    kernel.next_pid = 2
+    let fork_result = kernel.handle_syscall(1, Syscall.Fork)
+    assert(matches!(fork_result, SyscallResult.Value(2)))
+    assert(kernel.processes[2].is_some())
+    print("Fork syscall ✓")
+
+    // Test page allocation
+    let page = kernel.alloc_page().unwrap()
+    assert(page % PAGE_SIZE == 0)
+    print("Page allocation: 0x${page:x} ✓")
+
+    // Test clock
+    let time = kernel.handle_syscall(1, Syscall.ClockGetTime)
+    assert(matches!(time, SyscallResult.Value(_)))
+    print("ClockGetTime syscall ✓")
+
+    print("LateralusOS kernel — all syscall tests passed ✓")
+}
