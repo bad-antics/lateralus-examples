@@ -1,0 +1,374 @@
+// Niche Example — Interactive Shell / REPL
+// Command parsing, built-in commands, piping, environment variables.
+
+use std.collections.HashMap
+use std.io.{Read, Write, BufRead, BufReader}
+use std.os.process.{Command, Child, Stdio}
+use std.fs
+
+// ── Token types for shell parsing ────────────────────────────────────────────
+enum ShellToken {
+    Word(string),
+    Pipe,
+    RedirectOut(string),
+    RedirectAppend(string),
+    RedirectIn(string),
+    Background,
+    Semicolon,
+    And,         // &&
+    Or,          // ||
+    EnvAssign(string, string),
+}
+
+// ── Lexer ────────────────────────────────────────────────────────────────────
+fn tokenize(input: &str) -> Result<[ShellToken], string> {
+    let mut tokens: [ShellToken] = []
+    let chars: [char] = input.chars().collect()
+    let mut i = 0
+
+    while i < chars.len() {
+        match chars[i] {
+            ' ' | '\t' => i += 1,
+            '|' => {
+                if i + 1 < chars.len() && chars[i + 1] == '|' {
+                    tokens.push(ShellToken.Or); i += 2
+                } else { tokens.push(ShellToken.Pipe); i += 1 }
+            }
+            '&' => {
+                if i + 1 < chars.len() && chars[i + 1] == '&' {
+                    tokens.push(ShellToken.And); i += 2
+                } else { tokens.push(ShellToken.Background); i += 1 }
+            }
+            ';' => { tokens.push(ShellToken.Semicolon); i += 1 }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    i += 2; while i < chars.len() && chars[i] == ' ' { i += 1 }
+                    let mut file = string.new()
+                    while i < chars.len() && chars[i] != ' ' { file.push(chars[i]); i += 1 }
+                    tokens.push(ShellToken.RedirectAppend(file))
+                } else {
+                    i += 1; while i < chars.len() && chars[i] == ' ' { i += 1 }
+                    let mut file = string.new()
+                    while i < chars.len() && chars[i] != ' ' { file.push(chars[i]); i += 1 }
+                    tokens.push(ShellToken.RedirectOut(file))
+                }
+            }
+            '<' => {
+                i += 1; while i < chars.len() && chars[i] == ' ' { i += 1 }
+                let mut file = string.new()
+                while i < chars.len() && chars[i] != ' ' { file.push(chars[i]); i += 1 }
+                tokens.push(ShellToken.RedirectIn(file))
+            }
+            '\'' => {
+                i += 1
+                let mut word = string.new()
+                while i < chars.len() && chars[i] != '\'' { word.push(chars[i]); i += 1 }
+                if i < chars.len() { i += 1 }
+                tokens.push(ShellToken.Word(word))
+            }
+            '"' => {
+                i += 1
+                let mut word = string.new()
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() { i += 1 }
+                    word.push(chars[i]); i += 1
+                }
+                if i < chars.len() { i += 1 }
+                tokens.push(ShellToken.Word(word))
+            }
+            '$' => {
+                i += 1
+                let mut var_name = string.new()
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    var_name.push(chars[i]); i += 1
+                }
+                tokens.push(ShellToken.Word(var_name))  // expanded later
+            }
+            c => {
+                let mut word = string.new()
+                while i < chars.len() && !matches!(chars[i], ' '|'\t'|'|'|'&'|';'|'>'|'<') {
+                    word.push(chars[i]); i += 1
+                }
+                // Check for VAR=VALUE
+                if let some(eq_pos) = word.find('=') {
+                    let key = word[..eq_pos].to_string()
+                    let value = word[eq_pos+1..].to_string()
+                    if key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        tokens.push(ShellToken.EnvAssign(key, value))
+                    } else { tokens.push(ShellToken.Word(word)) }
+                } else { tokens.push(ShellToken.Word(word)) }
+            }
+        }
+    }
+    ok(tokens)
+}
+
+// ── Command representation ───────────────────────────────────────────────────
+struct ShellCommand {
+    program: string,
+    args: [string],
+    stdin_redirect: Option<string>,
+    stdout_redirect: Option<string>,
+    append: bool,
+    background: bool,
+}
+
+impl ShellCommand {
+    fn new(program: &str) -> ShellCommand {
+        ShellCommand {
+            program: program.to_string(), args: [],
+            stdin_redirect: none, stdout_redirect: none,
+            append: false, background: false,
+        }
+    }
+}
+
+struct Pipeline {
+    commands: [ShellCommand],
+    operator: Option<PipelineOp>,
+}
+
+enum PipelineOp { And, Or, Semicolon }
+
+// ── Built-in commands ────────────────────────────────────────────────────────
+struct Shell {
+    env: HashMap<string, string>,
+    cwd: string,
+    history: [string],
+    aliases: HashMap<string, string>,
+    last_exit_code: i32,
+    running: bool,
+}
+
+impl Shell {
+    fn new() -> Shell {
+        Shell {
+            env: HashMap.new(),
+            cwd: std.env.current_dir().unwrap().to_string(),
+            history: [],
+            aliases: HashMap.new(),
+            last_exit_code: 0,
+            running: true,
+        }
+    }
+
+    fn prompt(self) -> string {
+        let user = self.env.get("USER").unwrap_or(&"user".to_string()).clone()
+        let home = self.env.get("HOME").unwrap_or(&"/".to_string()).clone()
+        let display_cwd = if self.cwd.starts_with(&home) {
+            format!("~{}", &self.cwd[home.len()..])
+        } else { self.cwd.clone() }
+        format!("{user}@lateralus:{display_cwd}$ ")
+    }
+
+    fn execute_builtin(mut self, cmd: &ShellCommand) -> Option<i32> {
+        match cmd.program.as_str() {
+            "cd" => {
+                let dir = cmd.args.first().map(|s| s.as_str()).unwrap_or("~")
+                let target = if dir == "~" {
+                    self.env.get("HOME").cloned().unwrap_or("/".to_string())
+                } else if dir == "-" {
+                    self.env.get("OLDPWD").cloned().unwrap_or(self.cwd.clone())
+                } else if dir.starts_with('/') { dir.to_string() }
+                else { format!("{}/{dir}", self.cwd) }
+
+                self.env.insert("OLDPWD".to_string(), self.cwd.clone())
+                self.cwd = target
+                some(0)
+            }
+            "pwd" => { println!("{}", self.cwd); some(0) }
+            "echo" => {
+                let output = cmd.args.join(" ")
+                println!("{output}")
+                some(0)
+            }
+            "export" => {
+                for arg in &cmd.args {
+                    if let some(eq) = arg.find('=') {
+                        let key = arg[..eq].to_string()
+                        let val = arg[eq+1..].to_string()
+                        self.env.insert(key, val)
+                    }
+                }
+                some(0)
+            }
+            "unset" => {
+                for arg in &cmd.args { self.env.remove(arg); }
+                some(0)
+            }
+            "alias" => {
+                if cmd.args.is_empty() {
+                    for (k, v) in &self.aliases { println!("alias {k}='{v}'") }
+                } else {
+                    for arg in &cmd.args {
+                        if let some(eq) = arg.find('=') {
+                            self.aliases.insert(arg[..eq].to_string(), arg[eq+1..].to_string())
+                        }
+                    }
+                }
+                some(0)
+            }
+            "history" => {
+                for (i, cmd) in self.history.iter().enumerate() { println!("{:4}  {cmd}", i + 1) }
+                some(0)
+            }
+            "exit" => {
+                self.running = false
+                let code = cmd.args.first().and_then(|s| s.parse().ok()).unwrap_or(0)
+                some(code)
+            }
+            "type" => {
+                for arg in &cmd.args {
+                    if matches!(arg.as_str(), "cd"|"pwd"|"echo"|"export"|"exit"|"type"|"alias"|"history"|"unset") {
+                        println!("{arg} is a shell builtin")
+                    } else if self.aliases.contains_key(arg) {
+                        println!("{arg} is aliased to '{}'", self.aliases[arg])
+                    } else { println!("{arg} is an external command") }
+                }
+                some(0)
+            }
+            _ => none,  // not a builtin
+        }
+    }
+
+    fn expand_env(self, word: &str) -> string {
+        let mut result = string.new()
+        let chars: [char] = word.chars().collect()
+        let mut i = 0
+        while i < chars.len() {
+            if chars[i] == '$' {
+                i += 1
+                let mut var = string.new()
+                if i < chars.len() && chars[i] == '?' {
+                    result.push_str(&self.last_exit_code.to_string())
+                    i += 1
+                } else {
+                    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                        var.push(chars[i]); i += 1
+                    }
+                    if let some(val) = self.env.get(&var) { result.push_str(val) }
+                }
+            } else if chars[i] == '~' && i == 0 {
+                result.push_str(self.env.get("HOME").unwrap_or(&"/".to_string()))
+                i += 1
+            } else { result.push(chars[i]); i += 1 }
+        }
+        result
+    }
+
+    fn expand_glob(self, pattern: &str) -> [string] {
+        if !pattern.contains('*') && !pattern.contains('?') {
+            return [pattern.to_string()]
+        }
+        // Simple glob: list directory and match
+        let dir = if pattern.contains('/') {
+            pattern.rsplitn(2, '/').last().unwrap_or(".")
+        } else { "." }
+
+        match fs.read_dir(dir) {
+            ok(entries) => {
+                let matches: [string] = entries.filter_map(|e| {
+                    let name = e.file_name().to_string()
+                    if glob_match(pattern, &name) { some(name) } else { none }
+                }).collect()
+                if matches.is_empty() { [pattern.to_string()] } else { matches }
+            }
+            err(_) => [pattern.to_string()],
+        }
+    }
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: [char] = pattern.chars().collect()
+    let t: [char] = text.chars().collect()
+    let mut pi = 0; let mut ti = 0
+    let mut star_p: Option<usize> = none
+    let mut star_t: usize = 0
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == t[ti] || p[pi] == '?') { pi += 1; ti += 1 }
+        else if pi < p.len() && p[pi] == '*' { star_p = some(pi); star_t = ti; pi += 1 }
+        else if let some(sp) = star_p { pi = sp + 1; star_t += 1; ti = star_t }
+        else { return false }
+    }
+    while pi < p.len() && p[pi] == '*' { pi += 1 }
+    pi == p.len()
+}
+
+fn main() {
+    // Tokenizer
+    let tokens = tokenize("echo hello world").unwrap()
+    assert(tokens.len() == 3)
+    print("Tokenize: 3 tokens ✓")
+
+    let tokens = tokenize("ls -la | grep foo > out.txt").unwrap()
+    assert(tokens.len() == 5)  // ls, -la, |, grep, foo, >out.txt
+    print("Tokenize with pipe and redirect ✓")
+
+    let tokens = tokenize("echo 'hello world'").unwrap()
+    assert(tokens.len() == 2)
+    match &tokens[1] { ShellToken.Word(w) => assert(w == "hello world"), _ => panic("expected word") }
+    print("Single-quoted string ✓")
+
+    let tokens = tokenize("FOO=bar").unwrap()
+    match &tokens[0] { ShellToken.EnvAssign(k, v) => { assert(k == "FOO"); assert(v == "bar") }, _ => panic("expected env assign") }
+    print("Env assignment ✓")
+
+    let tokens = tokenize("cmd1 && cmd2 || cmd3").unwrap()
+    assert(tokens.len() == 5)
+    print("And/Or operators ✓")
+
+    // Shell
+    let mut shell = Shell.new()
+    shell.env.insert("USER".to_string(), "test".to_string())
+    shell.env.insert("HOME".to_string(), "/home/test".to_string())
+
+    // Environment expansion
+    let expanded = shell.expand_env("$USER")
+    assert(expanded == "test")
+    print("Env expansion ✓")
+
+    let expanded = shell.expand_env("~/.config")
+    assert(expanded == "/home/test/.config")
+    print("Tilde expansion ✓")
+
+    // Builtin: echo
+    let cmd = ShellCommand { program: "echo".to_string(), args: ["hello".to_string()], stdin_redirect: none, stdout_redirect: none, append: false, background: false }
+    let result = shell.execute_builtin(&cmd)
+    assert(result == some(0))
+    print("Builtin echo ✓")
+
+    // Builtin: export
+    let cmd = ShellCommand { program: "export".to_string(), args: ["MYVAR=myval".to_string()], stdin_redirect: none, stdout_redirect: none, append: false, background: false }
+    shell.execute_builtin(&cmd)
+    assert(shell.env.get("MYVAR").unwrap() == "myval")
+    print("Builtin export ✓")
+
+    // Builtin: cd
+    let cmd = ShellCommand { program: "cd".to_string(), args: ["/tmp".to_string()], stdin_redirect: none, stdout_redirect: none, append: false, background: false }
+    shell.execute_builtin(&cmd)
+    assert(shell.cwd == "/tmp")
+    print("Builtin cd ✓")
+
+    // Glob matching
+    assert(glob_match("*.txt", "hello.txt"))
+    assert(!glob_match("*.txt", "hello.rs"))
+    assert(glob_match("test?", "test1"))
+    assert(glob_match("*", "anything"))
+    assert(glob_match("a*b*c", "aXXbYYc"))
+    print("Glob matching ✓")
+
+    // Prompt
+    shell.cwd = "/home/test/projects".to_string()
+    let prompt = shell.prompt()
+    assert(prompt.contains("~/projects"))
+    print("Prompt: ${prompt.trim()} ✓")
+
+    // Alias
+    let cmd = ShellCommand { program: "alias".to_string(), args: ["ll=ls -la".to_string()], stdin_redirect: none, stdout_redirect: none, append: false, background: false }
+    shell.execute_builtin(&cmd)
+    assert(shell.aliases.get("ll").unwrap() == "ls -la")
+    print("Alias ✓")
+
+    print("Shell / REPL complete ✓")
+}
