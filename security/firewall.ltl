@@ -1,0 +1,393 @@
+// firewall.ltl — Stateful packet filter firewall in Lateralus
+
+use std.net.{Ipv4Addr, Ipv6Addr, IpAddr}
+use std.collections.{HashMap, BTreeMap}
+use std.time.Instant
+
+// ── Packet representation ─────────────────────────────────────────────────────
+enum Protocol { Tcp, Udp, Icmp, Other(u8) }
+
+struct Packet {
+    src_ip:    IpAddr,
+    dst_ip:    IpAddr,
+    src_port:  u16,
+    dst_port:  u16,
+    protocol:  Protocol,
+    flags:     TcpFlags,
+    payload:   [u8],
+    timestamp: u64,
+}
+
+struct TcpFlags {
+    syn: bool, ack: bool, fin: bool, rst: bool, psh: bool, urg: bool,
+}
+
+impl TcpFlags {
+    fn none() -> TcpFlags { TcpFlags { syn: false, ack: false, fin: false, rst: false, psh: false, urg: false } }
+}
+
+// ── Firewall rules ────────────────────────────────────────────────────────────
+enum Action { Allow, Deny, Drop, Log, RateLimit(u32) }
+
+enum Direction { Inbound, Outbound, Both }
+
+struct Rule {
+    id:         u32,
+    name:       string,
+    direction:  Direction,
+    src_cidr:   string?,     // e.g. "10.0.0.0/8"
+    dst_cidr:   string?,
+    src_port:   PortRange?,
+    dst_port:   PortRange?,
+    protocol:   Protocol?,
+    action:     Action,
+    log:        bool,
+    enabled:    bool,
+    priority:   u32,         // lower = higher priority
+}
+
+struct PortRange { start: u16, end: u16 }
+
+impl PortRange {
+    fn single(p: u16)         -> PortRange { PortRange { start: p, end: p } }
+    fn range(lo: u16, hi: u16) -> PortRange { PortRange { start: lo, end: hi } }
+    fn contains(self, port: u16) -> bool { port >= self.start && port <= self.end }
+}
+
+fn cidr_contains(cidr: &str, addr: IpAddr) -> bool {
+    let parts: [&str] = cidr.split('/').collect()
+    let network = IpAddr.parse(parts[0]).unwrap()
+    let prefix_len: u32 = parts[1].parse().unwrap()
+    match (network, addr) {
+        (IpAddr.V4(net), IpAddr.V4(a)) => {
+            let mask = if prefix_len == 0 { 0u32 } else { !0u32 << (32 - prefix_len) }
+            (net.to_u32() & mask) == (a.to_u32() & mask)
+        }
+        _ => false
+    }
+}
+
+// ── Connection tracking (stateful inspection) ─────────────────────────────────
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct ConnKey {
+    src_ip:   IpAddr,
+    dst_ip:   IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    protocol: u8,
+}
+
+enum ConnState { New, Established, Related, TimeWait, Closed }
+
+struct ConnEntry {
+    state:       ConnState,
+    packets_fwd: u64,
+    packets_rev: u64,
+    bytes_fwd:   u64,
+    bytes_rev:   u64,
+    created:     u64,
+    last_seen:   u64,
+    timeout:     u64,
+}
+
+struct ConnTracker {
+    table:     HashMap<ConnKey, ConnEntry>,
+    tcp_timeout_established: u64,  // seconds
+    tcp_timeout_time_wait:   u64,
+    udp_timeout:             u64,
+}
+
+impl ConnTracker {
+    fn new() -> ConnTracker {
+        ConnTracker {
+            table: HashMap.new(),
+            tcp_timeout_established: 7200,
+            tcp_timeout_time_wait:   120,
+            udp_timeout:             30,
+        }
+    }
+
+    fn lookup(self, pkt: &Packet) -> Option<(ConnKey, ConnState)> {
+        let fwd = conn_key_fwd(pkt)
+        if let some(entry) = self.table.get(&fwd) {
+            return some((fwd, entry.state.clone()))
+        }
+        let rev = conn_key_rev(pkt)
+        if let some(entry) = self.table.get(&rev) {
+            return some((rev, entry.state.clone()))
+        }
+        none
+    }
+
+    fn track(mut self, pkt: &Packet) {
+        let key = conn_key_fwd(pkt)
+        match self.table.get_mut(&key) {
+            some(entry) => {
+                entry.packets_fwd += 1
+                entry.bytes_fwd += pkt.payload.len() as u64
+                entry.last_seen = pkt.timestamp
+                if pkt.flags.ack && matches!(entry.state, ConnState.New) {
+                    entry.state = ConnState.Established
+                }
+                if pkt.flags.fin || pkt.flags.rst {
+                    entry.state = ConnState.TimeWait
+                    entry.timeout = self.tcp_timeout_time_wait
+                }
+            }
+            none => {
+                let timeout = match pkt.protocol {
+                    Protocol.Tcp => self.tcp_timeout_established,
+                    Protocol.Udp => self.udp_timeout,
+                    _ => 60,
+                }
+                self.table.insert(key, ConnEntry {
+                    state: if pkt.flags.syn { ConnState.New } else { ConnState.Established },
+                    packets_fwd: 1, packets_rev: 0,
+                    bytes_fwd: pkt.payload.len() as u64, bytes_rev: 0,
+                    created: pkt.timestamp, last_seen: pkt.timestamp,
+                    timeout,
+                })
+            }
+        }
+    }
+
+    fn gc(mut self, now: u64) -> int {
+        let before = self.table.len()
+        self.table.retain(|_, entry| now - entry.last_seen < entry.timeout)
+        (before - self.table.len()) as int
+    }
+}
+
+fn conn_key_fwd(pkt: &Packet) -> ConnKey {
+    ConnKey { src_ip: pkt.src_ip, dst_ip: pkt.dst_ip, src_port: pkt.src_port, dst_port: pkt.dst_port,
+              protocol: match pkt.protocol { Protocol.Tcp => 6, Protocol.Udp => 17, Protocol.Icmp => 1, Protocol.Other(n) => n } }
+}
+fn conn_key_rev(pkt: &Packet) -> ConnKey {
+    ConnKey { src_ip: pkt.dst_ip, dst_ip: pkt.src_ip, src_port: pkt.dst_port, dst_port: pkt.src_port,
+              protocol: match pkt.protocol { Protocol.Tcp => 6, Protocol.Udp => 17, Protocol.Icmp => 1, Protocol.Other(n) => n } }
+}
+
+// ── Rate limiter (token bucket) ───────────────────────────────────────────────
+struct RateLimiter {
+    buckets:     HashMap<IpAddr, TokenBucket>,
+    default_rate: u32,     // packets per second
+    burst_size:   u32,
+}
+
+struct TokenBucket { tokens: f64, last_refill: u64, rate: u32, max: u32 }
+
+impl RateLimiter {
+    fn new(rate: u32, burst: u32) -> RateLimiter {
+        RateLimiter { buckets: HashMap.new(), default_rate: rate, burst_size: burst }
+    }
+
+    fn allow(mut self, ip: IpAddr, now: u64) -> bool {
+        let bucket = self.buckets.entry(ip).or_insert(TokenBucket {
+            tokens: self.burst_size as f64, last_refill: now,
+            rate: self.default_rate, max: self.burst_size,
+        })
+        let elapsed = (now - bucket.last_refill) as f64
+        bucket.tokens = (bucket.tokens + elapsed * bucket.rate as f64).min(bucket.max as f64)
+        bucket.last_refill = now
+        if bucket.tokens >= 1.0 { bucket.tokens -= 1.0; true }
+        else { false }
+    }
+}
+
+// ── Firewall engine ───────────────────────────────────────────────────────────
+struct Firewall {
+    rules:        [Rule],
+    conn_tracker: ConnTracker,
+    rate_limiter: RateLimiter,
+    default_action: Action,
+    log_buffer:   [string],
+    stats:        FirewallStats,
+}
+
+struct FirewallStats {
+    packets_allowed: u64, packets_denied: u64, packets_dropped: u64,
+    packets_rate_limited: u64, total_bytes: u64,
+}
+
+impl Firewall {
+    fn new(default: Action) -> Firewall {
+        Firewall {
+            rules: [], conn_tracker: ConnTracker.new(),
+            rate_limiter: RateLimiter.new(100, 200),
+            default_action: default, log_buffer: [],
+            stats: FirewallStats { packets_allowed: 0, packets_denied: 0, packets_dropped: 0,
+                                   packets_rate_limited: 0, total_bytes: 0 },
+        }
+    }
+
+    fn add_rule(mut self, rule: Rule) { self.rules.push(rule); self.rules.sort_by_key(|r| r.priority) }
+
+    fn process(mut self, pkt: Packet, direction: Direction) -> Action {
+        self.stats.total_bytes += pkt.payload.len() as u64
+
+        // Check established connections first
+        if let some((_, ConnState.Established)) = self.conn_tracker.lookup(&pkt) {
+            self.stats.packets_allowed += 1
+            self.conn_tracker.track(&pkt)
+            return Action.Allow
+        }
+
+        // Match rules
+        for rule in &self.rules {
+            if !rule.enabled { continue }
+            if !direction_matches(rule.direction, direction) { continue }
+            if let some(ref cidr) = rule.src_cidr {
+                if !cidr_contains(cidr, pkt.src_ip) { continue }
+            }
+            if let some(ref cidr) = rule.dst_cidr {
+                if !cidr_contains(cidr, pkt.dst_ip) { continue }
+            }
+            if let some(ref pr) = rule.dst_port {
+                if !pr.contains(pkt.dst_port) { continue }
+            }
+            if let some(ref proto) = rule.protocol {
+                if !protocol_matches(proto, &pkt.protocol) { continue }
+            }
+
+            // Rule matched
+            if rule.log {
+                self.log_buffer.push(format!("[{}] {} → {} : {}", rule.name, pkt.src_ip, pkt.dst_ip, action_str(&rule.action)))
+            }
+
+            match rule.action {
+                Action.Allow => {
+                    self.stats.packets_allowed += 1
+                    self.conn_tracker.track(&pkt)
+                    return Action.Allow
+                }
+                Action.Deny  => { self.stats.packets_denied += 1;  return Action.Deny }
+                Action.Drop  => { self.stats.packets_dropped += 1; return Action.Drop }
+                Action.RateLimit(pps) => {
+                    if self.rate_limiter.allow(pkt.src_ip, pkt.timestamp) {
+                        self.stats.packets_allowed += 1
+                        self.conn_tracker.track(&pkt)
+                        return Action.Allow
+                    } else {
+                        self.stats.packets_rate_limited += 1
+                        return Action.Drop
+                    }
+                }
+                Action.Log => {
+                    self.log_buffer.push(format!("[LOG] {} → {}:{}", pkt.src_ip, pkt.dst_ip, pkt.dst_port))
+                }
+            }
+        }
+
+        // Default action
+        match self.default_action {
+            Action.Allow => { self.stats.packets_allowed += 1; self.conn_tracker.track(&pkt) }
+            Action.Deny  => self.stats.packets_denied += 1,
+            Action.Drop  => self.stats.packets_dropped += 1,
+            _ => {}
+        }
+        self.default_action.clone()
+    }
+
+    fn print_stats(self) {
+        print("Firewall stats:")
+        print("  Allowed:      ${self.stats.packets_allowed}")
+        print("  Denied:       ${self.stats.packets_denied}")
+        print("  Dropped:      ${self.stats.packets_dropped}")
+        print("  Rate limited: ${self.stats.packets_rate_limited}")
+        print("  Total bytes:  ${self.stats.total_bytes}")
+        print("  Connections:  ${self.conn_tracker.table.len()}")
+    }
+}
+
+fn direction_matches(rule_dir: Direction, pkt_dir: Direction) -> bool {
+    matches!((rule_dir, pkt_dir), (Direction.Both, _) | (Direction.Inbound, Direction.Inbound) | (Direction.Outbound, Direction.Outbound))
+}
+
+fn protocol_matches(rule: &Protocol, pkt: &Protocol) -> bool {
+    match (rule, pkt) {
+        (Protocol.Tcp, Protocol.Tcp) | (Protocol.Udp, Protocol.Udp) | (Protocol.Icmp, Protocol.Icmp) => true,
+        (Protocol.Other(a), Protocol.Other(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn action_str(a: &Action) -> string {
+    match a { Action.Allow => "ALLOW", Action.Deny => "DENY", Action.Drop => "DROP",
+              Action.Log => "LOG", Action.RateLimit(n) => "RATE(${n})" }
+}
+
+fn main() {
+    let mut fw = Firewall.new(Action.Drop)  // default deny
+
+    // Allow established/related
+    // Allow SSH from trusted subnet
+    fw.add_rule(Rule {
+        id: 1, name: "allow-ssh".to_string(), direction: Direction.Inbound,
+        src_cidr: some("10.0.0.0/8".to_string()), dst_cidr: none,
+        src_port: none, dst_port: some(PortRange.single(22)),
+        protocol: some(Protocol.Tcp), action: Action.Allow,
+        log: true, enabled: true, priority: 10,
+    })
+
+    // Allow HTTP/HTTPS outbound
+    fw.add_rule(Rule {
+        id: 2, name: "allow-web-out".to_string(), direction: Direction.Outbound,
+        src_cidr: none, dst_cidr: none,
+        src_port: none, dst_port: some(PortRange.range(80, 443)),
+        protocol: some(Protocol.Tcp), action: Action.Allow,
+        log: false, enabled: true, priority: 20,
+    })
+
+    // Rate-limit ICMP
+    fw.add_rule(Rule {
+        id: 3, name: "rate-limit-icmp".to_string(), direction: Direction.Both,
+        src_cidr: none, dst_cidr: none,
+        src_port: none, dst_port: none,
+        protocol: some(Protocol.Icmp), action: Action.RateLimit(10),
+        log: true, enabled: true, priority: 30,
+    })
+
+    // Block all from known-bad IP
+    fw.add_rule(Rule {
+        id: 4, name: "block-bad-ip".to_string(), direction: Direction.Inbound,
+        src_cidr: some("192.168.99.0/24".to_string()), dst_cidr: none,
+        src_port: none, dst_port: none,
+        protocol: none, action: Action.Deny,
+        log: true, enabled: true, priority: 5,
+    })
+
+    // Test packets
+    let allowed_ssh = Packet {
+        src_ip: IpAddr.parse("10.0.0.5").unwrap(),
+        dst_ip: IpAddr.parse("10.0.1.1").unwrap(),
+        src_port: 54321, dst_port: 22,
+        protocol: Protocol.Tcp,
+        flags: TcpFlags { syn: true, ack: false, fin: false, rst: false, psh: false, urg: false },
+        payload: vec![0u8; 64], timestamp: 1000,
+    }
+    assert(matches!(fw.process(allowed_ssh, Direction.Inbound), Action.Allow))
+    print("SSH from trusted subnet: ALLOW ✓")
+
+    let blocked = Packet {
+        src_ip: IpAddr.parse("192.168.99.5").unwrap(),
+        dst_ip: IpAddr.parse("10.0.1.1").unwrap(),
+        src_port: 12345, dst_port: 80,
+        protocol: Protocol.Tcp,
+        flags: TcpFlags.none(), payload: vec![0u8; 128], timestamp: 1001,
+    }
+    assert(matches!(fw.process(blocked, Direction.Inbound), Action.Deny))
+    print("Blocked bad IP: DENY ✓")
+
+    let dropped_default = Packet {
+        src_ip: IpAddr.parse("8.8.8.8").unwrap(),
+        dst_ip: IpAddr.parse("10.0.1.1").unwrap(),
+        src_port: 9999, dst_port: 9999,
+        protocol: Protocol.Udp,
+        flags: TcpFlags.none(), payload: [], timestamp: 1002,
+    }
+    assert(matches!(fw.process(dropped_default, Direction.Inbound), Action.Drop))
+    print("Unknown traffic: DROP (default deny) ✓")
+
+    fw.print_stats()
+    print("Firewall — all assertions passed ✓")
+}
