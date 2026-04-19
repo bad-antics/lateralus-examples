@@ -1,0 +1,205 @@
+// x25519_key_exchange.ltl — X25519 Diffie-Hellman key exchange (RFC 7748)
+
+// Field element in GF(2^255 - 19), represented as 5 × 51-bit limbs
+struct Fe { limbs: [u64; 5] }
+
+impl Fe {
+    fn zero() -> Fe { Fe { limbs: [0; 5] } }
+    fn one()  -> Fe { Fe { limbs: [1, 0, 0, 0, 0] } }
+
+    fn from_bytes(b: [u8; 32]) -> Fe {
+        let mut limbs: [u64; 5] = [0; 5]
+        // Pack 32 bytes into 5 × 51-bit limbs (little-endian)
+        let mut acc: u128 = 0
+        let mut bits = 0
+        let mut idx  = 0
+        for byte in b {
+            acc |= (byte as u128) << bits
+            bits += 8
+            while bits >= 51 && idx < 5 {
+                limbs[idx] = (acc & ((1u128 << 51) - 1)) as u64
+                acc >>= 51; bits -= 51; idx += 1
+            }
+        }
+        if idx < 5 { limbs[idx] = acc as u64 }
+        Fe { limbs }
+    }
+
+    fn to_bytes(self) -> [u8; 32] {
+        let mut out: [u8; 32] = [0; 32]
+        let mut carry: u128 = 0
+        let mut limbs = self.limbs.clone()
+        // reduce
+        for i in range(0, 5) {
+            let v = limbs[i] as u128 + carry
+            limbs[i] = (v & ((1u128 << 51) - 1)) as u64
+            carry = v >> 51
+        }
+        // pack back to bytes
+        let mut acc: u128 = 0; let mut bits = 0; let mut bi = 0
+        for l in limbs {
+            acc |= (l as u128) << bits; bits += 51
+            while bits >= 8 && bi < 32 { out[bi] = (acc & 0xff) as u8; acc >>= 8; bits -= 8; bi += 1 }
+        }
+        out
+    }
+
+    fn add(self, other: Fe) -> Fe {
+        let mut out: [u64; 5] = [0; 5]
+        for i in range(0, 5) { out[i] = self.limbs[i] + other.limbs[i] }
+        Fe { limbs: out }
+    }
+
+    fn sub(self, other: Fe) -> Fe {
+        let p_limbs: [u64; 5] = [
+            (1u64 << 51) - 19 + (1u64 << 51) * 2,
+            (1u64 << 51) - 1 + (1u64 << 51) * 2,
+            (1u64 << 51) - 1 + (1u64 << 51) * 2,
+            (1u64 << 51) - 1 + (1u64 << 51) * 2,
+            (1u64 << 51) - 1 + (1u64 << 51) * 2,
+        ]
+        let mut out: [u64; 5] = [0; 5]
+        for i in range(0, 5) { out[i] = p_limbs[i] + self.limbs[i] - other.limbs[i] }
+        Fe { limbs: out }
+    }
+
+    fn mul(self, other: Fe) -> Fe {
+        // Schoolbook multiply with reduction mod 2^255-19
+        let mut t: [u128; 9] = [0; 9]
+        for i in range(0, 5) {
+            for j in range(0, 5) {
+                t[i + j] += self.limbs[i] as u128 * other.limbs[j] as u128
+            }
+        }
+        // reduce upper limbs: x * 2^255 ≡ x * 19
+        for i in range(5, 9) { t[i - 5] += t[i] * 19 }
+        let mut limbs: [u64; 5] = [0; 5]
+        let mut carry: u128 = 0
+        for i in range(0, 5) {
+            let v = t[i] + carry
+            limbs[i] = (v & ((1u128 << 51) - 1)) as u64
+            carry = v >> 51
+        }
+        limbs[0] += (carry * 19) as u64
+        Fe { limbs }
+    }
+
+    fn sq(self) -> Fe { self.mul(self) }
+
+    fn pow(self, exp: [u8; 32]) -> Fe {
+        let mut result = Fe.one()
+        for byte_idx in (0..32).rev() {
+            for bit_idx in (0..8).rev() {
+                result = result.sq()
+                if (exp[byte_idx] >> bit_idx) & 1 == 1 {
+                    result = result.mul(self)
+                }
+            }
+        }
+        result
+    }
+
+    fn invert(self) -> Fe {
+        // a^(p-2) mod p, where p = 2^255 - 19
+        let mut exp: [u8; 32] = [0; 32]
+        // p - 2 = 2^255 - 21
+        for i in range(0, 32) { exp[i] = 0xff }
+        exp[31] = 0x7f  // clear top bit
+        exp[0] -= 2     // subtract 2 from the least significant byte: ...0xed → 0xeb
+        exp[0] = 0xeb
+        self.pow(exp)
+    }
+}
+
+// Montgomery ladder scalar multiply on Curve25519
+fn x25519_scalar_mult(scalar: [u8; 32], u_bytes: [u8; 32]) -> [u8; 32] {
+    // Clamp scalar per RFC 7748
+    let mut k = scalar.clone()
+    k[0]  &= 248
+    k[31] &= 127
+    k[31] |= 64
+
+    let u = Fe.from_bytes(u_bytes)
+    let mut x_1 = u.clone()
+    let mut x_2 = Fe.one()
+    let mut z_2 = Fe.zero()
+    let mut x_3 = u.clone()
+    let mut z_3 = Fe.one()
+    let mut swap: u64 = 0
+
+    for t in (0..255).rev() {
+        let k_t = ((k[t / 8] >> (t % 8)) & 1) as u64
+        swap ^= k_t
+        // conditional swap
+        for i in range(0, 5) {
+            let mask = 0u64.wrapping_sub(swap)
+            let tmp = mask & (x_2.limbs[i] ^ x_3.limbs[i])
+            x_2.limbs[i] ^= tmp; x_3.limbs[i] ^= tmp
+            let tmp = mask & (z_2.limbs[i] ^ z_3.limbs[i])
+            z_2.limbs[i] ^= tmp; z_3.limbs[i] ^= tmp
+        }
+        swap = k_t
+
+        let a  = x_2.add(z_2)
+        let aa = a.sq()
+        let b  = x_2.sub(z_2)
+        let bb = b.sq()
+        let e  = aa.sub(bb)
+        let c  = x_3.add(z_3)
+        let d  = x_3.sub(z_3)
+        let da = d.mul(a)
+        let cb = c.mul(b)
+        x_3 = da.add(cb).sq()
+        z_3 = x_1.mul(da.sub(cb).sq())
+        x_2 = aa.mul(bb)
+        let a24 = Fe { limbs: [121666, 0, 0, 0, 0] }  // (486662-2)/4 = 121665, +1 = 121666
+        z_2 = e.mul(aa.add(a24.mul(e)))
+    }
+
+    // final conditional swap
+    for i in range(0, 5) {
+        let mask = 0u64.wrapping_sub(swap)
+        let tmp = mask & (x_2.limbs[i] ^ x_3.limbs[i])
+        x_2.limbs[i] ^= tmp; x_3.limbs[i] ^= tmp
+        let tmp = mask & (z_2.limbs[i] ^ z_3.limbs[i])
+        z_2.limbs[i] ^= tmp; z_3.limbs[i] ^= tmp
+    }
+
+    x_2.mul(z_2.invert()).to_bytes()
+}
+
+// Basepoint is u=9
+fn x25519_base(scalar: [u8; 32]) -> [u8; 32] {
+    let mut base: [u8; 32] = [0; 32]
+    base[0] = 9
+    x25519_scalar_mult(scalar, base)
+}
+
+fn main() {
+    // RFC 7748 test vector
+    let alice_sk: [u8; 32] = [
+        0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d,
+        0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66, 0x45,
+        0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a,
+        0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a,
+    ]
+    let bob_sk: [u8; 32] = [
+        0x5d, 0xab, 0x08, 0x7e, 0x62, 0x4a, 0x8a, 0x4b,
+        0x79, 0xe1, 0x7f, 0x8b, 0x83, 0x80, 0x0e, 0xe6,
+        0x6f, 0x3b, 0xb1, 0x29, 0x26, 0x18, 0xb6, 0xfd,
+        0x1c, 0x2f, 0x8b, 0x27, 0xff, 0x88, 0xe0, 0xeb,
+    ]
+
+    let alice_pk = x25519_base(alice_sk)
+    let bob_pk   = x25519_base(bob_sk)
+
+    print("Alice PK: ${alice_pk |> map(|b| format!(\"{b:02x}\")) |> join(\"\")}")
+    print("Bob   PK: ${bob_pk   |> map(|b| format!(\"{b:02x}\")) |> join(\"\")}")
+
+    let shared_ab = x25519_scalar_mult(alice_sk, bob_pk)
+    let shared_ba = x25519_scalar_mult(bob_sk, alice_pk)
+
+    assert(shared_ab == shared_ba, "shared secrets must match")
+    print("Shared secret: ${shared_ab |> map(|b| format!(\"{b:02x}\")) |> join(\"\")}")
+    print("X25519 key exchange — ✓")
+}
