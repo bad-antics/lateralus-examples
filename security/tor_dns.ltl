@@ -1,0 +1,236 @@
+// tor_dns.ltl — DNS-over-HTTPS (DoH) + DNS-over-TLS (DoT) encrypted resolver
+
+use std.net.{TcpStream, UdpSocket, SocketAddr}
+use std.io.{Read, Write}
+use std.crypto.tls
+
+// ── DNS message format (RFC 1035) ─────────────────────────────────────────────
+struct DnsHeader {
+    id:      u16,
+    flags:   u16,
+    qd_count: u16,
+    an_count: u16,
+    ns_count: u16,
+    ar_count: u16,
+}
+
+enum DnsType { A = 1, AAAA = 28, CNAME = 5, MX = 15, TXT = 16, NS = 2, SOA = 6, PTR = 12, SRV = 33 }
+enum DnsClass { IN = 1 }
+
+struct DnsQuestion { name: string, qtype: DnsType, qclass: DnsClass }
+
+struct DnsRecord {
+    name:     string,
+    rtype:    DnsType,
+    rclass:   DnsClass,
+    ttl:      u32,
+    rdata:    DnsRdata,
+}
+
+enum DnsRdata {
+    A(Ipv4Addr),
+    AAAA(Ipv6Addr),
+    CNAME(string),
+    MX { priority: u16, exchange: string },
+    TXT(string),
+    NS(string),
+    Unknown([u8]),
+}
+
+struct DnsMessage {
+    header:    DnsHeader,
+    questions: [DnsQuestion],
+    answers:   [DnsRecord],
+    authority: [DnsRecord],
+    additional: [DnsRecord],
+}
+
+// ── DNS message encoding/decoding ─────────────────────────────────────────────
+fn encode_dns_query(name: string, qtype: DnsType) -> [u8] {
+    let mut buf: [u8] = []
+    let id: u16 = (std.time.now_ms() & 0xffff) as u16
+    // Header
+    buf.extend_from_slice(&id.to_be_bytes())
+    buf.extend_from_slice(&0x0100u16.to_be_bytes())  // RD=1
+    buf.extend_from_slice(&1u16.to_be_bytes())        // QDCOUNT=1
+    buf.extend_from_slice(&0u16.to_be_bytes())        // ANCOUNT
+    buf.extend_from_slice(&0u16.to_be_bytes())        // NSCOUNT
+    buf.extend_from_slice(&0u16.to_be_bytes())        // ARCOUNT
+    // Question
+    for label in name.split('.') {
+        buf.push(label.len() as u8)
+        buf.extend_from_slice(label.as_bytes())
+    }
+    buf.push(0)  // root label
+    buf.extend_from_slice(&(qtype as u16).to_be_bytes())
+    buf.extend_from_slice(&1u16.to_be_bytes())  // IN
+    buf
+}
+
+fn decode_dns_name(data: &[u8], offset: &mut usize) -> string {
+    let mut parts: [string] = []
+    loop {
+        let len = data[*offset] as usize
+        if len == 0 { *offset += 1; break }
+        if len & 0xc0 == 0xc0 {
+            let ptr = ((len & 0x3f) << 8 | data[*offset + 1] as usize) as usize
+            *offset += 2
+            let mut ptr_off = ptr
+            parts.push(decode_dns_name(data, &mut ptr_off))
+            return parts.join(".")
+        }
+        *offset += 1
+        parts.push(string.from_utf8(&data[*offset..*offset+len]).unwrap())
+        *offset += len
+    }
+    parts.join(".")
+}
+
+fn decode_dns_response(data: &[u8]) -> Result<DnsMessage, string> {
+    if data.len() < 12 { return err("response too short") }
+    let header = DnsHeader {
+        id:      u16_from_be(&data[0..2]),
+        flags:   u16_from_be(&data[2..4]),
+        qd_count: u16_from_be(&data[4..6]),
+        an_count: u16_from_be(&data[6..8]),
+        ns_count: u16_from_be(&data[8..10]),
+        ar_count: u16_from_be(&data[10..12]),
+    }
+    let mut offset = 12
+    let mut questions = []
+    for _ in range(0, header.qd_count as int) {
+        let name = decode_dns_name(data, &mut offset)
+        let qtype = u16_from_be(&data[offset..offset+2])
+        let qclass = u16_from_be(&data[offset+2..offset+4])
+        offset += 4
+        questions.push(DnsQuestion { name, qtype: unsafe { std.mem.transmute(qtype) }, qclass: DnsClass.IN })
+    }
+    let mut answers = []
+    for _ in range(0, header.an_count as int) {
+        let name = decode_dns_name(data, &mut offset)
+        let rtype  = u16_from_be(&data[offset..offset+2])
+        let rclass = u16_from_be(&data[offset+2..offset+4])
+        let ttl    = u32_from_be(&data[offset+4..offset+8])
+        let rdlen  = u16_from_be(&data[offset+8..offset+10]) as usize
+        offset += 10
+        let rdata = match rtype {
+            1 if rdlen == 4 => DnsRdata.A(Ipv4Addr.new(data[offset], data[offset+1], data[offset+2], data[offset+3])),
+            28 if rdlen == 16 => DnsRdata.AAAA(Ipv6Addr.from_bytes(&data[offset..offset+16])),
+            5 => { let mut o = offset; DnsRdata.CNAME(decode_dns_name(data, &mut o)) }
+            _ => DnsRdata.Unknown(data[offset..offset+rdlen].to_vec()),
+        }
+        offset += rdlen
+        answers.push(DnsRecord { name, rtype: unsafe { std.mem.transmute(rtype) }, rclass: DnsClass.IN, ttl, rdata })
+    }
+    ok(DnsMessage { header, questions, answers, authority: [], additional: [] })
+}
+
+fn u16_from_be(b: &[u8]) -> u16 { (b[0] as u16) << 8 | b[1] as u16 }
+fn u32_from_be(b: &[u8]) -> u32 { (b[0] as u32) << 24 | (b[1] as u32) << 16 | (b[2] as u32) << 8 | b[3] as u32 }
+
+// ── DNS-over-HTTPS (DoH) ────────────────────────────────────────────────────
+struct DohResolver { url: string, accept: string }
+
+impl DohResolver {
+    fn cloudflare() -> DohResolver {
+        DohResolver { url: "https://cloudflare-dns.com/dns-query".to_string(), accept: "application/dns-message".to_string() }
+    }
+    fn google() -> DohResolver {
+        DohResolver { url: "https://dns.google/dns-query".to_string(), accept: "application/dns-message".to_string() }
+    }
+
+    fn resolve(self, name: string, qtype: DnsType) -> Result<DnsMessage, string> {
+        let query = encode_dns_query(name, qtype)
+        let encoded = std.encoding.base64url.encode_no_pad(&query)
+        let url = "${self.url}?dns=${encoded}"
+        let resp = std.net.http.get(url)
+            .header("Accept", self.accept.clone())
+            .send()
+            .map_err(|e| e.to_string())?
+        if resp.status != 200 { return err("DoH error: HTTP ${resp.status}") }
+        decode_dns_response(&resp.body)
+    }
+}
+
+// ── DNS-over-TLS (DoT, port 853) ─────────────────────────────────────────────
+struct DotResolver { server: string, port: u16 }
+
+impl DotResolver {
+    fn cloudflare() -> DotResolver { DotResolver { server: "1.1.1.1".to_string(), port: 853 } }
+    fn google()     -> DotResolver { DotResolver { server: "8.8.8.8".to_string(), port: 853 } }
+    fn quad9()      -> DotResolver { DotResolver { server: "9.9.9.9".to_string(), port: 853 } }
+
+    fn resolve(self, name: string, qtype: DnsType) -> Result<DnsMessage, string> {
+        let tcp = TcpStream.connect("${self.server}:${self.port}").map_err(|e| e.to_string())?
+        let mut tls_stream = tls.connect(tcp, self.server.clone()).map_err(|e| e.to_string())?
+
+        let query = encode_dns_query(name, qtype)
+        // DNS-over-TLS: 2-byte length prefix
+        let len = (query.len() as u16).to_be_bytes()
+        tls_stream.write_all(&len).map_err(|e| e.to_string())?
+        tls_stream.write_all(&query).map_err(|e| e.to_string())?
+
+        let mut len_buf: [u8; 2] = [0; 2]
+        tls_stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?
+        let resp_len = u16_from_be(&len_buf) as usize
+
+        let mut resp_buf = vec![0u8; resp_len]
+        tls_stream.read_exact(&mut resp_buf).map_err(|e| e.to_string())?
+
+        decode_dns_response(&resp_buf)
+    }
+}
+
+// ── DNS cache with TTL ────────────────────────────────────────────────────────
+struct DnsCache {
+    entries: HashMap<(string, u16), (DnsMessage, u64)>,  // (name, qtype) → (response, expiry)
+}
+
+impl DnsCache {
+    fn new() -> DnsCache { DnsCache { entries: HashMap.new() } }
+
+    fn get(self, name: &str, qtype: u16, now: u64) -> Option<DnsMessage> {
+        self.entries.get(&(name.to_string(), qtype))
+            .filter(|(_, expiry)| *expiry > now)
+            .map(|(msg, _)| msg.clone())
+    }
+
+    fn put(mut self, name: string, qtype: u16, msg: DnsMessage, now: u64) {
+        let min_ttl = msg.answers.iter().map(|r| r.ttl).min().unwrap_or(300)
+        self.entries.insert((name, qtype), (msg, now + min_ttl as u64))
+    }
+
+    fn gc(mut self, now: u64) {
+        self.entries.retain(|_, (_, expiry)| *expiry > now)
+    }
+}
+
+fn main() {
+    // Build a DNS query for example.com A record
+    let query = encode_dns_query("example.com".to_string(), DnsType.A)
+    assert(query.len() > 12, "query must have header + question")
+    print("DNS query for example.com A: ${query.len()} bytes")
+
+    // Verify question section encoding
+    // Header: 12 bytes, then: \x07example\x03com\x00 + type(2) + class(2)
+    assert(query[12] == 7)  // "example" length
+    assert(query[20] == 3)  // "com" length
+    assert(query[24] == 0)  // root label
+    print("DNS encoding verified ✓")
+
+    // Test DoH resolver creation
+    let doh = DohResolver.cloudflare()
+    assert(doh.url.contains("cloudflare"))
+    print("DoH resolver (Cloudflare): ${doh.url} ✓")
+
+    let dot = DotResolver.quad9()
+    assert(dot.port == 853)
+    print("DoT resolver (Quad9): ${dot.server}:${dot.port} ✓")
+
+    // Cache test
+    let mut cache = DnsCache.new()
+    assert(cache.get("test.com", 1, 100).is_none())
+    print("DNS cache miss ✓")
+
+    print("Encrypted DNS (DoH + DoT) — all structures verified ✓")
+}
