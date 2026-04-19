@@ -1,0 +1,79 @@
+// signal_processing.ltl — FFT, convolution, filters
+// Run: lateralus run math/signal_processing.ltl
+
+use std.math.{PI, cos, sin, sqrt, complex}
+
+type Complex = (float, float)
+
+fn complex_add(a: Complex, b: Complex) -> Complex {
+    (a.0 + b.0, a.1 + b.1)
+}
+
+fn complex_mul(a: Complex, b: Complex) -> Complex {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+
+/// Cooley-Tukey FFT (N must be power of 2)
+fn fft(xs: [Complex]) -> [Complex] {
+    let n = xs.len()
+    if n <= 1 { return xs }
+    let even = fft(xs |> step_by(2) |> collect())
+    let odd  = fft(xs |> skip(1) |> step_by(2) |> collect())
+    let half = n / 2
+    let t = range(0, half) |> map(k => {
+        let angle = -2.0 * PI * k.float() / n.float()
+        complex_mul((cos(angle), sin(angle)), odd[k])
+    }) |> collect()
+    range(0, half) |> map(k => complex_add(even[k], t[k]))
+                   |> chain(range(0, half) |> map(k => {
+                       (even[k].0 - t[k].0, even[k].1 - t[k].1)
+                   }))
+                   |> collect()
+}
+
+fn magnitude(c: Complex) -> float {
+    sqrt(c.0 * c.0 + c.1 * c.1)
+}
+
+/// Box (moving average) filter
+fn box_filter(signal: [float], window: int) -> [float] {
+    signal |> windows(window)
+           |> map(w => w |> sum() / window.float())
+           |> collect()
+}
+
+/// Discrete convolution
+fn convolve(signal: [float], kernel: [float]) -> [float] {
+    let n  = signal.len()
+    let kn = kernel.len()
+    range(0, n + kn - 1) |> map(i => {
+        range(0, kn)
+            |> filter(j => i >= j && i - j < n)
+            |> map(j => signal[i - j] * kernel[j])
+            |> sum()
+    }) |> collect()
+}
+
+fn main() {
+    // Generate a simple signal: 440 Hz + 880 Hz at 8000 Hz sample rate
+    let sample_rate = 8000.0
+    let n = 512
+    let signal = range(0, n) |> map(i => {
+        let t = i.float() / sample_rate
+        cos(2.0 * PI * 440.0 * t) + 0.5 * cos(2.0 * PI * 880.0 * t)
+    }) |> collect()
+
+    // FFT
+    let complex_signal = signal |> map(v => (v, 0.0)) |> collect()
+    let spectrum = fft(complex_signal)
+    let magnitudes = spectrum |> take(n / 2) |> map(magnitude) |> collect()
+    let peak_bin = magnitudes |> arg_max() |> unwrap()
+    let peak_freq = peak_bin.float() * sample_rate / n.float()
+    print("Peak frequency: ${peak_freq.round(1)} Hz (expected ~440)")
+
+    // Moving average
+    let smoothed = box_filter(signal, 8)
+    print("Smoothed signal length: ${smoothed.len()}")
+}
+
+main()
