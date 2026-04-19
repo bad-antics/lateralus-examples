@@ -1,0 +1,388 @@
+// Niche Example — HTTP/1.1 Server
+// Request parsing, routing, middleware, response building.
+
+use std.net.{TcpListener, TcpStream}
+use std.io.{Read, Write, BufRead, BufReader}
+use std.collections.HashMap
+use std.thread
+
+// ── HTTP types ───────────────────────────────────────────────────────────────
+enum HttpMethod { GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS }
+
+impl HttpMethod {
+    fn from_str(s: &str) -> Option<HttpMethod> {
+        match s {
+            "GET" => some(HttpMethod.GET), "POST" => some(HttpMethod.POST),
+            "PUT" => some(HttpMethod.PUT), "DELETE" => some(HttpMethod.DELETE),
+            "PATCH" => some(HttpMethod.PATCH), "HEAD" => some(HttpMethod.HEAD),
+            "OPTIONS" => some(HttpMethod.OPTIONS), _ => none,
+        }
+    }
+
+    fn as_str(self) -> &str {
+        match self {
+            HttpMethod.GET => "GET", HttpMethod.POST => "POST",
+            HttpMethod.PUT => "PUT", HttpMethod.DELETE => "DELETE",
+            HttpMethod.PATCH => "PATCH", HttpMethod.HEAD => "HEAD",
+            HttpMethod.OPTIONS => "OPTIONS",
+        }
+    }
+}
+
+struct HttpRequest {
+    method: HttpMethod,
+    path: string,
+    query: HashMap<string, string>,
+    headers: HashMap<string, string>,
+    body: [u8],
+    params: HashMap<string, string>,  // route parameters
+}
+
+impl HttpRequest {
+    fn parse(reader: &mut BufReader<&TcpStream>) -> Result<HttpRequest, string> {
+        let mut request_line = string.new()
+        reader.read_line(&mut request_line).map_err(|e| e.to_string())?
+
+        let parts: [&str] = request_line.trim().split(' ').collect()
+        if parts.len() < 3 { return err("malformed request line".to_string()) }
+
+        let method = HttpMethod.from_str(parts[0]).ok_or("unknown method".to_string())?
+
+        // Parse path and query string
+        let (path, query) = if let some(q_pos) = parts[1].find('?') {
+            let path = parts[1][..q_pos].to_string()
+            let query_str = &parts[1][q_pos+1..]
+            let query = Self.parse_query(query_str)
+            (path, query)
+        } else {
+            (parts[1].to_string(), HashMap.new())
+        }
+
+        // Parse headers
+        let mut headers = HashMap.new()
+        loop {
+            let mut line = string.new()
+            reader.read_line(&mut line).map_err(|e| e.to_string())?
+            let trimmed = line.trim()
+            if trimmed.is_empty() { break }
+            if let some(colon) = trimmed.find(':') {
+                let key = trimmed[..colon].trim().to_lowercase()
+                let value = trimmed[colon+1..].trim().to_string()
+                headers.insert(key, value)
+            }
+        }
+
+        // Parse body
+        let body = if let some(len_str) = headers.get("content-length") {
+            let len: usize = len_str.parse().unwrap_or(0)
+            let mut buf = vec![0u8; len]
+            reader.read_exact(&mut buf).map_err(|e| e.to_string())?
+            buf
+        } else { [] }
+
+        ok(HttpRequest { method, path, query, headers, body, params: HashMap.new() })
+    }
+
+    fn parse_query(query: &str) -> HashMap<string, string> {
+        let mut map = HashMap.new()
+        for pair in query.split('&') {
+            if let some(eq) = pair.find('=') {
+                map.insert(
+                    Self.url_decode(&pair[..eq]),
+                    Self.url_decode(&pair[eq+1..]),
+                )
+            }
+        }
+        map
+    }
+
+    fn url_decode(s: &str) -> string {
+        let mut result = string.new()
+        let bytes = s.as_bytes()
+        let mut i = 0
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = &s[i+1..i+3]
+                if let ok(byte) = u8.from_str_radix(hex, 16) { result.push(byte as char) }
+                i += 3
+            } else if bytes[i] == b'+' { result.push(' '); i += 1 }
+            else { result.push(bytes[i] as char); i += 1 }
+        }
+        result
+    }
+
+    fn body_str(self) -> string { string.from_utf8_lossy(&self.body).to_string() }
+    fn content_type(self) -> Option<&string> { self.headers.get("content-type") }
+}
+
+// ── Response ─────────────────────────────────────────────────────────────────
+struct HttpResponse {
+    status: u16,
+    status_text: string,
+    headers: HashMap<string, string>,
+    body: [u8],
+}
+
+impl HttpResponse {
+    fn new(status: u16) -> HttpResponse {
+        let text = match status {
+            200 => "OK", 201 => "Created", 204 => "No Content",
+            301 => "Moved Permanently", 302 => "Found", 304 => "Not Modified",
+            400 => "Bad Request", 401 => "Unauthorized", 403 => "Forbidden",
+            404 => "Not Found", 405 => "Method Not Allowed",
+            500 => "Internal Server Error", _ => "Unknown",
+        }
+        let mut headers = HashMap.new()
+        headers.insert("server".to_string(), "lateralus/1.0".to_string())
+        headers.insert("connection".to_string(), "close".to_string())
+        HttpResponse { status, status_text: text.to_string(), headers, body: [] }
+    }
+
+    fn ok() -> HttpResponse { Self.new(200) }
+    fn not_found() -> HttpResponse { Self.new(404).body_text("Not Found") }
+    fn bad_request() -> HttpResponse { Self.new(400).body_text("Bad Request") }
+    fn internal_error() -> HttpResponse { Self.new(500).body_text("Internal Server Error") }
+
+    fn header(mut self, key: &str, value: &str) -> HttpResponse {
+        self.headers.insert(key.to_string(), value.to_string()); self
+    }
+
+    fn body_bytes(mut self, data: [u8]) -> HttpResponse {
+        self.headers.insert("content-length".to_string(), data.len().to_string())
+        self.body = data; self
+    }
+
+    fn body_text(mut self, text: &str) -> HttpResponse {
+        self.headers.insert("content-type".to_string(), "text/plain; charset=utf-8".to_string())
+        self.body_bytes(text.as_bytes().to_vec())
+    }
+
+    fn body_json(mut self, json: &str) -> HttpResponse {
+        self.headers.insert("content-type".to_string(), "application/json".to_string())
+        self.body_bytes(json.as_bytes().to_vec())
+    }
+
+    fn body_html(mut self, html: &str) -> HttpResponse {
+        self.headers.insert("content-type".to_string(), "text/html; charset=utf-8".to_string())
+        self.body_bytes(html.as_bytes().to_vec())
+    }
+
+    fn redirect(url: &str) -> HttpResponse {
+        Self.new(302).header("location", url)
+    }
+
+    fn serialize(self) -> [u8] {
+        let mut out = format!("HTTP/1.1 {} {}\r\n", self.status, self.status_text)
+        for (key, value) in &self.headers { out += &format!("{key}: {value}\r\n") }
+        out += "\r\n"
+        let mut bytes = out.into_bytes()
+        bytes.extend_from_slice(&self.body)
+        bytes
+    }
+}
+
+// ── Router ───────────────────────────────────────────────────────────────────
+type Handler = fn(&HttpRequest) -> HttpResponse
+
+struct Route {
+    method: HttpMethod,
+    pattern: string,
+    segments: [RouteSegment],
+    handler: Handler,
+}
+
+enum RouteSegment { Literal(string), Param(string), Wildcard }
+
+impl Route {
+    fn new(method: HttpMethod, pattern: &str, handler: Handler) -> Route {
+        let segments = pattern.split('/').filter(|s| !s.is_empty()).map(|s| {
+            if s.starts_with(':') { RouteSegment.Param(s[1..].to_string()) }
+            else if s == "*" { RouteSegment.Wildcard }
+            else { RouteSegment.Literal(s.to_string()) }
+        }).collect()
+        Route { method, pattern: pattern.to_string(), segments, handler }
+    }
+
+    fn matches(self, method: &HttpMethod, path: &str) -> Option<HashMap<string, string>> {
+        if std.mem.discriminant(&self.method) != std.mem.discriminant(method) { return none }
+        let parts: [&str] = path.split('/').filter(|s| !s.is_empty()).collect()
+        if parts.len() != self.segments.len() && !self.segments.last().map(|s| matches!(s, RouteSegment.Wildcard)).unwrap_or(false) {
+            return none
+        }
+        let mut params = HashMap.new()
+        for (seg, part) in self.segments.iter().zip(&parts) {
+            match seg {
+                RouteSegment.Literal(s) => { if s != part { return none } }
+                RouteSegment.Param(name) => { params.insert(name.clone(), part.to_string()); }
+                RouteSegment.Wildcard => {}
+            }
+        }
+        some(params)
+    }
+}
+
+struct Router {
+    routes: [Route],
+    middleware: [fn(&mut HttpRequest, &mut HttpResponse)],
+    not_found_handler: Handler,
+}
+
+impl Router {
+    fn new() -> Router {
+        Router {
+            routes: [],
+            middleware: [],
+            not_found_handler: |_| HttpResponse.not_found(),
+        }
+    }
+
+    fn get(mut self, pattern: &str, handler: Handler) -> &mut Router {
+        self.routes.push(Route.new(HttpMethod.GET, pattern, handler)); self
+    }
+    fn post(mut self, pattern: &str, handler: Handler) -> &mut Router {
+        self.routes.push(Route.new(HttpMethod.POST, pattern, handler)); self
+    }
+    fn put(mut self, pattern: &str, handler: Handler) -> &mut Router {
+        self.routes.push(Route.new(HttpMethod.PUT, pattern, handler)); self
+    }
+    fn delete(mut self, pattern: &str, handler: Handler) -> &mut Router {
+        self.routes.push(Route.new(HttpMethod.DELETE, pattern, handler)); self
+    }
+
+    fn use_middleware(mut self, mw: fn(&mut HttpRequest, &mut HttpResponse)) -> &mut Router {
+        self.middleware.push(mw); self
+    }
+
+    fn route(self, req: &mut HttpRequest) -> HttpResponse {
+        for route in &self.routes {
+            if let some(params) = route.matches(&req.method, &req.path) {
+                req.params = params
+                let mut response = (route.handler)(req)
+                for mw in &self.middleware { mw(req, &mut response) }
+                return response
+            }
+        }
+        (self.not_found_handler)(req)
+    }
+}
+
+// ── Server ───────────────────────────────────────────────────────────────────
+struct Server {
+    addr: string,
+    router: Router,
+}
+
+impl Server {
+    fn new(addr: &str) -> Server {
+        Server { addr: addr.to_string(), router: Router.new() }
+    }
+
+    fn router(mut self) -> &mut Router { &mut self.router }
+
+    fn listen(self) -> Result<(), string> {
+        let listener = TcpListener.bind(&self.addr).map_err(|e| e.to_string())?
+        print("Listening on ${self.addr}")
+
+        for stream in listener.incoming() {
+            match stream {
+                ok(stream) => {
+                    let router = &self.router
+                    thread.spawn(move || { Self.handle_connection(stream, router) })
+                }
+                err(e) => eprintln!("Accept error: {e}"),
+            }
+        }
+        ok(())
+    }
+
+    fn handle_connection(mut stream: TcpStream, router: &Router) {
+        let mut reader = BufReader.new(&stream)
+        match HttpRequest.parse(&mut reader) {
+            ok(mut req) => {
+                let response = router.route(&mut req)
+                stream.write_all(&response.serialize()).ok()
+            }
+            err(e) => {
+                let resp = HttpResponse.bad_request()
+                stream.write_all(&resp.serialize()).ok()
+            }
+        }
+    }
+}
+
+fn main() {
+    // HTTP method parsing
+    assert(HttpMethod.from_str("GET").is_some())
+    assert(HttpMethod.from_str("INVALID").is_none())
+    print("HttpMethod parsing ✓")
+
+    // Response building
+    let resp = HttpResponse.ok().body_text("Hello, World!")
+    assert(resp.status == 200)
+    let serialized = resp.serialize()
+    let resp_str = string.from_utf8_lossy(&serialized)
+    assert(resp_str.contains("200 OK"))
+    assert(resp_str.contains("Hello, World!"))
+    print("Response serialization ✓")
+
+    // JSON response
+    let json_resp = HttpResponse.ok().body_json(r#"{"key": "value"}"#)
+    assert(json_resp.headers.get("content-type").unwrap().contains("application/json"))
+    print("JSON response ✓")
+
+    // Redirect
+    let redir = HttpResponse.redirect("/new-location")
+    assert(redir.status == 302)
+    assert(redir.headers.get("location").unwrap() == "/new-location")
+    print("Redirect ✓")
+
+    // URL decoding
+    assert(HttpRequest.url_decode("hello%20world") == "hello world")
+    assert(HttpRequest.url_decode("a+b") == "a b")
+    assert(HttpRequest.url_decode("100%25") == "100%")
+    print("URL decoding ✓")
+
+    // Route matching
+    let route = Route.new(HttpMethod.GET, "/users/:id/posts/:post_id", |_| HttpResponse.ok())
+    let params = route.matches(&HttpMethod.GET, "/users/42/posts/7").unwrap()
+    assert(params.get("id").unwrap() == "42")
+    assert(params.get("post_id").unwrap() == "7")
+    print("Route params: id=42, post_id=7 ✓")
+
+    assert(route.matches(&HttpMethod.POST, "/users/42/posts/7").is_none())
+    assert(route.matches(&HttpMethod.GET, "/users/42").is_none())
+    print("Route mismatch ✓")
+
+    // Router
+    let mut router = Router.new()
+    router.get("/", |_| HttpResponse.ok().body_text("Home"))
+    router.get("/users/:id", |req| {
+        let id = req.params.get("id").unwrap()
+        HttpResponse.ok().body_json(&format!(r#"{{"id": "{id}"}}"#))
+    })
+    router.post("/users", |_| HttpResponse.new(201).body_text("Created"))
+
+    // Simulate request
+    let mut req = HttpRequest {
+        method: HttpMethod.GET, path: "/".to_string(),
+        query: HashMap.new(), headers: HashMap.new(),
+        body: [], params: HashMap.new(),
+    }
+    let resp = router.route(&mut req)
+    assert(resp.status == 200)
+    print("GET / → 200 ✓")
+
+    req.path = "/nonexistent".to_string()
+    let resp = router.route(&mut req)
+    assert(resp.status == 404)
+    print("GET /nonexistent → 404 ✓")
+
+    // Query string parsing
+    let query = HttpRequest.parse_query("name=john&age=30&city=new+york")
+    assert(query.get("name").unwrap() == "john")
+    assert(query.get("age").unwrap() == "30")
+    assert(query.get("city").unwrap() == "new york")
+    print("Query parsing ✓")
+
+    print("HTTP Server complete ✓")
+}
