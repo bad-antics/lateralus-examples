@@ -1,0 +1,67 @@
+// transducers.ltl — Composable, reusable transformations
+// Run: lateralus run functional/transducers.ltl
+
+// A transducer is a function from reducer to reducer
+type Reducer<Acc, In>  = fn(Acc, In) -> Acc
+type Transducer<A, B>  = fn(Reducer<any, B>) -> Reducer<any, A>
+
+fn mapping<A, B>(f: fn(A) -> B) -> Transducer<A, B> {
+    |rf| |acc, x| rf(acc, f(x))
+}
+
+fn filtering<A>(pred: fn(A) -> bool) -> Transducer<A, A> {
+    |rf| |acc, x| if pred(x) { rf(acc, x) } else { acc }
+}
+
+fn taking<A>(n: int) -> Transducer<A, A> {
+    mut count = 0
+    |rf| |acc, x| {
+        if count < n { count += 1; rf(acc, x) } else { acc }
+    }
+}
+
+fn flat_mapping<A, B>(f: fn(A) -> [B]) -> Transducer<A, B> {
+    |rf| |acc, x| f(x) |> fold(acc, rf)
+}
+
+fn compose_transducers<A, B, C>(t1: Transducer<A, B>, t2: Transducer<B, C>) -> Transducer<A, C> {
+    |rf| t1(t2(rf))
+}
+
+fn transduce<Acc, In, Out>(
+    xf:   Transducer<In, Out>,
+    rf:   Reducer<Acc, Out>,
+    init: Acc,
+    coll: [In],
+) -> Acc {
+    let xrf = xf(rf)
+    coll |> fold(init, xrf)
+}
+
+fn into_list<T>() -> Reducer<[T], T> {
+    |acc, x| { acc.push(x); acc }
+}
+
+fn main() {
+    let numbers = range(1, 21) |> collect()
+
+    // map(x => x * 2) |> filter(x => x % 3 == 0) |> take(5)
+    let xf = compose_transducers(
+        compose_transducers(
+            mapping(|x| x * 2),
+            filtering(|x| x % 3 == 0),
+        ),
+        taking(5),
+    )
+
+    let result = transduce(xf, into_list(), [], numbers)
+    print("Transduced result: ${result}")
+    // Expected: first 5 even multiples of 3: 6, 12, 18, 24, 30
+
+    // Flat map transducer
+    let expand = flat_mapping(|x| [x, x * 10])
+    let expanded = transduce(compose_transducers(expand, taking(6)), into_list(), [], [1, 2, 3])
+    print("Flat-mapped: ${expanded}")
+}
+
+main()
