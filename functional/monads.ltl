@@ -1,0 +1,79 @@
+// monads.ltl — Monadic patterns in Lateralus
+// Run: lateralus run functional/monads.ltl
+
+// ── Option monad ────────────────────────────────────────────────────────────
+fn find_user(id: int) -> int? {
+    if id > 0 { some(id * 10) } else { none }
+}
+
+fn get_email(user_data: int) -> string? {
+    if user_data > 50 { some("user${user_data}@example.com") } else { none }
+}
+
+fn user_email_domain(id: int) -> string? {
+    find_user(id)
+        .and_then(get_email)
+        .map(|e| e.split("@")[1])
+}
+
+// ── Result monad ────────────────────────────────────────────────────────────
+fn parse_int_safe(s: string) -> Result<int, string> {
+    s.parse_int().map_err(|_| "Not a number: ${s}")
+}
+
+fn reciprocal(n: int) -> Result<float, string> {
+    if n == 0 { err("Division by zero") }
+    else      { ok(1.0 / n.float()) }
+}
+
+fn parse_and_invert(s: string) -> Result<float, string> {
+    parse_int_safe(s).and_then(reciprocal)
+}
+
+// ── State monad ─────────────────────────────────────────────────────────────
+// Represented as fn(State) -> (Value, State)
+type State<S, A> = fn(S) -> (A, S)
+
+fn state_return<S, A>(a: A) -> State<S, A> {
+    |s| (a, s)
+}
+
+fn state_bind<S, A, B>(m: State<S, A>, f: fn(A) -> State<S, B>) -> State<S, B> {
+    |s| {
+        let (a, s2) = m(s)
+        f(a)(s2)
+    }
+}
+
+fn increment() -> State<int, int> {
+    |n| (n, n + 1)
+}
+
+fn get_count() -> State<int, int> {
+    |n| (n, n)
+}
+
+fn main() {
+    // Option
+    print("email domain for id=6:  ${user_email_domain(6)}")
+    print("email domain for id=1:  ${user_email_domain(1)}")
+    print("email domain for id=-1: ${user_email_domain(-1)}")
+
+    // Result
+    print("
+parse_and_invert('4'):   ${parse_and_invert("4")}")
+    print("parse_and_invert('0'):   ${parse_and_invert("0")}")
+    print("parse_and_invert('abc'): ${parse_and_invert("abc")}")
+
+    // State
+    let program = state_bind(increment(), |_|
+                  state_bind(increment(), |_|
+                  state_bind(increment(), |_|
+                  get_count())))
+    let (count, final_state) = program(0)
+    print("
+State after 3 increments: ${final_state} (value returned: ${count})")
+    assert_eq(final_state, 3)
+}
+
+main()
