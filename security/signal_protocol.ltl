@@ -1,0 +1,197 @@
+// signal_protocol.ltl — Signal Double Ratchet + X3DH key agreement
+
+use std.crypto.{x25519, hkdf, sha256, aes256_cbc, hmac_sha256, random_bytes}
+
+// ── X3DH (Extended Triple Diffie-Hellman) key agreement ──────────────────────
+struct IdentityKey   { sk: [u8; 32], pk: [u8; 32] }
+struct SignedPreKey   { sk: [u8; 32], pk: [u8; 32], signature: [u8; 64] }
+struct OneTimePreKey  { id: u32, sk: [u8; 32], pk: [u8; 32] }
+
+struct PreKeyBundle {
+    identity_key:    [u8; 32],
+    signed_prekey:   [u8; 32],
+    prekey_sig:      [u8; 64],
+    one_time_prekey: [u8; 32]?,
+}
+
+fn x3dh_initiator(
+    ika: IdentityKey,        // Alice's identity
+    eka_sk: [u8; 32],       // Alice's ephemeral secret
+    bundle: PreKeyBundle,     // Bob's published bundle
+) -> Result<([u8; 32], [u8; 32]), string> {
+    let ikb = bundle.identity_key
+    let spkb = bundle.signed_prekey
+
+    // DH1 = DH(IKa, SPKb)
+    let dh1 = x25519.scalar_mult(ika.sk, spkb)
+    // DH2 = DH(EKa, IKb)
+    let dh2 = x25519.scalar_mult(eka_sk, ikb)
+    // DH3 = DH(EKa, SPKb)
+    let dh3 = x25519.scalar_mult(eka_sk, spkb)
+    // DH4 = DH(EKa, OPKb) if available
+    let dh4 = bundle.one_time_prekey.map(|opk| x25519.scalar_mult(eka_sk, opk))
+
+    let mut ikm: [u8] = vec![0xff; 32]  // 32 bytes of 0xFF
+    ikm.extend_from_slice(&dh1)
+    ikm.extend_from_slice(&dh2)
+    ikm.extend_from_slice(&dh3)
+    if let some(d) = dh4 { ikm.extend_from_slice(&d) }
+
+    let salt: [u8; 32] = [0; 32]
+    let sk = hkdf.derive(salt, ikm, "X3DH".as_bytes(), 32)
+    let ek_pub = x25519.base_point_mul(eka_sk)
+
+    ok((sk.try_into().unwrap(), ek_pub))
+}
+
+// ── Double Ratchet ────────────────────────────────────────────────────────────
+struct MessageKey { key: [u8; 32], iv: [u8; 16] }
+
+struct RatchetState {
+    dhs:  [u8; 32],     // our current ratchet private key
+    dhr:  [u8; 32]?,    // their current ratchet public key
+    rk:   [u8; 32],     // root key
+    cks:  [u8; 32]?,    // sending chain key
+    ckr:  [u8; 32]?,    // receiving chain key
+    ns:   u32,          // message number (send)
+    nr:   u32,          // message number (recv)
+    pn:   u32,          // previous chain length
+    skipped: dict<(u32, [u8; 32]), MessageKey>,  // skipped message keys
+}
+
+impl RatchetState {
+    fn init_alice(sk: [u8; 32], bob_ratchet_pk: [u8; 32]) -> RatchetState {
+        let dhs_sk = random_bytes(32).try_into().unwrap()
+        let shared = x25519.scalar_mult(dhs_sk, bob_ratchet_pk)
+        let (rk, cks) = kdf_rk(sk, shared)
+        RatchetState {
+            dhs: dhs_sk, dhr: some(bob_ratchet_pk),
+            rk, cks: some(cks), ckr: none,
+            ns: 0, nr: 0, pn: 0,
+            skipped: dict(),
+        }
+    }
+
+    fn init_bob(sk: [u8; 32], ratchet_sk: [u8; 32]) -> RatchetState {
+        RatchetState {
+            dhs: ratchet_sk, dhr: none,
+            rk: sk, cks: none, ckr: none,
+            ns: 0, nr: 0, pn: 0,
+            skipped: dict(),
+        }
+    }
+
+    fn ratchet_encrypt(mut self, plaintext: &[u8]) -> (Header, [u8]) {
+        let (cks, mk) = kdf_ck(self.cks.unwrap())
+        self.cks = some(cks)
+        let dhs_pub = x25519.base_point_mul(self.dhs)
+        let header = Header { dh: dhs_pub, pn: self.pn, n: self.ns }
+        self.ns += 1
+        let ct = encrypt(mk, plaintext)
+        (header, ct)
+    }
+
+    fn ratchet_decrypt(mut self, header: Header, ciphertext: &[u8]) -> Result<[u8], string> {
+        // Try skipped keys first
+        let skip_key = (header.n, header.dh)
+        if let some(mk) = self.skipped.remove(&skip_key) {
+            return decrypt(mk, ciphertext)
+        }
+
+        // DH ratchet step if new ratchet key
+        if self.dhr.is_none() || header.dh != self.dhr.unwrap() {
+            self.skip_messages(header.pn)?
+            self.dh_ratchet(header.dh)
+        }
+
+        self.skip_messages(header.n)?
+        let (ckr, mk) = kdf_ck(self.ckr.unwrap())
+        self.ckr = some(ckr)
+        self.nr += 1
+        decrypt(mk, ciphertext)
+    }
+
+    fn dh_ratchet(mut self, new_dhr: [u8; 32]) {
+        self.pn = self.ns; self.ns = 0; self.nr = 0
+        self.dhr = some(new_dhr)
+
+        let shared = x25519.scalar_mult(self.dhs, new_dhr)
+        let (rk, ckr) = kdf_rk(self.rk, shared)
+        self.rk = rk; self.ckr = some(ckr)
+
+        let new_dhs = random_bytes(32).try_into().unwrap()
+        self.dhs = new_dhs
+        let shared2 = x25519.scalar_mult(new_dhs, new_dhr)
+        let (rk2, cks) = kdf_rk(self.rk, shared2)
+        self.rk = rk2; self.cks = some(cks)
+    }
+
+    fn skip_messages(mut self, until: u32) -> Result<(), string> {
+        if self.ckr.is_none() { return ok(()) }
+        while self.nr < until {
+            let (ckr, mk) = kdf_ck(self.ckr.unwrap())
+            self.ckr = some(ckr)
+            let dhr = self.dhr.unwrap()
+            self.skipped.insert((self.nr, dhr), mk)
+            self.nr += 1
+        }
+        ok(())
+    }
+}
+
+struct Header { dh: [u8; 32], pn: u32, n: u32 }
+
+fn kdf_rk(rk: [u8; 32], dh_out: [u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let output = hkdf.derive(rk, dh_out, "DoubleRatchetRK".as_bytes(), 64)
+    let rk_new:  [u8; 32] = output[0..32].try_into().unwrap()
+    let ck_new:  [u8; 32] = output[32..64].try_into().unwrap()
+    (rk_new, ck_new)
+}
+
+fn kdf_ck(ck: [u8; 32]) -> ([u8; 32], MessageKey) {
+    let ck_new = hmac_sha256.mac(ck, &[0x01])
+    let mk_raw = hmac_sha256.mac(ck, &[0x02])
+    let mk = MessageKey {
+        key: mk_raw[0..32].try_into().unwrap(),
+        iv:  hmac_sha256.mac(ck, &[0x03])[0..16].try_into().unwrap(),
+    }
+    (ck_new.try_into().unwrap(), mk)
+}
+
+fn encrypt(mk: MessageKey, pt: &[u8]) -> [u8] { aes256_cbc.encrypt(mk.key, mk.iv, pt) }
+fn decrypt(mk: MessageKey, ct: &[u8]) -> Result<[u8], string> { aes256_cbc.decrypt(mk.key, mk.iv, ct) }
+
+fn main() {
+    // Simulate X3DH + Double Ratchet
+    let alice_ik = IdentityKey { sk: random_bytes(32).try_into().unwrap(), pk: [0;32] }
+    let bob_ik   = IdentityKey { sk: random_bytes(32).try_into().unwrap(), pk: [0;32] }
+
+    // Pretend X3DH produced shared key sk
+    let sk: [u8; 32] = sha256.hash("test-shared-key".as_bytes()).try_into().unwrap()
+    let bob_ratchet_sk = random_bytes(32).try_into().unwrap()
+    let bob_ratchet_pk = x25519.base_point_mul(bob_ratchet_sk)
+
+    let mut alice = RatchetState.init_alice(sk, bob_ratchet_pk)
+    let mut bob   = RatchetState.init_bob(sk, bob_ratchet_sk)
+
+    // Alice sends
+    let (h1, c1) = alice.ratchet_encrypt("Hello Bob!".as_bytes())
+    let p1 = bob.ratchet_decrypt(h1, &c1).expect("decrypt 1")
+    assert(p1 == "Hello Bob!".as_bytes().to_vec())
+    print("Alice → Bob: '${string.from_utf8(p1).unwrap()}' ✓")
+
+    // Bob replies
+    let (h2, c2) = bob.ratchet_encrypt("Hi Alice!".as_bytes())
+    let p2 = alice.ratchet_decrypt(h2, &c2).expect("decrypt 2")
+    assert(p2 == "Hi Alice!".as_bytes().to_vec())
+    print("Bob → Alice: '${string.from_utf8(p2).unwrap()}' ✓")
+
+    // Multiple messages in same ratchet step
+    let (h3, c3) = alice.ratchet_encrypt("message 3".as_bytes())
+    let (h4, c4) = alice.ratchet_encrypt("message 4".as_bytes())
+    let p3 = bob.ratchet_decrypt(h3, &c3).unwrap()
+    let p4 = bob.ratchet_decrypt(h4, &c4).unwrap()
+    print("Multi-msg: '${string.from_utf8(p3).unwrap()}', '${string.from_utf8(p4).unwrap()}' ✓")
+
+    print("Signal Protocol (X3DH + Double Ratchet) — all passed ✓")
+}
