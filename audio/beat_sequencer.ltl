@@ -1,0 +1,80 @@
+// beat_sequencer.ltl — 16-step drum machine / beat sequencer
+use std.math.{sin, PI}
+
+const SAMPLE_RATE: int = 44100
+const BPM:         int = 120
+const STEPS:       int = 16
+
+fn samples_per_step() -> int { SAMPLE_RATE * 60 / BPM / 4 }
+
+// Drum synthesis primitives
+fn kick(t: float) -> float {
+    let freq = 150.0 * (1.0 - t * 8.0).max(0.0) + 40.0
+    let amp  = (-t * 20.0).exp()
+    sin(2.0 * PI * freq * t) * amp
+}
+
+fn snare(t: float) -> float {
+    let tone  = sin(2.0 * PI * 200.0 * t) * (-t * 15.0).exp()
+    let noise = (std.random.rand_float() * 2.0 - 1.0) * (-t * 30.0).exp()
+    (tone * 0.5 + noise * 0.5).clamp(-1.0, 1.0)
+}
+
+fn hihat(t: float, open: bool) -> float {
+    let decay = if open { 8.0 } else { 40.0 }
+    (std.random.rand_float() * 2.0 - 1.0) * (-t * decay).exp() * 0.5
+}
+
+struct Pattern {
+    kick:   [bool],   // 16 steps
+    snare:  [bool],
+    hihat:  [bool],
+    openhat:[bool],
+}
+
+impl Pattern {
+    fn four_on_floor() -> Pattern {
+        Pattern {
+            kick:    [true,false,false,false, true,false,false,false, true,false,false,false, true,false,false,false],
+            snare:   [false,false,false,false,true,false,false,false, false,false,false,false,true,false,false,false],
+            hihat:   [true,false,true,false,  true,false,true,false,  true,false,true,false,  true,false,true,false],
+            openhat: [false,false,false,false,false,false,false,true, false,false,false,false,false,false,false,true],
+        }
+    }
+
+    fn render_bar(self) -> [f32] {
+        let sps     = samples_per_step()
+        let total   = sps * STEPS
+        let mut out = [0.0f32; total]
+        for step in range(0, STEPS) {
+            let offset = step * sps
+            for i in range(0, sps) {
+                let t = i as float / SAMPLE_RATE as float
+                let mut s = 0.0
+                if self.kick[step]    { s += kick(t) }
+                if self.snare[step]   { s += snare(t) }
+                if self.hihat[step]   { s += hihat(t, false) }
+                if self.openhat[step] { s += hihat(t, true)  }
+                out[offset + i] = s.clamp(-1.0, 1.0) as f32
+            }
+        }
+        out
+    }
+}
+
+fn main() {
+    let p      = Pattern.four_on_floor()
+    let audio  = p.render_bar()
+    print("Beat sequencer: rendered ${audio.len()} samples (${BPM} BPM, ${STEPS} steps) ✓")
+
+    // Print ASCII grid of the pattern
+    print("
+Step:  1 2 3 4 | 5 6 7 8 | 9 A B C | D E F G")
+    for (name, track) in [("Kick ", p.kick), ("Snare", p.snare), ("HiHat", p.hihat), ("OpenH", p.openhat)] {
+        let row = track |> enumerate() |> map(|(i, b)| {
+            let sep = if i % 4 == 0 && i > 0 { "| " } else { "" }
+            sep + if b { "X " } else { ". " }
+        }) |> join("")
+        print("${name}: ${row}")
+    }
+}
