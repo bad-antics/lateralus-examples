@@ -1,0 +1,62 @@
+// tunnel.ltl — Infinite tunnel effect (classic 90s demoscene)
+use std.math.{sin, cos, atan2, sqrt, PI}
+use std.time.{Instant, sleep_ms}
+use std.io.stdout
+
+const W: int = 100
+const H: int = 40
+
+// Precompute tunnel table: for each screen pixel, (distance, angle)
+fn make_tunnel_table() -> [[(float, float)]] {
+    range(0, H) |> map(|y| {
+        range(0, W) |> map(|x| {
+            let fx = (x as float - W as float / 2.0) / (W as float / 2.0)
+            let fy = (y as float - H as float / 2.0) / (H as float / 2.0) * 2.0
+            let dist  = 1.0 / (sqrt(fx*fx + fy*fy) + 0.001)
+            let angle = atan2(fy, fx) / PI
+            (dist, angle)
+        }) |> collect()
+    }) |> collect()
+}
+
+fn checkerboard(d: float, a: float, t: float, zoom: float, rot: float) -> bool {
+    let u = ((d * zoom + t) % 2.0).abs()
+    let v = ((a + rot) % 2.0).abs()
+    ((u < 1.0) != (v < 1.0))
+}
+
+fn render_tunnel(table: [[(float, float)]], t: float) -> string {
+    let zoom  = 2.5
+    let rot   = t * 0.3
+    let mut out = "[H"
+    for y in range(0, H) {
+        for x in range(0, W) {
+            let (d, a) = table[y][x]
+            let bright = (d * 20.0).min(1.0)
+            let on     = checkerboard(d, a, t, zoom, rot)
+            let (r, g, b) = if on {
+                ((bright * 200.0) as int, (bright * 150.0) as int, (bright * 255.0) as int)
+            } else {
+                ((bright * 30.0) as int, (bright * 20.0) as int, (bright * 40.0) as int)
+            }
+            let ch = if d > 8.0 { '█' } else if d > 4.0 { '▓' } else if d > 2.0 { '▒' } else { '░' }
+            out += "[38;2;${r};${g};${b}m${ch}"
+        }
+        out += "[0m
+"
+    }
+    out
+}
+
+fn main() {
+    print("[2J[?25l")
+    let table  = make_tunnel_table()
+    let start  = Instant.now()
+    for _ in range(0, 100) {
+        let t = start.elapsed_ms() as float / 500.0
+        stdout().write(render_tunnel(table, t))
+        sleep_ms(33)
+    }
+    print("[?25h[0m")
+    print("Tunnel effect — 100 frames ✓")
+}
