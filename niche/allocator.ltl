@@ -1,0 +1,370 @@
+// Niche Example — Memory Allocator
+// Buddy allocator + slab allocator for fixed-size objects.
+
+use std.collections.HashMap
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const MIN_BLOCK_SIZE: usize = 16
+const MAX_ORDER: usize = 20  // 2^20 * MIN_BLOCK_SIZE = 16MB max
+
+// ── Buddy Allocator ──────────────────────────────────────────────────────────
+struct BuddyAllocator {
+    base: usize,
+    total_size: usize,
+    max_order: usize,
+    free_lists: [[usize]],  // free_lists[order] = list of free block addresses
+    allocated: HashMap<usize, usize>,  // addr -> order
+}
+
+impl BuddyAllocator {
+    fn new(base: usize, total_size: usize) -> BuddyAllocator {
+        let max_order = log2(total_size / MIN_BLOCK_SIZE)
+        let mut free_lists: [[usize]] = []
+        for _ in 0..=max_order { free_lists.push([]) }
+        free_lists[max_order].push(base)
+
+        BuddyAllocator { base, total_size, max_order, free_lists, allocated: HashMap.new() }
+    }
+
+    fn block_size(order: usize) -> usize { MIN_BLOCK_SIZE << order }
+
+    fn buddy_addr(self, addr: usize, order: usize) -> usize {
+        addr ^ Self.block_size(order)
+    }
+
+    fn order_for_size(size: usize) -> usize {
+        let mut order = 0
+        let mut block_size = MIN_BLOCK_SIZE
+        while block_size < size { block_size <<= 1; order += 1 }
+        order
+    }
+
+    fn alloc(mut self, size: usize) -> Option<usize> {
+        if size == 0 || size > self.total_size { return none }
+        let needed_order = Self.order_for_size(size)
+        if needed_order > self.max_order { return none }
+
+        // Find smallest available order
+        let mut found_order: Option<usize> = none
+        for order in needed_order..=self.max_order {
+            if !self.free_lists[order].is_empty() {
+                found_order = some(order)
+                break
+            }
+        }
+        let found_order = found_order?
+
+        // Split down to needed order
+        let addr = self.free_lists[found_order].pop().unwrap()
+        let mut current_order = found_order
+        while current_order > needed_order {
+            current_order -= 1
+            let buddy = addr + Self.block_size(current_order)
+            self.free_lists[current_order].push(buddy)
+        }
+
+        self.allocated.insert(addr, needed_order)
+        some(addr)
+    }
+
+    fn free(mut self, addr: usize) -> Result<(), string> {
+        let order = self.allocated.remove(&addr)
+            .ok_or(format!("address 0x{:x} not allocated", addr))?
+
+        let mut current_addr = addr
+        let mut current_order = order
+
+        // Coalesce with buddies
+        while current_order < self.max_order {
+            let buddy = self.buddy_addr(current_addr, current_order)
+            // Check if buddy is free
+            if let some(pos) = self.free_lists[current_order].iter().position(|a| *a == buddy) {
+                self.free_lists[current_order].remove(pos)
+                current_addr = current_addr.min(buddy)
+                current_order += 1
+            } else { break }
+        }
+
+        self.free_lists[current_order].push(current_addr)
+        ok(())
+    }
+
+    fn stats(self) -> AllocStats {
+        let mut free_blocks = 0
+        let mut free_bytes = 0
+        for (order, list) in self.free_lists.iter().enumerate() {
+            free_blocks += list.len()
+            free_bytes += list.len() * Self.block_size(order)
+        }
+        AllocStats {
+            total_bytes: self.total_size,
+            allocated_blocks: self.allocated.len(),
+            free_blocks,
+            free_bytes,
+            allocated_bytes: self.total_size - free_bytes,
+            fragmentation: if self.total_size > 0 {
+                1.0 - (free_bytes as f64 / self.total_size as f64)
+            } else { 0.0 },
+        }
+    }
+}
+
+struct AllocStats {
+    total_bytes: usize,
+    allocated_blocks: usize,
+    free_blocks: usize,
+    free_bytes: usize,
+    allocated_bytes: usize,
+    fragmentation: f64,
+}
+
+fn log2(n: usize) -> usize {
+    let mut result = 0
+    let mut val = n
+    while val > 1 { val >>= 1; result += 1 }
+    result
+}
+
+// ── Slab Allocator ───────────────────────────────────────────────────────────
+struct Slab {
+    base: usize,
+    object_size: usize,
+    capacity: usize,
+    free_list: [usize],  // stack of free slot indices
+    allocated: usize,
+}
+
+impl Slab {
+    fn new(base: usize, slab_size: usize, object_size: usize) -> Slab {
+        assert(object_size >= 8, "object size must be >= 8")
+        let capacity = slab_size / object_size
+        let mut free_list: [usize] = []
+        for i in (0..capacity).rev() { free_list.push(i) }
+        Slab { base, object_size, capacity, free_list, allocated: 0 }
+    }
+
+    fn alloc(mut self) -> Option<usize> {
+        let slot = self.free_list.pop()?
+        self.allocated += 1
+        some(self.base + slot * self.object_size)
+    }
+
+    fn free(mut self, addr: usize) -> Result<(), string> {
+        if addr < self.base { return err("address below slab".to_string()) }
+        let offset = addr - self.base
+        if offset % self.object_size != 0 { return err("unaligned address".to_string()) }
+        let slot = offset / self.object_size
+        if slot >= self.capacity { return err("address beyond slab".to_string()) }
+        self.free_list.push(slot)
+        self.allocated -= 1
+        ok(())
+    }
+
+    fn is_full(self) -> bool { self.free_list.is_empty() }
+    fn is_empty(self) -> bool { self.allocated == 0 }
+    fn usage(self) -> f64 { self.allocated as f64 / self.capacity as f64 }
+}
+
+// ── Slab Cache (manages multiple slabs of same object size) ──────────────────
+struct SlabCache {
+    object_size: usize,
+    slab_size: usize,
+    slabs: [Slab],
+    next_base: usize,
+}
+
+impl SlabCache {
+    fn new(object_size: usize, slab_size: usize) -> SlabCache {
+        SlabCache {
+            object_size, slab_size,
+            slabs: [Slab.new(0, slab_size, object_size)],
+            next_base: slab_size,
+        }
+    }
+
+    fn alloc(mut self) -> usize {
+        // Try existing slabs
+        for slab in &mut self.slabs {
+            if let some(addr) = slab.alloc() { return addr }
+        }
+        // All full, create new slab
+        let mut new_slab = Slab.new(self.next_base, self.slab_size, self.object_size)
+        self.next_base += self.slab_size
+        let addr = new_slab.alloc().unwrap()
+        self.slabs.push(new_slab)
+        addr
+    }
+
+    fn free(mut self, addr: usize) -> Result<(), string> {
+        for slab in &mut self.slabs {
+            if addr >= slab.base && addr < slab.base + self.slab_size {
+                return slab.free(addr)
+            }
+        }
+        err("address not in any slab".to_string())
+    }
+
+    fn total_allocated(self) -> usize { self.slabs.iter().map(|s| s.allocated).sum() }
+    fn total_capacity(self) -> usize { self.slabs.iter().map(|s| s.capacity).sum() }
+    fn slab_count(self) -> usize { self.slabs.len() }
+}
+
+// ── Arena Allocator (bump allocator, no individual free) ─────────────────────
+struct Arena {
+    base: usize,
+    size: usize,
+    offset: usize,
+    alignment: usize,
+}
+
+impl Arena {
+    fn new(base: usize, size: usize) -> Arena {
+        Arena { base, size, offset: 0, alignment: 8 }
+    }
+
+    fn alloc(mut self, size: usize) -> Option<usize> {
+        // Align offset
+        let aligned = (self.offset + self.alignment - 1) & !(self.alignment - 1)
+        if aligned + size > self.size { return none }
+        self.offset = aligned + size
+        some(self.base + aligned)
+    }
+
+    fn reset(mut self) { self.offset = 0 }
+    fn used(self) -> usize { self.offset }
+    fn remaining(self) -> usize { self.size - self.offset }
+}
+
+// ── Free List Allocator ──────────────────────────────────────────────────────
+struct FreeBlock { addr: usize, size: usize }
+
+struct FreeListAllocator {
+    base: usize,
+    size: usize,
+    free_blocks: [FreeBlock],
+    allocated: HashMap<usize, usize>,
+}
+
+impl FreeListAllocator {
+    fn new(base: usize, size: usize) -> FreeListAllocator {
+        FreeListAllocator {
+            base, size,
+            free_blocks: [FreeBlock { addr: base, size }],
+            allocated: HashMap.new(),
+        }
+    }
+
+    fn alloc(mut self, size: usize) -> Option<usize> {
+        // First-fit
+        let align = 8
+        for i in 0..self.free_blocks.len() {
+            let block = &self.free_blocks[i]
+            let aligned = (block.addr + align - 1) & !(align - 1)
+            let padding = aligned - block.addr
+            if block.size >= size + padding {
+                let addr = aligned
+                let remaining = block.size - size - padding
+                if remaining > 0 {
+                    self.free_blocks[i] = FreeBlock { addr: addr + size, size: remaining }
+                } else {
+                    self.free_blocks.remove(i)
+                }
+                self.allocated.insert(addr, size)
+                return some(addr)
+            }
+        }
+        none
+    }
+
+    fn free(mut self, addr: usize) -> Result<(), string> {
+        let size = self.allocated.remove(&addr).ok_or("not allocated".to_string())?
+        self.free_blocks.push(FreeBlock { addr, size })
+        // Merge adjacent blocks
+        self.free_blocks.sort_by_key(|b| b.addr)
+        let mut i = 0
+        while i + 1 < self.free_blocks.len() {
+            if self.free_blocks[i].addr + self.free_blocks[i].size == self.free_blocks[i + 1].addr {
+                self.free_blocks[i].size += self.free_blocks[i + 1].size
+                self.free_blocks.remove(i + 1)
+            } else { i += 1 }
+        }
+        ok(())
+    }
+}
+
+fn main() {
+    // Buddy allocator
+    let mut buddy = BuddyAllocator.new(0x1000, 1024)  // 1KB
+
+    let a1 = buddy.alloc(32).unwrap()
+    let a2 = buddy.alloc(64).unwrap()
+    let a3 = buddy.alloc(16).unwrap()
+    assert(a1 != a2 && a2 != a3)
+    print("Buddy alloc: 0x${a1:x}, 0x${a2:x}, 0x${a3:x} ✓")
+
+    let stats = buddy.stats()
+    assert(stats.allocated_blocks == 3)
+    print("Buddy stats: ${stats.allocated_blocks} blocks, ${stats.allocated_bytes} bytes ✓")
+
+    buddy.free(a2).unwrap()
+    assert(buddy.stats().allocated_blocks == 2)
+    print("Buddy free ✓")
+
+    // Re-allocate same size should reuse
+    let a4 = buddy.alloc(64).unwrap()
+    assert(a4 == a2)  // buddy reuses freed block
+    print("Buddy reuse ✓")
+
+    buddy.free(a1).unwrap()
+    buddy.free(a3).unwrap()
+    buddy.free(a4).unwrap()
+    assert(buddy.stats().allocated_blocks == 0)
+    print("Buddy full coalesce ✓")
+
+    // Slab allocator
+    let mut slab = Slab.new(0x2000, 256, 32)  // 256 bytes, 32-byte objects = 8 slots
+    assert(slab.capacity == 8)
+    let s1 = slab.alloc().unwrap()
+    let s2 = slab.alloc().unwrap()
+    assert(s1 != s2)
+    assert(slab.allocated == 2)
+    print("Slab alloc ✓")
+
+    slab.free(s1).unwrap()
+    assert(slab.allocated == 1)
+    print("Slab free ✓")
+
+    // Slab cache
+    let mut cache = SlabCache.new(64, 512)  // 64-byte objects, 512-byte slabs
+    let mut addrs: [usize] = []
+    for _ in 0..20 { addrs.push(cache.alloc()) }
+    assert(cache.total_allocated() == 20)
+    print("Slab cache: ${cache.slab_count()} slabs, ${cache.total_allocated()} allocated ✓")
+
+    for addr in &addrs { cache.free(*addr).unwrap() }
+    assert(cache.total_allocated() == 0)
+    print("Slab cache free all ✓")
+
+    // Arena allocator
+    let mut arena = Arena.new(0x3000, 1024)
+    let a1 = arena.alloc(100).unwrap()
+    let a2 = arena.alloc(200).unwrap()
+    assert(a2 > a1)
+    assert(arena.used() > 300)
+    print("Arena alloc: used=${arena.used()} ✓")
+
+    arena.reset()
+    assert(arena.used() == 0)
+    print("Arena reset ✓")
+
+    // Free list allocator
+    let mut fl = FreeListAllocator.new(0x4000, 1024)
+    let f1 = fl.alloc(100).unwrap()
+    let f2 = fl.alloc(200).unwrap()
+    fl.free(f1).unwrap()
+    let f3 = fl.alloc(50).unwrap()
+    assert(f3 == f1)  // first-fit reuses freed space
+    print("Free list alloc/free/reuse ✓")
+
+    print("Memory Allocator complete ✓")
+}
