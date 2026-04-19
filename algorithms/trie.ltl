@@ -1,0 +1,93 @@
+// trie.ltl — Trie (prefix tree) for fast string search
+// Run: lateralus run algorithms/trie.ltl
+
+struct TrieNode {
+    children: dict<char, TrieNode>,
+    is_end:   bool,
+}
+
+impl TrieNode {
+    fn new() -> TrieNode {
+        TrieNode { children: {}, is_end: false }
+    }
+}
+
+struct Trie {
+    root: TrieNode,
+}
+
+impl Trie {
+    fn new() -> Trie { Trie { root: TrieNode.new() } }
+
+    fn insert(mut self, word: string) {
+        mut node = self.root
+        for ch in word.chars() {
+            if !node.children.has(ch) {
+                node.children[ch] = TrieNode.new()
+            }
+            node = node.children[ch]
+        }
+        node.is_end = true
+    }
+
+    fn search(self, word: string) -> bool {
+        mut node = self.root
+        for ch in word.chars() {
+            match node.children.get(ch) {
+                none    => return false,
+                some(n) => node = n,
+            }
+        }
+        node.is_end
+    }
+
+    fn starts_with(self, prefix: string) -> bool {
+        mut node = self.root
+        for ch in prefix.chars() {
+            match node.children.get(ch) {
+                none    => return false,
+                some(n) => node = n,
+            }
+        }
+        true
+    }
+
+    fn words_with_prefix(self, prefix: string) -> [string] {
+        mut node = self.root
+        for ch in prefix.chars() {
+            match node.children.get(ch) {
+                none    => return [],
+                some(n) => node = n,
+            }
+        }
+        self.collect(node, prefix)
+    }
+
+    fn collect(self, node: TrieNode, prefix: string) -> [string] {
+        mut results = []
+        if node.is_end { results.push(prefix) }
+        for (ch, child) in node.children {
+            results.extend(self.collect(child, prefix + ch))
+        }
+        results
+    }
+}
+
+fn main() {
+    mut t = Trie.new()
+    ["apple", "app", "apply", "application", "apt", "banana", "band", "bandana"]
+        |> each(w => t.insert(w))
+
+    print("search 'app':         ${t.search("app")}")
+    print("search 'ap':          ${t.search("ap")}")
+    print("starts_with 'app':    ${t.starts_with("app")}")
+    print("starts_with 'xyz':    ${t.starts_with("xyz")}")
+
+    let words = t.words_with_prefix("app")
+    print("words with 'app':     ${words}")
+
+    let ban = t.words_with_prefix("ban")
+    print("words with 'ban':     ${ban}")
+}
+
+main()
