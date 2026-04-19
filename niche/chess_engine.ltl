@@ -1,0 +1,262 @@
+// Niche Example - Chess Engine
+// Board representation, move generation, minimax with alpha-beta pruning.
+
+#[derive(Clone, Copy, PartialEq)]
+enum Piece { Pawn, Knight, Bishop, Rook, Queen, King }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Color { White, Black }
+
+impl Color {
+    fn opposite(self) -> Color { match self { Color.White => Color.Black, Color.Black => Color.White } }
+}
+
+#[derive(Clone, Copy)]
+struct Square { piece: Option<(Piece, Color)> }
+
+struct Board {
+    squares: [Square; 64],
+    turn: Color,
+    castling: [bool; 4],   // KQkq
+    en_passant: Option<usize>,
+    halfmove: u32,
+    fullmove: u32,
+}
+
+impl Board {
+    fn new() -> Board {
+        let mut squares = [Square { piece: none }; 64]
+        let back_rank = [Piece.Rook, Piece.Knight, Piece.Bishop, Piece.Queen, Piece.King, Piece.Bishop, Piece.Knight, Piece.Rook]
+        for i in 0..8 {
+            squares[i] = Square { piece: some((back_rank[i], Color.White)) }
+            squares[8 + i] = Square { piece: some((Piece.Pawn, Color.White)) }
+            squares[48 + i] = Square { piece: some((Piece.Pawn, Color.Black)) }
+            squares[56 + i] = Square { piece: some((back_rank[i], Color.Black)) }
+        }
+        Board { squares, turn: Color.White, castling: [true; 4], en_passant: none, halfmove: 0, fullmove: 1 }
+    }
+
+    fn at(self, sq: usize) -> Option<(Piece, Color)> { self.squares[sq].piece }
+    fn rank(sq: usize) -> usize { sq / 8 }
+    fn file(sq: usize) -> usize { sq % 8 }
+    fn sq(rank: usize, file: usize) -> usize { rank * 8 + file }
+
+    fn is_valid(rank: i32, file: i32) -> bool { rank >= 0 && rank < 8 && file >= 0 && file < 8 }
+
+    fn generate_moves(self) -> [Move] {
+        let mut moves: [Move] = []
+        for from in 0..64 {
+            if let some((piece, color)) = self.at(from) {
+                if color != self.turn { continue }
+                match piece {
+                    Piece.Pawn => self.gen_pawn_moves(from, color, &mut moves),
+                    Piece.Knight => self.gen_knight_moves(from, color, &mut moves),
+                    Piece.Bishop => self.gen_sliding_moves(from, color, &BISHOP_DIRS, &mut moves),
+                    Piece.Rook => self.gen_sliding_moves(from, color, &ROOK_DIRS, &mut moves),
+                    Piece.Queen => { self.gen_sliding_moves(from, color, &BISHOP_DIRS, &mut moves); self.gen_sliding_moves(from, color, &ROOK_DIRS, &mut moves) }
+                    Piece.King => self.gen_king_moves(from, color, &mut moves),
+                }
+            }
+        }
+        moves
+    }
+
+    fn gen_pawn_moves(self, from: usize, color: Color, moves: &mut [Move]) {
+        let dir: i32 = if color == Color.White { 1 } else { -1 }
+        let r = Board.rank(from) as i32; let f = Board.file(from) as i32
+        let fwd = r + dir
+        if Board.is_valid(fwd, f) {
+            let to = Board.sq(fwd as usize, f as usize)
+            if self.at(to).is_none() {
+                if fwd == 0 || fwd == 7 {
+                    for promo in [Piece.Queen, Piece.Rook, Piece.Bishop, Piece.Knight] {
+                        moves.push(Move { from, to, promotion: some(promo) })
+                    }
+                } else {
+                    moves.push(Move.simple(from, to))
+                    // Double push
+                    let start_rank = if color == Color.White { 1 } else { 6 }
+                    if r == start_rank as i32 {
+                        let dbl = Board.sq((r + 2 * dir) as usize, f as usize)
+                        if self.at(dbl).is_none() { moves.push(Move.simple(from, dbl)) }
+                    }
+                }
+            }
+        }
+        // Captures
+        for df in [-1i32, 1] {
+            let nf = f + df
+            if Board.is_valid(fwd, nf) {
+                let to = Board.sq(fwd as usize, nf as usize)
+                let can_capture = match self.at(to) {
+                    some((_, c)) => c != color,
+                    none => self.en_passant == some(to),
+                }
+                if can_capture { moves.push(Move.simple(from, to)) }
+            }
+        }
+    }
+
+    fn gen_knight_moves(self, from: usize, color: Color, moves: &mut [Move]) {
+        let r = Board.rank(from) as i32; let f = Board.file(from) as i32
+        for (dr, df) in KNIGHT_OFFSETS {
+            let nr = r + dr; let nf = f + df
+            if Board.is_valid(nr, nf) {
+                let to = Board.sq(nr as usize, nf as usize)
+                match self.at(to) {
+                    some((_, c)) if c == color => {}
+                    _ => moves.push(Move.simple(from, to)),
+                }
+            }
+        }
+    }
+
+    fn gen_sliding_moves(self, from: usize, color: Color, dirs: &[(i32, i32)], moves: &mut [Move]) {
+        let r = Board.rank(from) as i32; let f = Board.file(from) as i32
+        for (dr, df) in dirs {
+            let mut nr = r + dr; let mut nf = f + df
+            while Board.is_valid(nr, nf) {
+                let to = Board.sq(nr as usize, nf as usize)
+                match self.at(to) {
+                    some((_, c)) => { if c != color { moves.push(Move.simple(from, to)) }; break }
+                    none => moves.push(Move.simple(from, to)),
+                }
+                nr += dr; nf += df
+            }
+        }
+    }
+
+    fn gen_king_moves(self, from: usize, color: Color, moves: &mut [Move]) {
+        let r = Board.rank(from) as i32; let f = Board.file(from) as i32
+        for dr in -1..=1 {
+            for df in -1..=1 {
+                if dr == 0 && df == 0 { continue }
+                let nr = r + dr; let nf = f + df
+                if Board.is_valid(nr, nf) {
+                    let to = Board.sq(nr as usize, nf as usize)
+                    match self.at(to) { some((_, c)) if c == color => {} _ => moves.push(Move.simple(from, to)) }
+                }
+            }
+        }
+    }
+
+    fn make_move(self, m: &Move) -> Board {
+        let mut new = self.clone()
+        let piece = new.squares[m.from].piece.take()
+        new.squares[m.to].piece = match m.promotion {
+            some(p) => some((p, self.turn)),
+            none => piece,
+        }
+        new.turn = self.turn.opposite()
+        if self.turn == Color.Black { new.fullmove += 1 }
+        new
+    }
+
+    fn evaluate(self) -> i32 {
+        let mut score = 0i32
+        for sq in 0..64 {
+            if let some((piece, color)) = self.at(sq) {
+                let value = match piece {
+                    Piece.Pawn => 100, Piece.Knight => 320, Piece.Bishop => 330,
+                    Piece.Rook => 500, Piece.Queen => 900, Piece.King => 20000,
+                }
+                score += if color == Color.White { value } else { -value }
+            }
+        }
+        score
+    }
+
+    fn find_king(self, color: Color) -> Option<usize> {
+        for i in 0..64 { if self.at(i) == some((Piece.King, color)) { return some(i) } }
+        none
+    }
+}
+
+const KNIGHT_OFFSETS: [(i32, i32); 8] = [(-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)]
+const BISHOP_DIRS: [(i32, i32); 4] = [(-1,-1),(-1,1),(1,-1),(1,1)]
+const ROOK_DIRS: [(i32, i32); 4] = [(-1,0),(1,0),(0,-1),(0,1)]
+
+struct Move { from: usize, to: usize, promotion: Option<Piece> }
+impl Move { fn simple(from: usize, to: usize) -> Move { Move { from, to, promotion: none } } }
+
+fn minimax(board: &Board, depth: u32, alpha: i32, beta: i32, maximizing: bool) -> i32 {
+    if depth == 0 { return board.evaluate() }
+    let moves = board.generate_moves()
+    if moves.is_empty() { return if maximizing { -99999 } else { 99999 } }
+
+    let mut a = alpha; let mut b = beta
+    if maximizing {
+        let mut best = -99999
+        for m in &moves {
+            let child = board.make_move(m)
+            let score = minimax(&child, depth - 1, a, b, false)
+            best = best.max(score)
+            a = a.max(score)
+            if b <= a { break }
+        }
+        best
+    } else {
+        let mut best = 99999
+        for m in &moves {
+            let child = board.make_move(m)
+            let score = minimax(&child, depth - 1, a, b, true)
+            best = best.min(score)
+            b = b.min(score)
+            if b <= a { break }
+        }
+        best
+    }
+}
+
+fn best_move(board: &Board, depth: u32) -> Option<Move> {
+    let moves = board.generate_moves()
+    let maximizing = board.turn == Color.White
+    let mut best_score = if maximizing { -99999 } else { 99999 }
+    let mut best: Option<Move> = none
+
+    for m in &moves {
+        let child = board.make_move(m)
+        let score = minimax(&child, depth - 1, -99999, 99999, !maximizing)
+        if (maximizing && score > best_score) || (!maximizing && score < best_score) {
+            best_score = score
+            best = some(m.clone())
+        }
+    }
+    best
+}
+
+fn main() {
+    let board = Board.new()
+    assert(board.turn == Color.White)
+    assert(board.at(0) == some((Piece.Rook, Color.White)))
+    assert(board.at(4) == some((Piece.King, Color.White)))
+    assert(board.at(60) == some((Piece.King, Color.Black)))
+    print("Board init \u2713")
+
+    let moves = board.generate_moves()
+    assert(moves.len() == 20)  // 16 pawn + 4 knight
+    print("Move gen (20 initial moves) \u2713")
+
+    let eval = board.evaluate()
+    assert(eval == 0)  // symmetric start
+    print("Evaluation \u2713")
+
+    // Make e2-e4
+    let e2e4 = Move.simple(Board.sq(1, 4), Board.sq(3, 4))
+    let after = board.make_move(&e2e4)
+    assert(after.turn == Color.Black)
+    assert(after.at(Board.sq(3, 4)) == some((Piece.Pawn, Color.White)))
+    assert(after.at(Board.sq(1, 4)).is_none())
+    print("Make move \u2713")
+
+    let bm = best_move(&board, 2)
+    assert(bm.is_some())
+    print("Best move (depth 2) \u2713")
+
+    // King finding
+    assert(board.find_king(Color.White) == some(4))
+    assert(board.find_king(Color.Black) == some(60))
+    print("Find king \u2713")
+
+    print("Chess Engine complete \u2713")
+}
