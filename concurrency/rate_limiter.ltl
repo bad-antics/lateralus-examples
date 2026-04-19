@@ -1,0 +1,86 @@
+// rate_limiter.ltl — Token bucket rate limiter
+// Run: lateralus run concurrency/rate_limiter.ltl
+
+use std.time.{Instant, Duration}
+use std.async.{sleep, spawn}
+use std.sync.{Arc, Mutex}
+
+struct TokenBucket {
+    capacity:    float,
+    tokens:      float,
+    refill_rate: float,      // tokens per second
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: float, refill_rate: float) -> Arc<Mutex<TokenBucket>> {
+        Arc.new(Mutex.new(TokenBucket {
+            capacity,
+            tokens: capacity,
+            refill_rate,
+            last_refill: Instant.now(),
+        }))
+    }
+
+    fn refill(mut self) {
+        let now     = Instant.now()
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64()
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity)
+        self.last_refill = now
+    }
+
+    fn try_consume(mut self, cost: float) -> bool {
+        self.refill()
+        if self.tokens >= cost {
+            self.tokens -= cost
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct RateLimiter {
+    bucket: Arc<Mutex<TokenBucket>>,
+}
+
+impl RateLimiter {
+    fn new(requests_per_sec: float, burst: float) -> RateLimiter {
+        RateLimiter { bucket: TokenBucket.new(burst, requests_per_sec) }
+    }
+
+    fn allow(self) -> bool {
+        self.bucket.lock().try_consume(1.0)
+    }
+
+    async fn wait(self) {
+        while !self.allow() {
+            await sleep(Duration.ms(10))
+        }
+    }
+}
+
+async fn main() {
+    let limiter = RateLimiter.new(5.0, 10.0)  // 5 req/s, burst 10
+
+    let mut allowed  = 0
+    let mut rejected = 0
+    let start = Instant.now()
+
+    // Fire 20 requests instantly
+    for _ in range(0, 20) {
+        if limiter.allow() { allowed += 1 } else { rejected += 1 }
+    }
+
+    print("Immediate: ${allowed} allowed, ${rejected} rejected")
+
+    // Wait and try again
+    await sleep(Duration.ms(1000))
+    allowed = 0
+    for _ in range(0, 10) {
+        if limiter.allow() { allowed += 1 }
+    }
+    print("After 1s refill: ${allowed} allowed")
+}
+
+main()
