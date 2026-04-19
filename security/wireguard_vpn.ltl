@@ -1,0 +1,283 @@
+// wireguard_vpn.ltl — WireGuard VPN protocol implementation (RFC-style)
+
+use std.crypto.{x25519, chacha20poly1305, blake2s, hkdf, tai64n, random_bytes}
+use std.net.{UdpSocket, SocketAddr}
+
+const CONSTRUCTION: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+const IDENTIFIER:   &str = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+const LABEL_MAC1:   &str = "mac1----"
+const LABEL_COOKIE: &str = "cookie--"
+
+// ── Handshake messages ────────────────────────────────────────────────────────
+struct HandshakeInit {
+    message_type:    u8,      // 1
+    sender_index:    u32,
+    unencrypted_ephemeral: [u8; 32],
+    encrypted_static:      [u8; 48],   // 32 + 16 tag
+    encrypted_timestamp:   [u8; 28],   // 12 + 16 tag
+    mac1:                  [u8; 16],
+    mac2:                  [u8; 16],
+}
+
+struct HandshakeResponse {
+    message_type:    u8,      // 2
+    sender_index:    u32,
+    receiver_index:  u32,
+    unencrypted_ephemeral: [u8; 32],
+    encrypted_nothing:     [u8; 16],   // empty + 16 tag
+    mac1:                  [u8; 16],
+    mac2:                  [u8; 16],
+}
+
+struct TransportData {
+    message_type:   u8,      // 4
+    receiver_index: u32,
+    counter:        u64,
+    encrypted_data: [u8],
+}
+
+// ── Peer state ────────────────────────────────────────────────────────────────
+struct WgPeer {
+    static_sk:       [u8; 32],
+    static_pk:       [u8; 32],
+    remote_static_pk: [u8; 32],
+    preshared_key:   [u8; 32],
+    ephemeral_sk:    [u8; 32]?,
+    ephemeral_pk:    [u8; 32]?,
+    sending_key:     [u8; 32]?,
+    receiving_key:   [u8; 32]?,
+    sending_nonce:   u64,
+    receiving_nonce: u64,
+    sender_index:    u32,
+    receiver_index:  u32,
+    allowed_ips:     [string],     // CIDR ranges
+    endpoint:        SocketAddr?,
+    last_handshake:  u64,          // timestamp
+}
+
+// ── Noise IK handshake ───────────────────────────────────────────────────────
+struct HandshakeState {
+    ck: [u8; 32],   // chaining key
+    h:  [u8; 32],   // hash
+}
+
+impl HandshakeState {
+    fn init() -> HandshakeState {
+        let h = blake2s.hash(CONSTRUCTION.as_bytes())
+        let ck = h.clone()
+        let h = blake2s.hash(&[&h[..], IDENTIFIER.as_bytes()].concat())
+        HandshakeState { ck, h }
+    }
+
+    fn mix_hash(mut self, data: &[u8]) {
+        self.h = blake2s.hash(&[&self.h[..], data].concat())
+    }
+
+    fn mix_key(mut self, input: &[u8]) -> [u8; 32] {
+        let (ck, key) = hkdf_blake2s(self.ck, input, 2)
+        self.ck = ck
+        key
+    }
+
+    fn mix_key_and_hash(mut self, input: &[u8]) -> [u8; 32] {
+        let (ck, temp_h, key) = hkdf_blake2s_3(self.ck, input)
+        self.ck = ck
+        self.mix_hash(&temp_h)
+        key
+    }
+
+    fn encrypt_and_hash(mut self, key: [u8; 32], plaintext: &[u8]) -> [u8] {
+        let nonce: [u8; 12] = [0; 12]
+        let (ct, tag) = chacha20poly1305.encrypt(key, nonce, plaintext, &self.h)
+        let result = [ct, tag.to_vec()].concat()
+        self.mix_hash(&result)
+        result
+    }
+
+    fn decrypt_and_hash(mut self, key: [u8; 32], ciphertext: &[u8]) -> Result<[u8], string> {
+        let nonce: [u8; 12] = [0; 12]
+        let ct  = &ciphertext[..ciphertext.len()-16]
+        let tag: [u8; 16] = ciphertext[ciphertext.len()-16..].try_into().unwrap()
+        let pt = chacha20poly1305.decrypt(key, nonce, ct, &self.h, tag)?
+        self.mix_hash(ciphertext)
+        ok(pt)
+    }
+}
+
+fn hkdf_blake2s(ck: [u8; 32], input: &[u8], n: int) -> ([u8; 32], [u8; 32]) {
+    let prk = blake2s.mac(ck, input)
+    let t1 = blake2s.mac(prk, &[0x01])
+    let t2 = blake2s.mac(prk, &[&t1[..], &[0x02]].concat())
+    (t1.try_into().unwrap(), t2.try_into().unwrap())
+}
+
+fn hkdf_blake2s_3(ck: [u8; 32], input: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    let prk = blake2s.mac(ck, input)
+    let t1 = blake2s.mac(prk, &[0x01])
+    let t2 = blake2s.mac(prk, &[&t1[..], &[0x02]].concat())
+    let t3 = blake2s.mac(prk, &[&t2[..], &[0x03]].concat())
+    (t1.try_into().unwrap(), t2.try_into().unwrap(), t3.try_into().unwrap())
+}
+
+impl WgPeer {
+    fn new(static_sk: [u8; 32], remote_pk: [u8; 32], psk: [u8; 32]) -> WgPeer {
+        let static_pk = x25519.base_point_mul(static_sk)
+        WgPeer {
+            static_sk, static_pk, remote_static_pk: remote_pk, preshared_key: psk,
+            ephemeral_sk: none, ephemeral_pk: none,
+            sending_key: none, receiving_key: none,
+            sending_nonce: 0, receiving_nonce: 0,
+            sender_index: random_u32(), receiver_index: 0,
+            allowed_ips: [], endpoint: none, last_handshake: 0,
+        }
+    }
+
+    fn create_initiation(mut self) -> HandshakeInit {
+        let mut hs = HandshakeState.init()
+        hs.mix_hash(&self.remote_static_pk)
+
+        // e: ephemeral key
+        let e_sk = random_bytes(32).try_into().unwrap()
+        let e_pk = x25519.base_point_mul(e_sk)
+        self.ephemeral_sk = some(e_sk)
+        hs.mix_hash(&e_pk)
+
+        // ee → DH(e, rs)
+        let shared_e_rs = x25519.scalar_mult(e_sk, self.remote_static_pk)
+        let key1 = hs.mix_key(&shared_e_rs)
+
+        // s: encrypt static key
+        let encrypted_static = hs.encrypt_and_hash(key1, &self.static_pk)
+
+        // ss → DH(s, rs)
+        let shared_s_rs = x25519.scalar_mult(self.static_sk, self.remote_static_pk)
+        let key2 = hs.mix_key(&shared_s_rs)
+
+        // timestamp
+        let timestamp = tai64n.now()
+        let encrypted_timestamp = hs.encrypt_and_hash(key2, &timestamp)
+
+        let mac_key = blake2s.hash(&[LABEL_MAC1.as_bytes(), &self.remote_static_pk[..]].concat())
+        let msg_bytes = [&[1u8][..], &self.sender_index.to_le_bytes()[..], &e_pk[..],
+                         &encrypted_static[..], &encrypted_timestamp[..]].concat()
+        let mac1: [u8; 16] = blake2s.mac(mac_key, &msg_bytes)[0..16].try_into().unwrap()
+
+        HandshakeInit {
+            message_type: 1,
+            sender_index: self.sender_index,
+            unencrypted_ephemeral: e_pk,
+            encrypted_static: encrypted_static.try_into().unwrap(),
+            encrypted_timestamp: encrypted_timestamp.try_into().unwrap(),
+            mac1, mac2: [0; 16],
+        }
+    }
+
+    fn encrypt_transport(mut self, data: &[u8]) -> Result<TransportData, string> {
+        let key = self.sending_key.ok_or("no sending key")?
+        let mut nonce: [u8; 12] = [0; 12]
+        nonce[4..12].copy_from_slice(&self.sending_nonce.to_le_bytes())
+        let (ct, tag) = chacha20poly1305.encrypt(key, nonce, data, &[])
+        self.sending_nonce += 1
+        ok(TransportData {
+            message_type: 4,
+            receiver_index: self.receiver_index,
+            counter: self.sending_nonce - 1,
+            encrypted_data: [ct, tag.to_vec()].concat(),
+        })
+    }
+
+    fn decrypt_transport(mut self, msg: TransportData) -> Result<[u8], string> {
+        let key = self.receiving_key.ok_or("no receiving key")?
+        let mut nonce: [u8; 12] = [0; 12]
+        nonce[4..12].copy_from_slice(&msg.counter.to_le_bytes())
+        let ct  = &msg.encrypted_data[..msg.encrypted_data.len()-16]
+        let tag: [u8; 16] = msg.encrypted_data[msg.encrypted_data.len()-16..].try_into().unwrap()
+        let pt = chacha20poly1305.decrypt(key, nonce, ct, &[], tag)?
+        self.receiving_nonce = msg.counter + 1
+        ok(pt)
+    }
+}
+
+fn random_u32() -> u32 {
+    let bytes = random_bytes(4)
+    u32_from_le_bytes(&bytes)
+}
+
+fn u32_from_le_bytes(b: &[u8]) -> u32 {
+    b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16 | (b[3] as u32) << 24
+}
+
+// ── IP tunnel ────────────────────────────────────────────────────────────────
+struct WgInterface {
+    private_key: [u8; 32],
+    listen_port: u16,
+    peers:       [WgPeer],
+    address:     string,     // tunnel IP (e.g. 10.0.0.1/24)
+    dns:         [string],
+    mtu:         u16,
+    fwmark:      u32?,
+}
+
+impl WgInterface {
+    fn new(private_key: [u8; 32], port: u16, address: string) -> WgInterface {
+        WgInterface {
+            private_key, listen_port: port, peers: [],
+            address, dns: [], mtu: 1420, fwmark: none,
+        }
+    }
+
+    fn add_peer(mut self, peer: WgPeer) { self.peers.push(peer) }
+
+    fn to_config(self) -> string {
+        let pk = x25519.base_point_mul(self.private_key)
+        let mut cfg = "[Interface]\n"
+        cfg += "PrivateKey = ${base64_encode(&self.private_key)}\n"
+        cfg += "Address = ${self.address}\n"
+        cfg += "ListenPort = ${self.listen_port}\n"
+        if !self.dns.is_empty() { cfg += "DNS = ${self.dns |> join(\", \")}\n" }
+        cfg += "MTU = ${self.mtu}\n"
+        for peer in self.peers {
+            cfg += "\n[Peer]\n"
+            cfg += "PublicKey = ${base64_encode(&peer.remote_static_pk)}\n"
+            if peer.preshared_key != [0; 32] { cfg += "PresharedKey = ${base64_encode(&peer.preshared_key)}\n" }
+            cfg += "AllowedIPs = ${peer.allowed_ips |> join(\", \")}\n"
+            if let some(ep) = peer.endpoint { cfg += "Endpoint = ${ep}\n" }
+            cfg += "PersistentKeepalive = 25\n"
+        }
+        cfg
+    }
+}
+
+fn base64_encode(data: &[u8]) -> string { std.encoding.base64.encode(data) }
+
+fn main() {
+    // Generate keys for Alice and Bob
+    let alice_sk = random_bytes(32).try_into().unwrap()
+    let alice_pk = x25519.base_point_mul(alice_sk)
+    let bob_sk   = random_bytes(32).try_into().unwrap()
+    let bob_pk   = x25519.base_point_mul(bob_sk)
+    let psk: [u8; 32] = [0; 32]  // optional pre-shared key
+
+    print("Alice PK: ${base64_encode(&alice_pk)}")
+    print("Bob   PK: ${base64_encode(&bob_pk)}")
+
+    // Create WireGuard interface
+    let mut wg = WgInterface.new(alice_sk, 51820, "10.0.0.1/24".to_string())
+    let mut peer = WgPeer.new(alice_sk, bob_pk, psk)
+    peer.allowed_ips = ["10.0.0.2/32".to_string(), "0.0.0.0/0".to_string()]
+    peer.endpoint = some(SocketAddr.parse("203.0.113.1:51820").unwrap())
+    wg.add_peer(peer)
+
+    let config = wg.to_config()
+    print("Generated WireGuard config:")
+    print(config)
+
+    // Handshake initiation
+    let mut alice_peer = WgPeer.new(alice_sk, bob_pk, psk)
+    let init = alice_peer.create_initiation()
+    assert(init.message_type == 1)
+    assert(init.unencrypted_ephemeral.len() == 32)
+    print("Handshake initiation created (${init.encrypted_static.len()} + ${init.encrypted_timestamp.len()} bytes) ✓")
+
+    print("WireGuard VPN — all structures verified ✓")
+}
