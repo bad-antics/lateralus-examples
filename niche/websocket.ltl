@@ -1,0 +1,452 @@
+// Niche Example — WebSocket Protocol (RFC 6455)
+// Frame encoding/decoding, handshake, ping/pong, close frames.
+
+use std.collections.HashMap
+use std.io.{Read, Write}
+use std.crypto.sha1
+use std.encoding.base64
+
+// ── WebSocket Constants ──────────────────────────────────────────────────────
+const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024  // 16MB
+
+enum Opcode {
+    Continuation = 0x0,
+    Text = 0x1,
+    Binary = 0x2,
+    Close = 0x8,
+    Ping = 0x9,
+    Pong = 0xA,
+}
+
+impl Opcode {
+    fn from_u8(val: u8) -> Option<Opcode> {
+        match val {
+            0x0 => some(Opcode.Continuation), 0x1 => some(Opcode.Text),
+            0x2 => some(Opcode.Binary), 0x8 => some(Opcode.Close),
+            0x9 => some(Opcode.Ping), 0xA => some(Opcode.Pong),
+            _ => none,
+        }
+    }
+
+    fn is_control(self) -> bool { (self as u8) >= 0x8 }
+}
+
+// ── WebSocket Frame ──────────────────────────────────────────────────────────
+struct Frame {
+    fin: bool,
+    rsv1: bool,
+    rsv2: bool,
+    rsv3: bool,
+    opcode: Opcode,
+    masked: bool,
+    mask_key: [u8; 4],
+    payload: [u8],
+}
+
+impl Frame {
+    fn new_text(text: &str) -> Frame {
+        Frame {
+            fin: true, rsv1: false, rsv2: false, rsv3: false,
+            opcode: Opcode.Text, masked: false, mask_key: [0; 4],
+            payload: text.as_bytes().to_vec(),
+        }
+    }
+
+    fn new_binary(data: &[u8]) -> Frame {
+        Frame {
+            fin: true, rsv1: false, rsv2: false, rsv3: false,
+            opcode: Opcode.Binary, masked: false, mask_key: [0; 4],
+            payload: data.to_vec(),
+        }
+    }
+
+    fn new_close(code: u16, reason: &str) -> Frame {
+        let mut payload: [u8] = []
+        payload.extend_from_slice(&code.to_be_bytes())
+        payload.extend_from_slice(reason.as_bytes())
+        Frame {
+            fin: true, rsv1: false, rsv2: false, rsv3: false,
+            opcode: Opcode.Close, masked: false, mask_key: [0; 4],
+            payload,
+        }
+    }
+
+    fn new_ping(data: &[u8]) -> Frame {
+        Frame {
+            fin: true, rsv1: false, rsv2: false, rsv3: false,
+            opcode: Opcode.Ping, masked: false, mask_key: [0; 4],
+            payload: data.to_vec(),
+        }
+    }
+
+    fn new_pong(data: &[u8]) -> Frame {
+        Frame {
+            fin: true, rsv1: false, rsv2: false, rsv3: false,
+            opcode: Opcode.Pong, masked: false, mask_key: [0; 4],
+            payload: data.to_vec(),
+        }
+    }
+
+    fn apply_mask(mut self) {
+        if !self.masked { return }
+        for i in 0..self.payload.len() {
+            self.payload[i] ^= self.mask_key[i % 4]
+        }
+    }
+
+    fn encode(self) -> [u8] {
+        let mut buf: [u8] = []
+
+        // First byte: FIN + RSV + opcode
+        let mut b0: u8 = self.opcode as u8
+        if self.fin { b0 |= 0x80 }
+        if self.rsv1 { b0 |= 0x40 }
+        if self.rsv2 { b0 |= 0x20 }
+        if self.rsv3 { b0 |= 0x10 }
+        buf.push(b0)
+
+        // Second byte: MASK + payload length
+        let len = self.payload.len()
+        let mask_bit: u8 = if self.masked { 0x80 } else { 0 }
+
+        if len < 126 {
+            buf.push(mask_bit | len as u8)
+        } else if len < 65536 {
+            buf.push(mask_bit | 126)
+            buf.extend_from_slice(&(len as u16).to_be_bytes())
+        } else {
+            buf.push(mask_bit | 127)
+            buf.extend_from_slice(&(len as u64).to_be_bytes())
+        }
+
+        // Mask key
+        if self.masked { buf.extend_from_slice(&self.mask_key) }
+
+        // Payload (masked if needed)
+        if self.masked {
+            for i in 0..self.payload.len() {
+                buf.push(self.payload[i] ^ self.mask_key[i % 4])
+            }
+        } else {
+            buf.extend_from_slice(&self.payload)
+        }
+
+        buf
+    }
+
+    fn decode(data: &[u8]) -> Result<(Frame, usize), string> {
+        if data.len() < 2 { return err("frame too short".to_string()) }
+
+        let b0 = data[0]
+        let b1 = data[1]
+
+        let fin = b0 & 0x80 != 0
+        let rsv1 = b0 & 0x40 != 0
+        let rsv2 = b0 & 0x20 != 0
+        let rsv3 = b0 & 0x10 != 0
+        let opcode = Opcode.from_u8(b0 & 0x0F).ok_or("invalid opcode".to_string())?
+
+        let masked = b1 & 0x80 != 0
+        let mut payload_len = (b1 & 0x7F) as u64
+        let mut offset = 2usize
+
+        if payload_len == 126 {
+            if data.len() < offset + 2 { return err("incomplete length".to_string()) }
+            payload_len = u16.from_be_bytes([data[offset], data[offset + 1]]) as u64
+            offset += 2
+        } else if payload_len == 127 {
+            if data.len() < offset + 8 { return err("incomplete length".to_string()) }
+            payload_len = u64.from_be_bytes([
+                data[offset], data[offset+1], data[offset+2], data[offset+3],
+                data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            ])
+            offset += 8
+        }
+
+        if payload_len > MAX_FRAME_SIZE as u64 { return err("frame too large".to_string()) }
+
+        let mut mask_key = [0u8; 4]
+        if masked {
+            if data.len() < offset + 4 { return err("incomplete mask".to_string()) }
+            mask_key.copy_from_slice(&data[offset..offset + 4])
+            offset += 4
+        }
+
+        let plen = payload_len as usize
+        if data.len() < offset + plen { return err("incomplete payload".to_string()) }
+
+        let mut payload = data[offset..offset + plen].to_vec()
+        if masked {
+            for i in 0..payload.len() { payload[i] ^= mask_key[i % 4] }
+        }
+
+        let total = offset + plen
+        ok((Frame { fin, rsv1, rsv2, rsv3, opcode, masked, mask_key, payload }, total))
+    }
+
+    fn close_code(self) -> Option<u16> {
+        if self.payload.len() >= 2 {
+            some(u16.from_be_bytes([self.payload[0], self.payload[1]]))
+        } else { none }
+    }
+
+    fn close_reason(self) -> Option<string> {
+        if self.payload.len() > 2 {
+            some(string.from_utf8_lossy(&self.payload[2..]).to_string())
+        } else { none }
+    }
+
+    fn as_text(self) -> Result<string, string> {
+        string.from_utf8(self.payload.clone()).map_err(|e| e.to_string())
+    }
+}
+
+// ── Handshake ────────────────────────────────────────────────────────────────
+struct HandshakeRequest {
+    path: string,
+    host: string,
+    key: string,
+    version: u32,
+    protocols: [string],
+    extensions: [string],
+}
+
+impl HandshakeRequest {
+    fn build(host: &str, path: &str, key: &str) -> string {
+        let mut req = format!("GET {path} HTTP/1.1\r\n")
+        req.push_str(&format!("Host: {host}\r\n"))
+        req.push_str("Upgrade: websocket\r\n")
+        req.push_str("Connection: Upgrade\r\n")
+        req.push_str(&format!("Sec-WebSocket-Key: {key}\r\n"))
+        req.push_str("Sec-WebSocket-Version: 13\r\n")
+        req.push_str("\r\n")
+        req
+    }
+
+    fn parse(data: &str) -> Result<HandshakeRequest, string> {
+        let lines: [&str] = data.split("\r\n").collect()
+        if lines.is_empty() { return err("empty request".to_string()) }
+
+        let first_line: [&str] = lines[0].split(' ').collect()
+        if first_line.len() < 2 { return err("invalid request line".to_string()) }
+        let path = first_line[1].to_string()
+
+        let mut headers: HashMap<string, string> = HashMap.new()
+        for line in &lines[1..] {
+            if line.is_empty() { break }
+            if let some(colon) = line.find(':') {
+                let key = line[..colon].trim().to_lowercase()
+                let value = line[colon + 1..].trim().to_string()
+                headers.insert(key, value)
+            }
+        }
+
+        let host = headers.get("host").cloned().unwrap_or_default()
+        let key = headers.get("sec-websocket-key").cloned().ok_or("missing key".to_string())?
+        let version: u32 = headers.get("sec-websocket-version").and_then(|v| v.parse().ok()).unwrap_or(13)
+        let protocols = headers.get("sec-websocket-protocol")
+            .map(|p| p.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default()
+
+        ok(HandshakeRequest { path, host, key, version, protocols, extensions: [] })
+    }
+}
+
+struct HandshakeResponse {
+    accept_key: string,
+    protocol: Option<string>,
+}
+
+impl HandshakeResponse {
+    fn compute_accept(key: &str) -> string {
+        let combined = format!("{key}{WS_MAGIC}")
+        let hash = sha1.hash(combined.as_bytes())
+        base64.encode(&hash)
+    }
+
+    fn build(accept_key: &str, protocol: Option<&str>) -> string {
+        let mut resp = "HTTP/1.1 101 Switching Protocols\r\n".to_string()
+        resp.push_str("Upgrade: websocket\r\n")
+        resp.push_str("Connection: Upgrade\r\n")
+        resp.push_str(&format!("Sec-WebSocket-Accept: {accept_key}\r\n"))
+        if let some(proto) = protocol {
+            resp.push_str(&format!("Sec-WebSocket-Protocol: {proto}\r\n"))
+        }
+        resp.push_str("\r\n")
+        resp
+    }
+}
+
+// ── Close Codes ──────────────────────────────────────────────────────────────
+enum CloseCode {
+    Normal = 1000,
+    GoingAway = 1001,
+    ProtocolError = 1002,
+    Unsupported = 1003,
+    NoStatus = 1005,
+    Abnormal = 1006,
+    InvalidData = 1007,
+    PolicyViolation = 1008,
+    TooLarge = 1009,
+    MandatoryExtension = 1010,
+    InternalError = 1011,
+    TlsHandshake = 1015,
+}
+
+// ── Message (reassembled from frames) ────────────────────────────────────────
+enum WsMessage {
+    Text(string),
+    Binary([u8]),
+    Ping([u8]),
+    Pong([u8]),
+    Close(Option<u16>, Option<string>),
+}
+
+struct MessageAssembler {
+    fragments: [Frame],
+    opcode: Option<Opcode>,
+}
+
+impl MessageAssembler {
+    fn new() -> MessageAssembler { MessageAssembler { fragments: [], opcode: none } }
+
+    fn feed(mut self, frame: Frame) -> Result<Option<WsMessage>, string> {
+        if frame.opcode.is_control() {
+            if !frame.fin { return err("fragmented control frame".to_string()) }
+            return match frame.opcode {
+                Opcode.Ping => ok(some(WsMessage.Ping(frame.payload.clone()))),
+                Opcode.Pong => ok(some(WsMessage.Pong(frame.payload.clone()))),
+                Opcode.Close => {
+                    let code = frame.close_code()
+                    let reason = frame.close_reason()
+                    ok(some(WsMessage.Close(code, reason)))
+                }
+                _ => err("unknown control".to_string()),
+            }
+        }
+
+        match frame.opcode {
+            Opcode.Continuation => {
+                if self.opcode.is_none() { return err("unexpected continuation".to_string()) }
+                self.fragments.push(frame.clone())
+                if frame.fin {
+                    let opcode = self.opcode.take().unwrap()
+                    let mut data: [u8] = []
+                    for f in self.fragments.drain(..) { data.extend(f.payload) }
+                    match opcode {
+                        Opcode.Text => ok(some(WsMessage.Text(string.from_utf8(data).map_err(|e| e.to_string())?))),
+                        Opcode.Binary => ok(some(WsMessage.Binary(data))),
+                        _ => err("invalid opcode".to_string()),
+                    }
+                } else { ok(none) }
+            }
+            Opcode.Text | Opcode.Binary => {
+                if self.opcode.is_some() { return err("new message during fragmentation".to_string()) }
+                if frame.fin {
+                    match frame.opcode {
+                        Opcode.Text => ok(some(WsMessage.Text(string.from_utf8(frame.payload.clone()).map_err(|e| e.to_string())?))),
+                        Opcode.Binary => ok(some(WsMessage.Binary(frame.payload.clone()))),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    self.opcode = some(frame.opcode)
+                    self.fragments.push(frame)
+                    ok(none)
+                }
+            }
+            _ => err("unexpected opcode".to_string()),
+        }
+    }
+}
+
+fn main() {
+    // Frame encoding
+    let frame = Frame.new_text("Hello")
+    let encoded = frame.encode()
+    assert(encoded[0] == 0x81)  // FIN + Text
+    assert(encoded[1] == 5)     // length
+    assert(&encoded[2..] == b"Hello")
+    print("Text frame encode ✓")
+
+    // Frame decoding
+    let (decoded, consumed) = Frame.decode(&encoded).unwrap()
+    assert(decoded.fin)
+    assert(decoded.payload == b"Hello")
+    assert(consumed == 7)
+    print("Text frame decode ✓")
+
+    // Binary frame
+    let frame = Frame.new_binary(&[0xDE, 0xAD, 0xBE, 0xEF])
+    let encoded = frame.encode()
+    let (decoded, _) = Frame.decode(&encoded).unwrap()
+    assert(decoded.payload == [0xDE, 0xAD, 0xBE, 0xEF])
+    print("Binary frame ✓")
+
+    // Close frame
+    let frame = Frame.new_close(1000, "goodbye")
+    assert(frame.close_code() == some(1000))
+    assert(frame.close_reason().unwrap() == "goodbye")
+    let encoded = frame.encode()
+    let (decoded, _) = Frame.decode(&encoded).unwrap()
+    assert(decoded.close_code() == some(1000))
+    print("Close frame ✓")
+
+    // Masked frame
+    let mut frame = Frame.new_text("Hi")
+    frame.masked = true
+    frame.mask_key = [0x37, 0xFA, 0x21, 0x3D]
+    let encoded = frame.encode()
+    let (decoded, _) = Frame.decode(&encoded).unwrap()
+    assert(decoded.as_text().unwrap() == "Hi")
+    print("Masked frame ✓")
+
+    // Extended length (16-bit)
+    let payload = [0u8; 200]
+    let frame = Frame.new_binary(&payload)
+    let encoded = frame.encode()
+    assert(encoded[1] == 126)  // extended length marker
+    let (decoded, _) = Frame.decode(&encoded).unwrap()
+    assert(decoded.payload.len() == 200)
+    print("Extended length (16-bit) ✓")
+
+    // Handshake
+    let key = "dGhlIHNhbXBsZSBub25jZQ=="
+    let accept = HandshakeResponse.compute_accept(key)
+    assert(accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+    print("Handshake accept key ✓")
+
+    let request = HandshakeRequest.build("echo.websocket.org", "/", key)
+    assert(request.contains("Upgrade: websocket"))
+    assert(request.contains("Sec-WebSocket-Key:"))
+    print("Handshake request ✓")
+
+    let parsed = HandshakeRequest.parse(&request).unwrap()
+    assert(parsed.path == "/")
+    assert(parsed.host == "echo.websocket.org")
+    print("Handshake parse ✓")
+
+    // Message assembler
+    let mut assembler = MessageAssembler.new()
+    let frame = Frame.new_text("Hello World")
+    let msg = assembler.feed(frame).unwrap().unwrap()
+    match msg { WsMessage.Text(t) => assert(t == "Hello World"), _ => panic("expected text") }
+    print("Message assembler (single frame) ✓")
+
+    // Fragmented message
+    let mut assembler = MessageAssembler.new()
+    let f1 = Frame { fin: false, rsv1: false, rsv2: false, rsv3: false, opcode: Opcode.Text, masked: false, mask_key: [0; 4], payload: b"Hello ".to_vec() }
+    let f2 = Frame { fin: true, rsv1: false, rsv2: false, rsv3: false, opcode: Opcode.Continuation, masked: false, mask_key: [0; 4], payload: b"World".to_vec() }
+    assert(assembler.feed(f1).unwrap().is_none())
+    let msg = assembler.feed(f2).unwrap().unwrap()
+    match msg { WsMessage.Text(t) => assert(t == "Hello World"), _ => panic("expected text") }
+    print("Message assembler (fragmented) ✓")
+
+    // Ping/Pong
+    let ping = Frame.new_ping(b"alive")
+    let msg = MessageAssembler.new().feed(ping).unwrap().unwrap()
+    match msg { WsMessage.Ping(d) => assert(d == b"alive"), _ => panic("expected ping") }
+    print("Ping/Pong ✓")
+
+    print("WebSocket complete ✓")
+}
