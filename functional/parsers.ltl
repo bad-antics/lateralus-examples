@@ -1,0 +1,98 @@
+// parsers.ltl — Parser combinator library
+// Run: lateralus run functional/parsers.ltl
+
+type ParseResult<T> = Result<(T, string), string>
+type Parser<T>      = fn(string) -> ParseResult<T>
+
+// Primitives
+fn char_p(c: char) -> Parser<char> {
+    |input| {
+        if input.starts_with(c) { ok((c, input[1..])) }
+        else { err("Expected '${c}', got '${input.get(0)?.to_string() ?? "EOF"}'") }
+    }
+}
+
+fn string_p(s: string) -> Parser<string> {
+    |input| {
+        if input.starts_with(s) { ok((s, input[s.len()..])) }
+        else { err("Expected '${s}'") }
+    }
+}
+
+fn digit() -> Parser<char> {
+    satisfy("digit", |c| c.is_ascii_digit())
+}
+
+fn alpha() -> Parser<char> {
+    satisfy("alpha", |c| c.is_alphabetic())
+}
+
+fn satisfy(name: string, pred: fn(char) -> bool) -> Parser<char> {
+    |input| {
+        match input.chars().first() {
+            none    => err("Unexpected EOF, expected ${name}"),
+            some(c) => if pred(c) { ok((c, input[1..])) }
+                       else { err("Expected ${name}, got '${c}'") },
+        }
+    }
+}
+
+// Combinators
+fn map_p<A, B>(p: Parser<A>, f: fn(A) -> B) -> Parser<B> {
+    |input| p(input).map(|(v, rest)| (f(v), rest))
+}
+
+fn then<A, B>(p1: Parser<A>, p2: Parser<B>) -> Parser<(A, B)> {
+    |input| {
+        let (a, rest1) = p1(input)?
+        let (b, rest2) = p2(rest1)?
+        ok(((a, b), rest2))
+    }
+}
+
+fn or_p<A>(p1: Parser<A>, p2: Parser<A>) -> Parser<A> {
+    |input| p1(input).or_else(|_| p2(input))
+}
+
+fn many<A>(p: Parser<A>) -> Parser<[A]> {
+    |input| {
+        mut results = []
+        mut rest    = input
+        loop {
+            match p(rest) {
+                err(_)         => return ok((results, rest)),
+                ok((v, next))  => { results.push(v); rest = next },
+            }
+        }
+    }
+}
+
+fn integer() -> Parser<int> {
+    map_p(many(digit()), |digits| digits |> collect_string() |> parse_int().unwrap())
+}
+
+fn whitespace() -> Parser<string> {
+    map_p(many(satisfy("space", |c| c.is_whitespace())), |cs| cs |> collect_string())
+}
+
+fn token<A>(p: Parser<A>) -> Parser<A> {
+    map_p(then(whitespace(), p), |(_, v)| v)
+}
+
+fn main() {
+    // Parse "42"
+    let result = integer()("42 rest")
+    print("integer '42 rest': ${result}")
+
+    // Parse "hello"
+    let alnum = many(or_p(alpha(), digit()))
+    let result2 = alnum("hello123!")
+    print("alnum 'hello123!': ${result2}")
+
+    // Parse simple addition: int + int
+    let add = then(token(integer()), then(token(char_p('+')), token(integer())))
+    let result3 = add("  12 + 34  end")
+    print("'12 + 34' = ${result3}")
+}
+
+main()
