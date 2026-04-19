@@ -1,0 +1,19 @@
+// Project Euler #5 — Smallest number evenly divisible by 1-20
+// Run: lateralus run challenges/euler_005.ltl
+
+fn gcd(a: int, b: int) -> int {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+fn lcm(a: int, b: int) -> int {
+    a / gcd(a, b) * b
+}
+
+fn main() {
+    let result = range(1, 21) |> fold(1, lcm)
+    print("LCM(1..20): ${result}")
+    assert_eq(result, 232792560)
+    print("✓ Correct!")
+}
+
+main()
