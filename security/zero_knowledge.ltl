@@ -1,0 +1,208 @@
+// zero_knowledge.ltl — Zero-knowledge proofs: Schnorr protocol + zk-SNARK structures
+
+use std.crypto.{sha256, random_bytes}
+use std.math.big.{BigInt, ModExp}
+
+// ── Schnorr identification protocol ──────────────────────────────────────────
+// Proves knowledge of discrete log x where y = g^x mod p without revealing x
+
+struct SchnorrParams {
+    p: BigInt,   // large prime
+    q: BigInt,   // prime order of subgroup
+    g: BigInt,   // generator of subgroup
+}
+
+impl SchnorrParams {
+    fn demo_params() -> SchnorrParams {
+        // Small parameters for demonstration (use 2048+ bit in production)
+        let p = BigInt.from_str("115792089237316195423570985008687907853269984665640564039457584007908834671663")
+        let q = BigInt.from_str("57896044618658097711785492504343953926634992332820282019728792003954417335831")
+        let g = BigInt.from_i64(4)
+        SchnorrParams { p, q, g }
+    }
+}
+
+struct SchnorrProver {
+    params: SchnorrParams,
+    x:      BigInt,   // secret
+    y:      BigInt,   // public: g^x mod p
+}
+
+struct SchnorrCommitment { t: BigInt, k: BigInt }  // k is prover's secret random
+
+impl SchnorrProver {
+    fn new(params: SchnorrParams, x: BigInt) -> SchnorrProver {
+        let y = params.g.mod_exp(x.clone(), params.p.clone())
+        SchnorrProver { params, x, y }
+    }
+
+    fn commit(self) -> SchnorrCommitment {
+        let k = BigInt.random_below(self.params.q.clone())
+        let t = self.params.g.mod_exp(k.clone(), self.params.p.clone())
+        SchnorrCommitment { t, k }
+    }
+
+    fn respond(self, commitment: SchnorrCommitment, challenge: BigInt) -> BigInt {
+        // s = k - x * c mod q
+        let xc = self.x.clone().mul(challenge).mod_(self.params.q.clone())
+        commitment.k.sub(xc).mod_(self.params.q.clone())
+    }
+}
+
+fn schnorr_verify(params: SchnorrParams, y: BigInt, t: BigInt, c: BigInt, s: BigInt) -> bool {
+    // Check: g^s * y^c ≡ t (mod p)
+    let gs = params.g.mod_exp(s, params.p.clone())
+    let yc = y.mod_exp(c, params.p.clone())
+    let lhs = gs.mul(yc).mod_(params.p.clone())
+    lhs == t
+}
+
+// Non-interactive Schnorr (Fiat-Shamir heuristic)
+fn schnorr_sign(params: SchnorrParams, x: BigInt, msg: &[u8]) -> (BigInt, BigInt) {
+    let k = BigInt.random_below(params.q.clone())
+    let t = params.g.mod_exp(k.clone(), params.p.clone())
+
+    // c = H(t || msg)
+    let mut hash_input = t.to_bytes()
+    hash_input.extend_from_slice(msg)
+    let c_hash = sha256.hash(&hash_input)
+    let c = BigInt.from_bytes(&c_hash).mod_(params.q.clone())
+
+    let s = k.sub(x.mul(c.clone())).mod_(params.q.clone())
+    (c, s)
+}
+
+fn schnorr_verify_sig(params: SchnorrParams, y: BigInt, msg: &[u8], c: BigInt, s: BigInt) -> bool {
+    let gs = params.g.mod_exp(s, params.p.clone())
+    let yc = y.mod_exp(c.clone(), params.p.clone())
+    let t_reconstructed = gs.mul(yc).mod_(params.p.clone())
+
+    let mut hash_input = t_reconstructed.to_bytes()
+    hash_input.extend_from_slice(msg)
+    let c_check = BigInt.from_bytes(&sha256.hash(&hash_input)).mod_(params.q.clone())
+    c == c_check
+}
+
+// ── zk-SNARK structures (Groth16-style) ──────────────────────────────────────
+// Arithmetic circuit: R1CS (Rank-1 Constraint System)
+
+struct R1CS {
+    num_vars:     usize,
+    num_inputs:   usize,
+    constraints:  [(SparseVec, SparseVec, SparseVec)],  // (A, B, C) where A*B=C
+}
+
+struct SparseVec { entries: [(usize, BigInt)] }
+
+impl SparseVec {
+    fn eval(self, witness: &[BigInt]) -> BigInt {
+        let mut sum = BigInt.zero()
+        for (idx, coeff) in self.entries { sum = sum.add(coeff.mul(witness[idx].clone())) }
+        sum
+    }
+}
+
+impl R1CS {
+    fn is_satisfied(self, witness: &[BigInt]) -> bool {
+        for (a, b, c) in self.constraints {
+            let va = a.eval(witness)
+            let vb = b.eval(witness)
+            let vc = c.eval(witness)
+            if va.mul(vb) != vc { return false }
+        }
+        true
+    }
+}
+
+// QAP (Quadratic Arithmetic Program) — compiled from R1CS
+struct QAP {
+    a_polys: [Polynomial],
+    b_polys: [Polynomial],
+    c_polys: [Polynomial],
+    target:  Polynomial,     // vanishing polynomial t(x) = (x-1)(x-2)...(x-m)
+}
+
+struct Polynomial { coeffs: [BigInt] }
+
+impl Polynomial {
+    fn eval(self, x: BigInt) -> BigInt {
+        let mut result = BigInt.zero()
+        let mut x_pow = BigInt.one()
+        for coeff in self.coeffs {
+            result = result.add(coeff.mul(x_pow.clone()))
+            x_pow = x_pow.mul(x.clone())
+        }
+        result
+    }
+}
+
+// Proof structure (Groth16)
+struct Groth16Proof {
+    pi_a: (BigInt, BigInt),   // G1 point
+    pi_b: (BigInt, BigInt),   // G2 point
+    pi_c: (BigInt, BigInt),   // G1 point
+}
+
+struct VerificationKey {
+    alpha_g1:   (BigInt, BigInt),
+    beta_g2:    (BigInt, BigInt),
+    gamma_g2:   (BigInt, BigInt),
+    delta_g2:   (BigInt, BigInt),
+    ic:         [(BigInt, BigInt)],  // input commitments
+}
+
+fn main() {
+    let params = SchnorrParams.demo_params()
+
+    // Interactive Schnorr
+    let secret = BigInt.from_i64(42)
+    let prover = SchnorrProver.new(params.clone(), secret)
+    print("Public key y = g^x mod p computed")
+
+    let commitment = prover.commit()
+    let challenge  = BigInt.random_below(params.q.clone())
+    let response   = prover.respond(commitment.clone(), challenge.clone())
+
+    let valid = schnorr_verify(params.clone(), prover.y.clone(), commitment.t, challenge, response)
+    assert(valid, "interactive Schnorr must verify")
+    print("Interactive Schnorr ✓")
+
+    // Non-interactive Schnorr signature
+    let msg = "zero knowledge is powerful".as_bytes()
+    let (c, s) = schnorr_sign(params.clone(), BigInt.from_i64(42), msg)
+    let sig_valid = schnorr_verify_sig(params.clone(), prover.y.clone(), msg, c, s)
+    assert(sig_valid, "Schnorr signature must verify")
+    print("Schnorr signature (Fiat-Shamir) ✓")
+
+    // R1CS example: prove knowledge of x such that x^3 + x + 5 = 35 (x=3)
+    let r1cs = R1CS {
+        num_vars: 5, num_inputs: 1,
+        constraints: [
+            // x * x = v1 (v1 = x^2)
+            (SparseVec { entries: [(1, BigInt.one())] },
+             SparseVec { entries: [(1, BigInt.one())] },
+             SparseVec { entries: [(2, BigInt.one())] }),
+            // v1 * x = v2 (v2 = x^3)
+            (SparseVec { entries: [(2, BigInt.one())] },
+             SparseVec { entries: [(1, BigInt.one())] },
+             SparseVec { entries: [(3, BigInt.one())] }),
+            // (v2 + x + 5) * 1 = out
+            (SparseVec { entries: [(3, BigInt.one()), (1, BigInt.one()), (0, BigInt.from_i64(5))] },
+             SparseVec { entries: [(0, BigInt.one())] },
+             SparseVec { entries: [(4, BigInt.one())] }),
+        ],
+    }
+    // witness: [1, x, x^2, x^3, out] = [1, 3, 9, 27, 35]
+    let witness = [BigInt.one(), BigInt.from_i64(3), BigInt.from_i64(9), BigInt.from_i64(27), BigInt.from_i64(35)]
+    assert(r1cs.is_satisfied(&witness), "R1CS must be satisfied")
+    print("R1CS constraint system verified (x³+x+5=35, x=3) ✓")
+
+    // Wrong witness should fail
+    let bad_witness = [BigInt.one(), BigInt.from_i64(4), BigInt.from_i64(16), BigInt.from_i64(64), BigInt.from_i64(73)]
+    assert(r1cs.is_satisfied(&bad_witness), "correct witness for x=4: 64+4+5=73")
+    let bad2 = [BigInt.one(), BigInt.from_i64(4), BigInt.from_i64(16), BigInt.from_i64(64), BigInt.from_i64(35)]
+    assert(!r1cs.is_satisfied(&bad2), "wrong output should fail")
+    print("R1CS bad witness rejection ✓")
+
+    print("Zero-knowledge proofs — all passed ✓")
+}
