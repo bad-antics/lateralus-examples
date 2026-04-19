@@ -1,0 +1,230 @@
+// secure_boot.ltl — Secure boot chain: firmware → bootloader → kernel verification
+
+use std.crypto.{ed25519, sha256, rsa2048, x509}
+
+// ── Root of trust ────────────────────────────────────────────────────────────
+struct PlatformKey {
+    pk:          [u8; 32],         // Ed25519 public key burned into ROM
+    fingerprint: [u8; 32],         // SHA-256 of pk
+}
+
+struct KeyDatabase {
+    platform_key:   PlatformKey,
+    key_exchange_keys: [TrustedKey],   // KEK: can add/remove db entries
+    allowed_keys:      [TrustedKey],   // db: keys that can sign boot images
+    forbidden_hashes:  [[u8; 32]],     // dbx: revoked image hashes
+}
+
+struct TrustedKey {
+    owner:        string,
+    public_key:   [u8; 32],
+    key_type:     KeyType,
+    not_before:   u64,
+    not_after:    u64,
+    revoked:      bool,
+}
+
+enum KeyType { Ed25519, RSA2048, RSA4096 }
+
+// ── Boot image format ────────────────────────────────────────────────────────
+struct BootImage {
+    magic:      [u8; 8],
+    version:    u32,
+    image_type: ImageType,
+    load_addr:  u64,
+    entry_point: u64,
+    image_size: u64,
+    hash:       [u8; 32],
+    signature:  [u8; 64],
+    signer_pk:  [u8; 32],
+    payload:    [u8],
+}
+
+enum ImageType { Firmware, Bootloader, Kernel, InitRamfs, Module }
+
+impl BootImage {
+    fn create(image_type: ImageType, payload: [u8], load_addr: u64, entry_point: u64,
+              signing_key: [u8; 32]) -> BootImage {
+        let hash = sha256.hash(&payload)
+        let keypair = ed25519.keypair_from_seed(signing_key)
+        let signature = ed25519.sign(&keypair, &hash)
+        BootImage {
+            magic: *b"LTLBOOT\0",
+            version: 1,
+            image_type, load_addr, entry_point,
+            image_size: payload.len() as u64,
+            hash, signature,
+            signer_pk: keypair.public_key,
+            payload,
+        }
+    }
+
+    fn verify(self, key_db: &KeyDatabase) -> Result<(), BootVerifyError> {
+        // 1. Check magic
+        if self.magic != *b"LTLBOOT\0" { return err(BootVerifyError.InvalidMagic) }
+
+        // 2. Check hash matches payload
+        let computed_hash = sha256.hash(&self.payload)
+        if computed_hash != self.hash { return err(BootVerifyError.HashMismatch) }
+
+        // 3. Check hash not in forbidden list
+        if key_db.forbidden_hashes.contains(&self.hash) {
+            return err(BootVerifyError.Revoked)
+        }
+
+        // 4. Find signer in allowed keys
+        let signer = key_db.allowed_keys.iter()
+            .find(|k| k.public_key == self.signer_pk && !k.revoked)
+            .ok_or(BootVerifyError.UntrustedSigner)?
+
+        // 5. Check key validity period
+        let now = std.time.now_secs()
+        if now < signer.not_before || now > signer.not_after {
+            return err(BootVerifyError.KeyExpired)
+        }
+
+        // 6. Verify signature
+        if !ed25519.verify(&self.signer_pk, &self.hash, &self.signature) {
+            return err(BootVerifyError.SignatureFailed)
+        }
+
+        ok(())
+    }
+}
+
+enum BootVerifyError {
+    InvalidMagic,
+    HashMismatch,
+    Revoked,
+    UntrustedSigner,
+    KeyExpired,
+    SignatureFailed,
+}
+
+// ── Measured boot (TPM-style PCR extend) ──────────────────────────────────────
+struct MeasuredBoot {
+    pcrs: [[u8; 32]; 24],   // Platform Configuration Registers
+    event_log: [MeasurementEvent],
+}
+
+struct MeasurementEvent {
+    pcr_index:  u8,
+    event_type: string,
+    digest:     [u8; 32],
+    data:       [u8],
+}
+
+impl MeasuredBoot {
+    fn new() -> MeasuredBoot {
+        MeasuredBoot { pcrs: [[0u8; 32]; 24], event_log: [] }
+    }
+
+    fn extend(mut self, pcr: u8, data: &[u8], event_type: string) {
+        let digest = sha256.hash(data)
+        // PCR_new = SHA-256(PCR_old || digest)
+        self.pcrs[pcr as usize] = sha256.hash(
+            &[&self.pcrs[pcr as usize][..], &digest[..]].concat()
+        )
+        self.event_log.push(MeasurementEvent {
+            pcr_index: pcr, event_type, digest, data: data[0..std.cmp.min(64, data.len())].to_vec(),
+        })
+    }
+
+    fn quote(self, pcr_mask: u32, nonce: [u8; 32], signing_key: [u8; 32]) -> ([u8], [u8; 64]) {
+        let mut quote_data: [u8] = nonce.to_vec()
+        for i in range(0, 24) {
+            if (pcr_mask >> i) & 1 == 1 {
+                quote_data.extend_from_slice(&self.pcrs[i])
+            }
+        }
+        let hash = sha256.hash(&quote_data)
+        let kp = ed25519.keypair_from_seed(signing_key)
+        let sig = ed25519.sign(&kp, &hash)
+        (quote_data, sig)
+    }
+}
+
+// ── Boot chain ───────────────────────────────────────────────────────────────
+struct BootChain {
+    key_db:        KeyDatabase,
+    measured_boot: MeasuredBoot,
+    stages:        [BootImage],
+}
+
+impl BootChain {
+    fn new(key_db: KeyDatabase) -> BootChain {
+        BootChain { key_db, measured_boot: MeasuredBoot.new(), stages: [] }
+    }
+
+    fn load_stage(mut self, image: BootImage) -> Result<(), BootVerifyError> {
+        // Verify image
+        image.verify(&self.key_db)?
+
+        // Measure into PCR based on image type
+        let pcr = match image.image_type {
+            ImageType.Firmware   => 0,
+            ImageType.Bootloader => 4,
+            ImageType.Kernel     => 8,
+            ImageType.InitRamfs  => 9,
+            ImageType.Module     => 10,
+        }
+        self.measured_boot.extend(pcr, &image.payload, format!("{:?}", image.image_type))
+        self.stages.push(image)
+        ok(())
+    }
+}
+
+fn main() {
+    // Create signing key
+    let signing_seed: [u8; 32] = std.crypto.random_bytes(32).try_into().unwrap()
+    let kp = ed25519.keypair_from_seed(signing_seed)
+
+    // Set up key database
+    let key_db = KeyDatabase {
+        platform_key: PlatformKey { pk: kp.public_key, fingerprint: sha256.hash(&kp.public_key) },
+        key_exchange_keys: [],
+        allowed_keys: [TrustedKey {
+            owner: "LateralusOS".to_string(),
+            public_key: kp.public_key,
+            key_type: KeyType.Ed25519,
+            not_before: 0, not_after: u64.MAX,
+            revoked: false,
+        }],
+        forbidden_hashes: [],
+    }
+
+    let mut chain = BootChain.new(key_db)
+
+    // Create and verify boot stages
+    let firmware = BootImage.create(ImageType.Firmware, vec![0xDE, 0xAD; 1024], 0x0000, 0x0000, signing_seed)
+    chain.load_stage(firmware).expect("firmware verification failed")
+    print("Firmware verified and measured ✓")
+
+    let bootloader = BootImage.create(ImageType.Bootloader, vec![0xBE, 0xEF; 2048], 0x7C00, 0x7C00, signing_seed)
+    chain.load_stage(bootloader).expect("bootloader verification failed")
+    print("Bootloader verified and measured ✓")
+
+    let kernel = BootImage.create(ImageType.Kernel, vec![0xCA, 0xFE; 65536], 0x100000, 0x100000, signing_seed)
+    chain.load_stage(kernel).expect("kernel verification failed")
+    print("Kernel verified and measured ✓")
+
+    // PCRs should be non-zero after measurement
+    assert(chain.measured_boot.pcrs[0] != [0; 32])
+    assert(chain.measured_boot.pcrs[4] != [0; 32])
+    assert(chain.measured_boot.pcrs[8] != [0; 32])
+    print("PCR measurements non-zero ✓")
+
+    // Tampered image should fail
+    let mut tampered = BootImage.create(ImageType.Module, vec![0x41; 512], 0x200000, 0x200000, signing_seed)
+    tampered.payload[0] = 0x00  // tamper
+    assert(tampered.verify(&chain.key_db).is_err())
+    print("Tampered image rejected ✓")
+
+    // Event log
+    print("Boot event log (${chain.measured_boot.event_log.len()} events):")
+    for evt in chain.measured_boot.event_log {
+        print("  PCR${evt.pcr_index}: ${evt.event_type}")
+    }
+
+    print("Secure boot chain — all passed ✓")
+}
