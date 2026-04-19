@@ -1,0 +1,255 @@
+// Niche Example - Image Processor
+// Pixel operations, convolution, resize, grayscale, blur, edge detection.
+
+struct Pixel { r: u8, g: u8, b: u8, a: u8 }
+
+impl Pixel {
+    fn new(r: u8, g: u8, b: u8) -> Pixel { Pixel { r, g, b, a: 255 } }
+    fn rgba(r: u8, g: u8, b: u8, a: u8) -> Pixel { Pixel { r, g, b, a } }
+    fn black() -> Pixel { Pixel.new(0, 0, 0) }
+    fn white() -> Pixel { Pixel.new(255, 255, 255) }
+
+    fn luminance(self) -> f64 {
+        0.299 * self.r as f64 + 0.587 * self.g as f64 + 0.114 * self.b as f64
+    }
+
+    fn grayscale(self) -> Pixel {
+        let l = self.luminance() as u8
+        Pixel { r: l, g: l, b: l, a: self.a }
+    }
+
+    fn invert(self) -> Pixel {
+        Pixel { r: 255 - self.r, g: 255 - self.g, b: 255 - self.b, a: self.a }
+    }
+
+    fn blend(self, other: &Pixel, factor: f64) -> Pixel {
+        let f = factor.clamp(0.0, 1.0)
+        Pixel {
+            r: (self.r as f64 * (1.0 - f) + other.r as f64 * f) as u8,
+            g: (self.g as f64 * (1.0 - f) + other.g as f64 * f) as u8,
+            b: (self.b as f64 * (1.0 - f) + other.b as f64 * f) as u8,
+            a: (self.a as f64 * (1.0 - f) + other.a as f64 * f) as u8,
+        }
+    }
+
+    fn adjust_brightness(self, factor: f64) -> Pixel {
+        Pixel {
+            r: (self.r as f64 * factor).clamp(0.0, 255.0) as u8,
+            g: (self.g as f64 * factor).clamp(0.0, 255.0) as u8,
+            b: (self.b as f64 * factor).clamp(0.0, 255.0) as u8,
+            a: self.a,
+        }
+    }
+}
+
+struct Image {
+    width: usize,
+    height: usize,
+    pixels: [Pixel],
+}
+
+impl Image {
+    fn new(width: usize, height: usize) -> Image {
+        Image { width, height, pixels: (0..width*height).map(|_| Pixel.black()).collect() }
+    }
+
+    fn filled(width: usize, height: usize, color: Pixel) -> Image {
+        Image { width, height, pixels: (0..width*height).map(|_| color.clone()).collect() }
+    }
+
+    fn get(self, x: usize, y: usize) -> &Pixel {
+        &self.pixels[y * self.width + x]
+    }
+
+    fn set(mut self, x: usize, y: usize, pixel: Pixel) {
+        self.pixels[y * self.width + x] = pixel
+    }
+
+    fn get_clamped(self, x: i32, y: i32) -> &Pixel {
+        let cx = x.clamp(0, self.width as i32 - 1) as usize
+        let cy = y.clamp(0, self.height as i32 - 1) as usize
+        self.get(cx, cy)
+    }
+
+    fn to_grayscale(self) -> Image {
+        Image {
+            width: self.width, height: self.height,
+            pixels: self.pixels.iter().map(|p| p.grayscale()).collect(),
+        }
+    }
+
+    fn invert(self) -> Image {
+        Image {
+            width: self.width, height: self.height,
+            pixels: self.pixels.iter().map(|p| p.invert()).collect(),
+        }
+    }
+
+    fn adjust_brightness(self, factor: f64) -> Image {
+        Image {
+            width: self.width, height: self.height,
+            pixels: self.pixels.iter().map(|p| p.adjust_brightness(factor)).collect(),
+        }
+    }
+
+    fn convolve(self, kernel: &Kernel) -> Image {
+        let mut result = Image.new(self.width, self.height)
+        let half = kernel.size as i32 / 2
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let mut r_sum = 0.0f64
+                let mut g_sum = 0.0f64
+                let mut b_sum = 0.0f64
+
+                for ky in 0..kernel.size {
+                    for kx in 0..kernel.size {
+                        let px = x as i32 + kx as i32 - half
+                        let py = y as i32 + ky as i32 - half
+                        let pixel = self.get_clamped(px, py)
+                        let weight = kernel.values[ky * kernel.size + kx]
+                        r_sum += pixel.r as f64 * weight
+                        g_sum += pixel.g as f64 * weight
+                        b_sum += pixel.b as f64 * weight
+                    }
+                }
+                result.set(x, y, Pixel.new(
+                    r_sum.clamp(0.0, 255.0) as u8,
+                    g_sum.clamp(0.0, 255.0) as u8,
+                    b_sum.clamp(0.0, 255.0) as u8,
+                ))
+            }
+        }
+        result
+    }
+
+    fn resize(self, new_width: usize, new_height: usize) -> Image {
+        let mut result = Image.new(new_width, new_height)
+        let x_ratio = self.width as f64 / new_width as f64
+        let y_ratio = self.height as f64 / new_height as f64
+
+        for y in 0..new_height {
+            for x in 0..new_width {
+                let src_x = (x as f64 * x_ratio) as usize
+                let src_y = (y as f64 * y_ratio) as usize
+                result.set(x, y, self.get(src_x.min(self.width - 1), src_y.min(self.height - 1)).clone())
+            }
+        }
+        result
+    }
+
+    fn crop(self, x: usize, y: usize, w: usize, h: usize) -> Image {
+        let mut result = Image.new(w, h)
+        for dy in 0..h {
+            for dx in 0..w {
+                if x + dx < self.width && y + dy < self.height {
+                    result.set(dx, dy, self.get(x + dx, y + dy).clone())
+                }
+            }
+        }
+        result
+    }
+
+    fn flip_horizontal(self) -> Image {
+        let mut result = Image.new(self.width, self.height)
+        for y in 0..self.height {
+            for x in 0..self.width {
+                result.set(self.width - 1 - x, y, self.get(x, y).clone())
+            }
+        }
+        result
+    }
+
+    fn rotate_90(self) -> Image {
+        let mut result = Image.new(self.height, self.width)
+        for y in 0..self.height {
+            for x in 0..self.width {
+                result.set(self.height - 1 - y, x, self.get(x, y).clone())
+            }
+        }
+        result
+    }
+
+    fn histogram(self) -> ([usize; 256], [usize; 256], [usize; 256]) {
+        let mut rh = [0usize; 256]; let mut gh = [0usize; 256]; let mut bh = [0usize; 256]
+        for p in &self.pixels { rh[p.r as usize] += 1; gh[p.g as usize] += 1; bh[p.b as usize] += 1 }
+        (rh, gh, bh)
+    }
+}
+
+struct Kernel { size: usize, values: [f64] }
+
+impl Kernel {
+    fn blur_3x3() -> Kernel {
+        Kernel { size: 3, values: [1.0/9.0; 9] }
+    }
+    fn sharpen() -> Kernel {
+        Kernel { size: 3, values: [0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0] }
+    }
+    fn edge_detect() -> Kernel {
+        Kernel { size: 3, values: [-1.0, -1.0, -1.0, -1.0, 8.0, -1.0, -1.0, -1.0, -1.0] }
+    }
+    fn sobel_x() -> Kernel {
+        Kernel { size: 3, values: [-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0] }
+    }
+    fn sobel_y() -> Kernel {
+        Kernel { size: 3, values: [-1.0, -2.0, -1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0] }
+    }
+    fn gaussian_3x3() -> Kernel {
+        Kernel { size: 3, values: [1.0/16.0, 2.0/16.0, 1.0/16.0, 2.0/16.0, 4.0/16.0, 2.0/16.0, 1.0/16.0, 2.0/16.0, 1.0/16.0] }
+    }
+}
+
+fn main() {
+    let mut img = Image.new(10, 10)
+    img.set(5, 5, Pixel.new(255, 0, 0))
+    assert(img.get(5, 5).r == 255)
+    assert(img.get(0, 0).r == 0)
+    print("Image create/get/set \u2713")
+
+    let gray = img.to_grayscale()
+    let p = gray.get(5, 5)
+    assert(p.r == p.g && p.g == p.b)
+    print("Grayscale \u2713")
+
+    let inv = img.invert()
+    assert(inv.get(5, 5).r == 0)
+    assert(inv.get(0, 0).r == 255)
+    print("Invert \u2713")
+
+    let bright = img.adjust_brightness(0.5)
+    assert(bright.get(5, 5).r == 127 || bright.get(5, 5).r == 128)
+    print("Brightness \u2713")
+
+    let blurred = img.convolve(&Kernel.blur_3x3())
+    assert(blurred.width == 10 && blurred.height == 10)
+    print("Blur convolution \u2713")
+
+    let resized = img.resize(5, 5)
+    assert(resized.width == 5 && resized.height == 5)
+    print("Resize \u2713")
+
+    let cropped = img.crop(2, 2, 4, 4)
+    assert(cropped.width == 4 && cropped.height == 4)
+    print("Crop \u2713")
+
+    let flipped = img.flip_horizontal()
+    assert(flipped.get(4, 5).r == 255)
+    print("Flip horizontal \u2713")
+
+    let rotated = img.rotate_90()
+    assert(rotated.width == 10 && rotated.height == 10)
+    print("Rotate 90 \u2713")
+
+    let p1 = Pixel.new(100, 200, 50)
+    let p2 = Pixel.new(200, 100, 150)
+    let blended = p1.blend(&p2, 0.5)
+    assert(blended.r == 150)
+    print("Pixel blend \u2713")
+
+    let lum = Pixel.new(255, 255, 255).luminance()
+    assert(lum > 254.0)
+    print("Luminance \u2713")
+
+    print("Image Processor complete \u2713")
+}
