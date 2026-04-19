@@ -1,0 +1,329 @@
+// Niche Example - Image Converter
+// Pixel manipulation, format conversion, and basic image processing.
+
+use std.io.{Read, Write, File}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pixel {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+impl Pixel {
+    fn new(r: u8, g: u8, b: u8) -> Pixel {
+        Pixel { r, g, b, a: 255 }
+    }
+
+    fn rgba(r: u8, g: u8, b: u8, a: u8) -> Pixel {
+        Pixel { r, g, b, a }
+    }
+
+    fn black() -> Pixel { Pixel.new(0, 0, 0) }
+    fn white() -> Pixel { Pixel.new(255, 255, 255) }
+    fn red() -> Pixel { Pixel.new(255, 0, 0) }
+    fn green() -> Pixel { Pixel.new(0, 255, 0) }
+    fn blue() -> Pixel { Pixel.new(0, 0, 255) }
+
+    fn grayscale(self) -> u8 {
+        ((self.r as u32 * 299 + self.g as u32 * 587 + self.b as u32 * 114) / 1000) as u8
+    }
+
+    fn to_grayscale(self) -> Pixel {
+        let g = self.grayscale()
+        Pixel { r: g, g: g, b: g, a: self.a }
+    }
+
+    fn invert(self) -> Pixel {
+        Pixel { r: 255 - self.r, g: 255 - self.g, b: 255 - self.b, a: self.a }
+    }
+
+    fn blend(self, other: Pixel, t: f32) -> Pixel {
+        let t = t.clamp(0.0, 1.0)
+        Pixel {
+            r: (self.r as f32 * (1.0 - t) + other.r as f32 * t) as u8,
+            g: (self.g as f32 * (1.0 - t) + other.g as f32 * t) as u8,
+            b: (self.b as f32 * (1.0 - t) + other.b as f32 * t) as u8,
+            a: (self.a as f32 * (1.0 - t) + other.a as f32 * t) as u8,
+        }
+    }
+
+    fn brightness(self, factor: f32) -> Pixel {
+        Pixel {
+            r: (self.r as f32 * factor).clamp(0.0, 255.0) as u8,
+            g: (self.g as f32 * factor).clamp(0.0, 255.0) as u8,
+            b: (self.b as f32 * factor).clamp(0.0, 255.0) as u8,
+            a: self.a,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Image {
+    width: u32,
+    height: u32,
+    pixels: [Pixel],
+}
+
+impl Image {
+    fn new(width: u32, height: u32, fill: Pixel) -> Image {
+        Image {
+            width, height,
+            pixels: vec![fill; (width * height) as usize],
+        }
+    }
+
+    fn get_pixel(self, x: u32, y: u32) -> Option<Pixel> {
+        if x < self.width && y < self.height {
+            some(self.pixels[(y * self.width + x) as usize])
+        } else { none }
+    }
+
+    fn set_pixel(mut self, x: u32, y: u32, pixel: Pixel) {
+        if x < self.width && y < self.height {
+            self.pixels[(y * self.width + x) as usize] = pixel
+        }
+    }
+
+    fn fill_rect(mut self, x: u32, y: u32, w: u32, h: u32, pixel: Pixel) {
+        for dy in 0..h {
+            for dx in 0..w {
+                self.set_pixel(x + dx, y + dy, pixel)
+            }
+        }
+    }
+
+    fn to_grayscale(self) -> Image {
+        Image {
+            width: self.width, height: self.height,
+            pixels: self.pixels.iter().map(|p| p.to_grayscale()).collect(),
+        }
+    }
+
+    fn invert(self) -> Image {
+        Image {
+            width: self.width, height: self.height,
+            pixels: self.pixels.iter().map(|p| p.invert()).collect(),
+        }
+    }
+
+    fn brightness(self, factor: f32) -> Image {
+        Image {
+            width: self.width, height: self.height,
+            pixels: self.pixels.iter().map(|p| p.brightness(factor)).collect(),
+        }
+    }
+
+    fn flip_horizontal(self) -> Image {
+        let mut result = self.clone()
+        for y in 0..self.height {
+            for x in 0..self.width / 2 {
+                let left = self.get_pixel(x, y).unwrap()
+                let right = self.get_pixel(self.width - 1 - x, y).unwrap()
+                result.set_pixel(x, y, right)
+                result.set_pixel(self.width - 1 - x, y, left)
+            }
+        }
+        result
+    }
+
+    fn flip_vertical(self) -> Image {
+        let mut result = self.clone()
+        for y in 0..self.height / 2 {
+            for x in 0..self.width {
+                let top = self.get_pixel(x, y).unwrap()
+                let bottom = self.get_pixel(x, self.height - 1 - y).unwrap()
+                result.set_pixel(x, y, bottom)
+                result.set_pixel(x, self.height - 1 - y, top)
+            }
+        }
+        result
+    }
+
+    fn rotate_90(self) -> Image {
+        let mut result = Image.new(self.height, self.width, Pixel.black())
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let p = self.get_pixel(x, y).unwrap()
+                result.set_pixel(self.height - 1 - y, x, p)
+            }
+        }
+        result
+    }
+
+    fn crop(self, x: u32, y: u32, w: u32, h: u32) -> Image {
+        let mut result = Image.new(w, h, Pixel.black())
+        for dy in 0..h {
+            for dx in 0..w {
+                if let some(p) = self.get_pixel(x + dx, y + dy) {
+                    result.set_pixel(dx, dy, p)
+                }
+            }
+        }
+        result
+    }
+
+    fn resize_nearest(self, new_width: u32, new_height: u32) -> Image {
+        let mut result = Image.new(new_width, new_height, Pixel.black())
+        for y in 0..new_height {
+            for x in 0..new_width {
+                let sx = (x as f64 * self.width as f64 / new_width as f64) as u32
+                let sy = (y as f64 * self.height as f64 / new_height as f64) as u32
+                if let some(p) = self.get_pixel(sx.min(self.width - 1), sy.min(self.height - 1)) {
+                    result.set_pixel(x, y, p)
+                }
+            }
+        }
+        result
+    }
+
+    // Generate PPM format (portable pixmap)
+    fn to_ppm(self) -> [u8] {
+        let header = format!("P6\n{} {}\n255\n", self.width, self.height)
+        let mut data: [u8] = header.into_bytes()
+        for p in &self.pixels {
+            data.push(p.r)
+            data.push(p.g)
+            data.push(p.b)
+        }
+        data
+    }
+
+    fn histogram(self) -> ([u32; 256], [u32; 256], [u32; 256]) {
+        let mut r_hist = [0u32; 256]
+        let mut g_hist = [0u32; 256]
+        let mut b_hist = [0u32; 256]
+        for p in &self.pixels {
+            r_hist[p.r as usize] += 1
+            g_hist[p.g as usize] += 1
+            b_hist[p.b as usize] += 1
+        }
+        (r_hist, g_hist, b_hist)
+    }
+
+    fn pixel_count(self) -> usize {
+        (self.width * self.height) as usize
+    }
+}
+
+fn main() {
+    // Pixel
+    let p = Pixel.new(100, 150, 200)
+    assert(p.r == 100)
+    assert(p.g == 150)
+    assert(p.b == 200)
+    assert(p.a == 255)
+    print("Pixel ✓")
+
+    // Named colors
+    assert(Pixel.black() == Pixel.new(0, 0, 0))
+    assert(Pixel.white() == Pixel.new(255, 255, 255))
+    assert(Pixel.red().r == 255)
+    print("Named colors ✓")
+
+    // Grayscale
+    let gray = Pixel.new(100, 100, 100).grayscale()
+    assert(gray == 100)
+    let gray_pixel = Pixel.new(255, 0, 0).to_grayscale()
+    assert(gray_pixel.r == gray_pixel.g)
+    assert(gray_pixel.r == gray_pixel.b)
+    print("Grayscale ✓")
+
+    // Invert
+    let inv = Pixel.new(100, 150, 200).invert()
+    assert(inv.r == 155)
+    assert(inv.g == 105)
+    assert(inv.b == 55)
+    print("Invert ✓")
+
+    // Blend
+    let blended = Pixel.black().blend(Pixel.white(), 0.5)
+    assert(blended.r >= 127 && blended.r <= 128)
+    print("Blend ✓")
+
+    // Brightness
+    let bright = Pixel.new(100, 100, 100).brightness(2.0)
+    assert(bright.r == 200)
+    let over = Pixel.new(200, 200, 200).brightness(2.0)
+    assert(over.r == 255) // clamped
+    print("Brightness ✓")
+
+    // Image
+    let mut img = Image.new(4, 4, Pixel.black())
+    assert(img.width == 4)
+    assert(img.height == 4)
+    assert(img.pixel_count() == 16)
+    print("Image creation ✓")
+
+    // Get/set pixel
+    img.set_pixel(0, 0, Pixel.red())
+    assert(img.get_pixel(0, 0).unwrap() == Pixel.red())
+    assert(img.get_pixel(1, 0).unwrap() == Pixel.black())
+    assert(img.get_pixel(10, 10).is_none())
+    print("Get/set pixel ✓")
+
+    // Fill rect
+    img.fill_rect(1, 1, 2, 2, Pixel.blue())
+    assert(img.get_pixel(1, 1).unwrap() == Pixel.blue())
+    assert(img.get_pixel(2, 2).unwrap() == Pixel.blue())
+    assert(img.get_pixel(0, 0).unwrap() == Pixel.red())
+    print("Fill rect ✓")
+
+    // Grayscale image
+    let gray_img = img.to_grayscale()
+    let gp = gray_img.get_pixel(0, 0).unwrap()
+    assert(gp.r == gp.g && gp.g == gp.b)
+    print("Grayscale image ✓")
+
+    // Invert image
+    let inv_img = img.invert()
+    let ip = inv_img.get_pixel(0, 0).unwrap()
+    assert(ip.r == 0 && ip.g == 255 && ip.b == 255) // inverted red
+    print("Invert image ✓")
+
+    // Flip horizontal
+    let mut himg = Image.new(4, 1, Pixel.black())
+    himg.set_pixel(0, 0, Pixel.red())
+    let flipped = himg.flip_horizontal()
+    assert(flipped.get_pixel(3, 0).unwrap() == Pixel.red())
+    assert(flipped.get_pixel(0, 0).unwrap() == Pixel.black())
+    print("Flip horizontal ✓")
+
+    // Rotate 90
+    let mut rimg = Image.new(4, 2, Pixel.black())
+    rimg.set_pixel(0, 0, Pixel.green())
+    let rotated = rimg.rotate_90()
+    assert(rotated.width == 2)
+    assert(rotated.height == 4)
+    print("Rotate 90 ✓")
+
+    // Crop
+    let cropped = img.crop(1, 1, 2, 2)
+    assert(cropped.width == 2)
+    assert(cropped.height == 2)
+    assert(cropped.get_pixel(0, 0).unwrap() == Pixel.blue())
+    print("Crop ✓")
+
+    // Resize
+    let resized = img.resize_nearest(8, 8)
+    assert(resized.width == 8)
+    assert(resized.height == 8)
+    print("Resize ✓")
+
+    // PPM output
+    let small = Image.new(2, 2, Pixel.red())
+    let ppm = small.to_ppm()
+    assert(ppm.len() > 0)
+    let header = string.from_utf8(&ppm[..3]).unwrap()
+    assert(header == "P6\n" || header.starts_with("P6"))
+    print("PPM output ✓")
+
+    // Histogram
+    let (rh, gh, bh) = small.histogram()
+    assert(rh[255] == 4)
+    assert(gh[0] == 4)
+    print("Histogram ✓")
+
+    print("Image Converter complete ✓")
+}
