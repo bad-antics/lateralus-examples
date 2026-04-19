@@ -1,0 +1,430 @@
+// Niche Example — Task Scheduler
+// Priority queue, dependency graph, cron-like scheduling, work stealing.
+
+use std.collections.{HashMap, HashSet, BinaryHeap}
+use std.time.{Duration, Instant}
+
+// ── Task Priority ────────────────────────────────────────────────────────────
+enum Priority { Critical = 0, High = 1, Normal = 2, Low = 3, Background = 4 }
+
+impl Priority {
+    fn weight(self) -> u32 { 4 - self as u32 }
+}
+
+impl PartialOrd for Priority {
+    fn partial_cmp(self, other: &Priority) -> Option<std.cmp.Ordering> {
+        some((self as u32).cmp(&(*other as u32)).reverse())  // Lower value = higher priority
+    }
+}
+
+// ── Task ─────────────────────────────────────────────────────────────────────
+enum TaskState { Pending, Ready, Running, Completed, Failed(string), Cancelled }
+
+struct Task {
+    id: u64,
+    name: string,
+    priority: Priority,
+    state: TaskState,
+    dependencies: [u64],
+    created_at: u64,
+    started_at: Option<u64>,
+    completed_at: Option<u64>,
+    deadline: Option<u64>,
+    retry_count: u32,
+    max_retries: u32,
+    timeout: Option<Duration>,
+    tags: [string],
+}
+
+impl Task {
+    fn new(id: u64, name: &str, priority: Priority) -> Task {
+        Task {
+            id, name: name.to_string(), priority, state: TaskState.Pending,
+            dependencies: [], created_at: 0, started_at: none, completed_at: none,
+            deadline: none, retry_count: 0, max_retries: 3, timeout: none, tags: [],
+        }
+    }
+
+    fn with_dependency(mut self, dep_id: u64) -> Task {
+        self.dependencies.push(dep_id); self
+    }
+
+    fn with_deadline(mut self, deadline: u64) -> Task { self.deadline = some(deadline); self }
+    fn with_timeout(mut self, timeout: Duration) -> Task { self.timeout = some(timeout); self }
+    fn with_tag(mut self, tag: &str) -> Task { self.tags.push(tag.to_string()); self }
+
+    fn is_ready(self, completed: &HashSet<u64>) -> bool {
+        self.dependencies.iter().all(|dep| completed.contains(dep))
+    }
+
+    fn is_overdue(self, now: u64) -> bool {
+        self.deadline.map(|d| now > d).unwrap_or(false)
+    }
+
+    fn elapsed(self) -> Option<u64> {
+        match (self.started_at, self.completed_at) {
+            (some(start), some(end)) => some(end - start),
+            _ => none,
+        }
+    }
+
+    fn can_retry(self) -> bool { self.retry_count < self.max_retries }
+}
+
+// ── Dependency Graph ─────────────────────────────────────────────────────────
+struct DependencyGraph {
+    edges: HashMap<u64, [u64]>,      // task -> dependencies
+    dependents: HashMap<u64, [u64]>, // task -> tasks that depend on it
+}
+
+impl DependencyGraph {
+    fn new() -> DependencyGraph {
+        DependencyGraph { edges: HashMap.new(), dependents: HashMap.new() }
+    }
+
+    fn add_dependency(mut self, task_id: u64, depends_on: u64) {
+        self.edges.entry(task_id).or_insert_with(|| []).push(depends_on)
+        self.dependents.entry(depends_on).or_insert_with(|| []).push(task_id)
+    }
+
+    fn get_dependencies(self, task_id: u64) -> &[u64] {
+        self.edges.get(&task_id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    fn get_dependents(self, task_id: u64) -> &[u64] {
+        self.dependents.get(&task_id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    fn has_cycle(self) -> bool {
+        let mut visited: HashSet<u64> = HashSet.new()
+        let mut in_stack: HashSet<u64> = HashSet.new()
+
+        for task_id in self.edges.keys() {
+            if self.dfs_cycle(*task_id, &mut visited, &mut in_stack) { return true }
+        }
+        false
+    }
+
+    fn dfs_cycle(self, node: u64, visited: &mut HashSet<u64>, in_stack: &mut HashSet<u64>) -> bool {
+        if in_stack.contains(&node) { return true }
+        if visited.contains(&node) { return false }
+
+        visited.insert(node)
+        in_stack.insert(node)
+
+        for dep in self.get_dependencies(node) {
+            if self.dfs_cycle(*dep, visited, in_stack) { return true }
+        }
+
+        in_stack.remove(&node)
+        false
+    }
+
+    fn topological_sort(self) -> Result<[u64], string> {
+        if self.has_cycle() { return err("dependency cycle detected".to_string()) }
+
+        let mut in_degree: HashMap<u64, usize> = HashMap.new()
+        let mut all_nodes: HashSet<u64> = HashSet.new()
+
+        for (task, deps) in &self.edges {
+            all_nodes.insert(*task)
+            in_degree.entry(*task).or_insert(0)
+            for dep in deps {
+                all_nodes.insert(*dep)
+                *in_degree.entry(*dep).or_insert(0) += 1
+            }
+        }
+
+        // Wait—edges go task->dependency, so in_degree should count incoming edges
+        // Actually for topo sort we need: for each node, count how many depend on it
+        let mut in_deg: HashMap<u64, usize> = HashMap.new()
+        for node in &all_nodes { in_deg.insert(*node, 0); }
+        for (task, deps) in &self.edges {
+            for dep in deps {
+                // dep must finish before task
+                *in_deg.entry(*task).or_insert(0) += 1
+            }
+        }
+
+        let mut queue: [u64] = in_deg.iter().filter(|(_, &d)| d == 0).map(|(id, _)| *id).collect()
+        let mut result: [u64] = []
+
+        while !queue.is_empty() {
+            let node = queue.remove(0)
+            result.push(node)
+            for dep in self.get_dependents(node) {
+                let deg = in_deg.get_mut(dep).unwrap()
+                *deg -= 1
+                if *deg == 0 { queue.push(*dep) }
+            }
+        }
+
+        if result.len() == all_nodes.len() { ok(result) }
+        else { err("unresolved dependencies".to_string()) }
+    }
+}
+
+// ── Cron Expression ──────────────────────────────────────────────────────────
+struct CronSchedule {
+    minutes: [u8],     // 0-59
+    hours: [u8],       // 0-23
+    days: [u8],        // 1-31
+    months: [u8],      // 1-12
+    weekdays: [u8],    // 0-6 (Sun-Sat)
+}
+
+impl CronSchedule {
+    fn parse(expr: &str) -> Result<CronSchedule, string> {
+        let parts: [&str] = expr.split(' ').collect()
+        if parts.len() != 5 { return err("cron must have 5 fields".to_string()) }
+
+        ok(CronSchedule {
+            minutes: parse_cron_field(parts[0], 0, 59)?,
+            hours: parse_cron_field(parts[1], 0, 23)?,
+            days: parse_cron_field(parts[2], 1, 31)?,
+            months: parse_cron_field(parts[3], 1, 12)?,
+            weekdays: parse_cron_field(parts[4], 0, 6)?,
+        })
+    }
+
+    fn matches(self, minute: u8, hour: u8, day: u8, month: u8, weekday: u8) -> bool {
+        self.minutes.contains(&minute) && self.hours.contains(&hour)
+        && self.days.contains(&day) && self.months.contains(&month)
+        && self.weekdays.contains(&weekday)
+    }
+
+    fn every_minute() -> CronSchedule { CronSchedule.parse("* * * * *").unwrap() }
+    fn every_hour() -> CronSchedule { CronSchedule.parse("0 * * * *").unwrap() }
+    fn daily_at(hour: u8, minute: u8) -> CronSchedule {
+        CronSchedule.parse(&format!("{minute} {hour} * * *")).unwrap()
+    }
+}
+
+fn parse_cron_field(field: &str, min: u8, max: u8) -> Result<[u8], string> {
+    if field == "*" { return ok((min..=max).collect()) }
+    if field.contains('/') {
+        let parts: [&str] = field.split('/').collect()
+        let step = parts[1].parse::<u8>().map_err(|_| "invalid step".to_string())?
+        return ok((min..=max).step_by(step as usize).collect())
+    }
+    if field.contains(',') {
+        return field.split(',').map(|v| v.parse::<u8>().map_err(|_| "invalid value".to_string())).collect()
+    }
+    if field.contains('-') {
+        let parts: [&str] = field.split('-').collect()
+        let start = parts[0].parse::<u8>().map_err(|_| "invalid range start".to_string())?
+        let end = parts[1].parse::<u8>().map_err(|_| "invalid range end".to_string())?
+        return ok((start..=end).collect())
+    }
+    let val = field.parse::<u8>().map_err(|_| "invalid value".to_string())?
+    ok([val])
+}
+
+// ── Scheduler ────────────────────────────────────────────────────────────────
+struct Scheduler {
+    tasks: HashMap<u64, Task>,
+    graph: DependencyGraph,
+    completed: HashSet<u64>,
+    next_id: u64,
+    cron_jobs: [(u64, CronSchedule)],
+}
+
+impl Scheduler {
+    fn new() -> Scheduler {
+        Scheduler {
+            tasks: HashMap.new(), graph: DependencyGraph.new(),
+            completed: HashSet.new(), next_id: 1, cron_jobs: [],
+        }
+    }
+
+    fn add_task(mut self, name: &str, priority: Priority) -> u64 {
+        let id = self.next_id; self.next_id += 1
+        self.tasks.insert(id, Task.new(id, name, priority))
+        id
+    }
+
+    fn add_dependency(mut self, task_id: u64, depends_on: u64) {
+        if let some(task) = self.tasks.get_mut(&task_id) {
+            task.dependencies.push(depends_on)
+        }
+        self.graph.add_dependency(task_id, depends_on)
+    }
+
+    fn get_ready_tasks(self) -> [u64] {
+        let mut ready: [u64] = []
+        for (id, task) in &self.tasks {
+            match task.state {
+                TaskState.Pending => {
+                    if task.is_ready(&self.completed) { ready.push(*id) }
+                }
+                _ => {}
+            }
+        }
+        // Sort by priority (higher priority first)
+        ready.sort_by(|a, b| {
+            let ta = self.tasks.get(a).unwrap()
+            let tb = self.tasks.get(b).unwrap()
+            (ta.priority as u32).cmp(&(tb.priority as u32))
+        })
+        ready
+    }
+
+    fn start_task(mut self, id: u64, now: u64) {
+        if let some(task) = self.tasks.get_mut(&id) {
+            task.state = TaskState.Running
+            task.started_at = some(now)
+        }
+    }
+
+    fn complete_task(mut self, id: u64, now: u64) {
+        if let some(task) = self.tasks.get_mut(&id) {
+            task.state = TaskState.Completed
+            task.completed_at = some(now)
+            self.completed.insert(id)
+        }
+    }
+
+    fn fail_task(mut self, id: u64, error: &str) {
+        if let some(task) = self.tasks.get_mut(&id) {
+            if task.can_retry() {
+                task.retry_count += 1
+                task.state = TaskState.Pending
+            } else {
+                task.state = TaskState.Failed(error.to_string())
+            }
+        }
+    }
+
+    fn cancel_task(mut self, id: u64) {
+        if let some(task) = self.tasks.get_mut(&id) { task.state = TaskState.Cancelled }
+    }
+
+    fn stats(self) -> SchedulerStats {
+        let mut pending = 0; let mut running = 0; let mut completed = 0; let mut failed = 0
+        for (_, task) in &self.tasks {
+            match task.state {
+                TaskState.Pending | TaskState.Ready => pending += 1,
+                TaskState.Running => running += 1,
+                TaskState.Completed => completed += 1,
+                TaskState.Failed(_) => failed += 1,
+                _ => {}
+            }
+        }
+        SchedulerStats { total: self.tasks.len(), pending, running, completed, failed }
+    }
+}
+
+struct SchedulerStats { total: usize, pending: usize, running: usize, completed: usize, failed: usize }
+
+fn main() {
+    let mut scheduler = Scheduler.new()
+
+    // Add tasks
+    let t1 = scheduler.add_task("Download data", Priority.High)
+    let t2 = scheduler.add_task("Parse data", Priority.Normal)
+    let t3 = scheduler.add_task("Analyze", Priority.Normal)
+    let t4 = scheduler.add_task("Report", Priority.Low)
+
+    // Dependencies: t2 depends on t1, t3 depends on t2, t4 depends on t3
+    scheduler.add_dependency(t2, t1)
+    scheduler.add_dependency(t3, t2)
+    scheduler.add_dependency(t4, t3)
+
+    // Only t1 should be ready
+    let ready = scheduler.get_ready_tasks()
+    assert(ready.len() == 1)
+    assert(ready[0] == t1)
+    print("Initial ready tasks: [${t1}] ✓")
+
+    // Complete t1 → t2 becomes ready
+    scheduler.start_task(t1, 100)
+    scheduler.complete_task(t1, 150)
+    let ready = scheduler.get_ready_tasks()
+    assert(ready.len() == 1 && ready[0] == t2)
+    print("After t1 complete: [${t2}] ready ✓")
+
+    // Complete chain
+    scheduler.start_task(t2, 200)
+    scheduler.complete_task(t2, 300)
+    scheduler.start_task(t3, 300)
+    scheduler.complete_task(t3, 400)
+
+    let ready = scheduler.get_ready_tasks()
+    assert(ready[0] == t4)
+    print("Dependency chain ✓")
+
+    // Stats
+    let stats = scheduler.stats()
+    assert(stats.completed == 3)
+    assert(stats.pending == 1)
+    print("Stats: completed=${stats.completed}, pending=${stats.pending} ✓")
+
+    // Dependency graph cycle detection
+    let mut graph = DependencyGraph.new()
+    graph.add_dependency(1, 2)
+    graph.add_dependency(2, 3)
+    assert(!graph.has_cycle())
+    print("No cycle ✓")
+
+    graph.add_dependency(3, 1)
+    assert(graph.has_cycle())
+    print("Cycle detected ✓")
+
+    // Topological sort (acyclic graph)
+    let mut graph = DependencyGraph.new()
+    graph.add_dependency(2, 1)
+    graph.add_dependency(3, 1)
+    graph.add_dependency(4, 2)
+    graph.add_dependency(4, 3)
+    let order = graph.topological_sort().unwrap()
+    assert(order[0] == 1)  // 1 has no deps
+    assert(order.last().unwrap() == &4)  // 4 depends on everything
+    print("Topological sort: ${order:?} ✓")
+
+    // Cron parsing
+    let cron = CronSchedule.parse("30 2 * * 1-5").unwrap()
+    assert(cron.minutes == [30])
+    assert(cron.hours == [2])
+    assert(cron.weekdays == [1, 2, 3, 4, 5])
+    print("Cron parse ✓")
+
+    assert(cron.matches(30, 2, 15, 6, 3))   // Wednesday at 2:30
+    assert(!cron.matches(30, 2, 15, 6, 0))  // Sunday
+    assert(!cron.matches(15, 2, 15, 6, 3))  // wrong minute
+    print("Cron matching ✓")
+
+    // Cron helpers
+    let every_min = CronSchedule.every_minute()
+    assert(every_min.minutes.len() == 60)
+    let daily = CronSchedule.daily_at(9, 0)
+    assert(daily.hours == [9])
+    assert(daily.minutes == [0])
+    print("Cron helpers ✓")
+
+    // Retry logic
+    let mut scheduler2 = Scheduler.new()
+    let rt = scheduler2.add_task("Flaky task", Priority.Normal)
+    scheduler2.start_task(rt, 0)
+    scheduler2.fail_task(rt, "timeout")
+    match scheduler2.tasks.get(&rt).unwrap().state { TaskState.Pending => {} _ => panic("should retry") }
+    assert(scheduler2.tasks.get(&rt).unwrap().retry_count == 1)
+    print("Retry on failure ✓")
+
+    // Exhaust retries
+    scheduler2.start_task(rt, 10); scheduler2.fail_task(rt, "timeout")
+    scheduler2.start_task(rt, 20); scheduler2.fail_task(rt, "timeout")
+    scheduler2.start_task(rt, 30); scheduler2.fail_task(rt, "timeout")
+    match scheduler2.tasks.get(&rt).unwrap().state { TaskState.Failed(_) => {} _ => panic("should fail") }
+    print("Max retries exceeded ✓")
+
+    // Priority ordering
+    let mut scheduler3 = Scheduler.new()
+    scheduler3.add_task("Low", Priority.Low)
+    scheduler3.add_task("Critical", Priority.Critical)
+    scheduler3.add_task("Normal", Priority.Normal)
+    let ready = scheduler3.get_ready_tasks()
+    assert(scheduler3.tasks.get(&ready[0]).unwrap().name == "Critical")
+    print("Priority ordering ✓")
+
+    print("Task Scheduler complete ✓")
+}
