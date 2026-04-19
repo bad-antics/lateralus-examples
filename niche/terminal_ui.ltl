@@ -1,0 +1,263 @@
+// Niche Example - Terminal UI Framework
+// ANSI escape codes, box drawing, colors, widgets, layout.
+
+enum Color {
+    Black, Red, Green, Yellow, Blue, Magenta, Cyan, White,
+    BrightBlack, BrightRed, BrightGreen, BrightYellow,
+    BrightBlue, BrightMagenta, BrightCyan, BrightWhite,
+    Rgb(u8, u8, u8),
+    Ansi256(u8),
+}
+
+impl Color {
+    fn fg_code(self) -> string {
+        match self {
+            Color.Black => "30".into(), Color.Red => "31".into(), Color.Green => "32".into(),
+            Color.Yellow => "33".into(), Color.Blue => "34".into(), Color.Magenta => "35".into(),
+            Color.Cyan => "36".into(), Color.White => "37".into(),
+            Color.BrightBlack => "90".into(), Color.BrightRed => "91".into(),
+            Color.BrightGreen => "92".into(), Color.BrightYellow => "93".into(),
+            Color.BrightBlue => "94".into(), Color.BrightMagenta => "95".into(),
+            Color.BrightCyan => "96".into(), Color.BrightWhite => "97".into(),
+            Color.Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
+            Color.Ansi256(n) => format!("38;5;{n}"),
+        }
+    }
+    fn bg_code(self) -> string {
+        match self {
+            Color.Black => "40".into(), Color.Red => "41".into(), Color.Green => "42".into(),
+            Color.Yellow => "43".into(), Color.Blue => "44".into(), Color.Magenta => "45".into(),
+            Color.Cyan => "46".into(), Color.White => "47".into(),
+            Color.Rgb(r, g, b) => format!("48;2;{r};{g};{b}"),
+            Color.Ansi256(n) => format!("48;5;{n}"),
+            _ => "49".into(),
+        }
+    }
+}
+
+struct Style {
+    fg: Option<Color>,
+    bg: Option<Color>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+}
+
+impl Style {
+    fn new() -> Style { Style { fg: none, bg: none, bold: false, italic: false, underline: false, strikethrough: false } }
+    fn fg(mut self, c: Color) -> Style { self.fg = some(c); self }
+    fn bg(mut self, c: Color) -> Style { self.bg = some(c); self }
+    fn bold(mut self) -> Style { self.bold = true; self }
+    fn italic(mut self) -> Style { self.italic = true; self }
+    fn underline(mut self) -> Style { self.underline = true; self }
+
+    fn apply(self, text: &str) -> string {
+        let mut codes: [string] = []
+        if self.bold { codes.push("1".into()) }
+        if self.italic { codes.push("3".into()) }
+        if self.underline { codes.push("4".into()) }
+        if self.strikethrough { codes.push("9".into()) }
+        if let some(fg) = &self.fg { codes.push(fg.fg_code()) }
+        if let some(bg) = &self.bg { codes.push(bg.bg_code()) }
+        if codes.is_empty() { return text.to_string() }
+        format!("\x1b[{}m{}\x1b[0m", codes.join(";"), text)
+    }
+}
+
+struct Rect { x: u16, y: u16, width: u16, height: u16 }
+
+impl Rect {
+    fn new(x: u16, y: u16, w: u16, h: u16) -> Rect { Rect { x, y, width: w, height: h } }
+    fn area(self) -> u32 { self.width as u32 * self.height as u32 }
+    fn inner(self, margin: u16) -> Rect {
+        Rect { x: self.x + margin, y: self.y + margin,
+            width: self.width.saturating_sub(margin * 2),
+            height: self.height.saturating_sub(margin * 2) }
+    }
+}
+
+struct Buffer {
+    width: u16,
+    height: u16,
+    cells: [BufferCell],
+}
+
+struct BufferCell { ch: char, style: Style }
+
+impl Buffer {
+    fn new(width: u16, height: u16) -> Buffer {
+        let cells = (0..width as usize * height as usize)
+            .map(|_| BufferCell { ch: ' ', style: Style.new() })
+            .collect()
+        Buffer { width, height, cells }
+    }
+
+    fn set(mut self, x: u16, y: u16, ch: char, style: &Style) {
+        if x < self.width && y < self.height {
+            let idx = y as usize * self.width as usize + x as usize
+            self.cells[idx] = BufferCell { ch, style: style.clone() }
+        }
+    }
+
+    fn write_str(mut self, x: u16, y: u16, text: &str, style: &Style) {
+        for (i, ch) in text.chars().enumerate() {
+            self.set(x + i as u16, y, ch, style)
+        }
+    }
+
+    fn draw_box(mut self, rect: &Rect, style: &Style) {
+        let (x, y, w, h) = (rect.x, rect.y, rect.width, rect.height)
+        self.set(x, y, '\u{250c}', style)                    // top-left
+        self.set(x + w - 1, y, '\u{2510}', style)            // top-right
+        self.set(x, y + h - 1, '\u{2514}', style)            // bottom-left
+        self.set(x + w - 1, y + h - 1, '\u{2518}', style)    // bottom-right
+        for i in 1..w - 1 {
+            self.set(x + i, y, '\u{2500}', style)             // top
+            self.set(x + i, y + h - 1, '\u{2500}', style)    // bottom
+        }
+        for i in 1..h - 1 {
+            self.set(x, y + i, '\u{2502}', style)             // left
+            self.set(x + w - 1, y + i, '\u{2502}', style)    // right
+        }
+    }
+
+    fn render(self) -> string {
+        let mut out = string.new()
+        out.push_str("\x1b[2J\x1b[H")  // clear + home
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let cell = &self.cells[y as usize * self.width as usize + x as usize]
+                out.push_str(&cell.style.apply(&cell.ch.to_string()))
+            }
+            out.push('\n')
+        }
+        out
+    }
+}
+
+enum Widget {
+    Text { content: string, style: Style },
+    Box { title: Option<string>, style: Style },
+    List { items: [string], selected: usize, style: Style },
+    ProgressBar { progress: f32, width: u16, style: Style },
+    Table { headers: [string], rows: [[string]], style: Style },
+}
+
+impl Widget {
+    fn draw(self, buf: &mut Buffer, rect: &Rect) {
+        match self {
+            Widget.Text { content, style } => {
+                for (i, line) in content.lines().enumerate() {
+                    if rect.y + i as u16 >= rect.y + rect.height { break }
+                    let display = if line.len() > rect.width as usize {
+                        &line[..rect.width as usize]
+                    } else { line }
+                    buf.write_str(rect.x, rect.y + i as u16, display, style)
+                }
+            }
+            Widget.Box { title, style } => {
+                buf.draw_box(rect, style)
+                if let some(t) = title {
+                    let header = format!(" {} ", t)
+                    buf.write_str(rect.x + 1, rect.y, &header, style)
+                }
+            }
+            Widget.List { items, selected, style } => {
+                buf.draw_box(rect, style)
+                let inner = rect.inner(1)
+                for (i, item) in items.iter().enumerate() {
+                    if i as u16 >= inner.height { break }
+                    let prefix = if i == *selected { "> " } else { "  " }
+                    let line_style = if i == *selected { style.clone().bold() } else { style.clone() }
+                    buf.write_str(inner.x, inner.y + i as u16, &format!("{prefix}{item}"), &line_style)
+                }
+            }
+            Widget.ProgressBar { progress, width, style } => {
+                let filled = (progress.clamp(0.0, 1.0) * *width as f32) as u16
+                let bar: string = "\u{2588}".repeat(filled as usize) + &"\u{2591}".repeat((*width - filled) as usize)
+                let label = format!(" {:.0}%", progress * 100.0)
+                buf.write_str(rect.x, rect.y, &format!("{bar}{label}"), style)
+            }
+            Widget.Table { headers, rows, style } => {
+                buf.draw_box(rect, style)
+                let inner = rect.inner(1)
+                let header_str = headers.join(" | ")
+                buf.write_str(inner.x, inner.y, &header_str, &style.clone().bold())
+                let sep: string = "\u{2500}".repeat(inner.width as usize)
+                buf.write_str(inner.x, inner.y + 1, &sep, style)
+                for (i, row) in rows.iter().enumerate() {
+                    if i as u16 + 2 >= inner.height { break }
+                    buf.write_str(inner.x, inner.y + 2 + i as u16, &row.join(" | "), style)
+                }
+            }
+        }
+    }
+}
+
+enum LayoutDirection { Horizontal, Vertical }
+
+fn split(rect: &Rect, direction: LayoutDirection, sizes: &[u16]) -> [Rect] {
+    let mut result: [Rect] = []
+    match direction {
+        LayoutDirection.Horizontal => {
+            let mut x = rect.x
+            for size in sizes {
+                result.push(Rect.new(x, rect.y, *size, rect.height))
+                x += size
+            }
+        }
+        LayoutDirection.Vertical => {
+            let mut y = rect.y
+            for size in sizes {
+                result.push(Rect.new(rect.x, y, rect.width, *size))
+                y += size
+            }
+        }
+    }
+    result
+}
+
+fn main() {
+    let style = Style.new().fg(Color.Green).bold()
+    let text = style.apply("Hello, Terminal!")
+    assert(text.contains("\x1b["))
+    assert(text.contains("Hello, Terminal!"))
+    print("Style apply \u2713")
+
+    let rect = Rect.new(0, 0, 40, 20)
+    assert(rect.area() == 800)
+    let inner = rect.inner(1)
+    assert(inner.x == 1 && inner.y == 1 && inner.width == 38 && inner.height == 18)
+    print("Rect \u2713")
+
+    let mut buf = Buffer.new(40, 10)
+    buf.write_str(0, 0, "Test", &Style.new())
+    assert(buf.cells[0].ch == 'T')
+    assert(buf.cells[3].ch == 't')
+    print("Buffer write \u2713")
+
+    buf.draw_box(&Rect.new(0, 0, 10, 5), &Style.new())
+    assert(buf.cells[0].ch == '\u{250c}')
+    print("Box drawing \u2713")
+
+    let areas = split(&rect, LayoutDirection.Vertical, &[5, 10, 5])
+    assert(areas.len() == 3)
+    assert(areas[0].height == 5)
+    assert(areas[1].y == 5)
+    print("Layout split \u2713")
+
+    let progress = Widget.ProgressBar { progress: 0.75, width: 20, style: Style.new().fg(Color.Cyan) }
+    let mut buf2 = Buffer.new(30, 1)
+    progress.draw(&mut buf2, &Rect.new(0, 0, 30, 1))
+    print("Progress bar \u2713")
+
+    let colors = [Color.Red, Color.Green, Color.Blue, Color.Rgb(128, 0, 255)]
+    for c in &colors {
+        let code = c.fg_code()
+        assert(!code.is_empty())
+    }
+    print("Colors \u2713")
+
+    print("Terminal UI complete \u2713")
+}
