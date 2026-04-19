@@ -1,0 +1,86 @@
+// process_manager.ltl — Spawn and supervise child processes
+// Run: lateralus run systems/process_manager.ltl
+
+use std.process.{Command, Child, ExitStatus}
+use std.time.{Duration, Instant}
+use std.sync.{Arc, Mutex}
+
+struct ManagedProcess {
+    name:      string,
+    cmd:       string,
+    args:      [string],
+    child:     Child?,
+    restarts:  int,
+    started:   Instant?,
+}
+
+struct Supervisor {
+    processes: Arc<Mutex<[ManagedProcess]>>,
+    max_restarts: int,
+}
+
+impl Supervisor {
+    fn new(max_restarts: int) -> Supervisor {
+        Supervisor { processes: Arc.new(Mutex.new([])), max_restarts }
+    }
+
+    fn add(self, name: string, cmd: string, args: [string]) {
+        self.processes.lock().push(ManagedProcess {
+            name, cmd, args, child: none, restarts: 0, started: none,
+        })
+    }
+
+    fn start_all(self) {
+        let mut procs = self.processes.lock()
+        for p in procs.iter_mut() {
+            self.spawn_one(p)
+        }
+    }
+
+    fn spawn_one(self, p: mut ManagedProcess) {
+        match Command.new(p.cmd.clone()).args(p.args.clone()).spawn() {
+            err(e) => eprintln("[supervisor] Failed to start ${p.name}: ${e}"),
+            ok(child) => {
+                print("[supervisor] Started ${p.name} (pid ${child.pid()})")
+                p.child   = some(child)
+                p.started = some(Instant.now())
+            },
+        }
+    }
+
+    fn monitor(self) {
+        loop {
+            std.thread.sleep_ms(500)
+            let mut procs = self.processes.lock()
+            for p in procs.iter_mut() {
+                let exited = p.child.as_mut()
+                    .and_then(|c| c.try_wait().ok())
+                    .flatten()
+                    .is_some()
+
+                if exited {
+                    p.child = none
+                    if p.restarts < self.max_restarts {
+                        p.restarts += 1
+                        eprintln("[supervisor] ${p.name} exited — restart #${p.restarts}")
+                        self.spawn_one(p)
+                    } else {
+                        eprintln("[supervisor] ${p.name} exceeded max restarts — giving up")
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    let sup = Supervisor.new(3)
+    sup.add("echo-server", "nc", ["-l", "-p", "9999", "-k"])
+    sup.add("date-logger", "sh", ["-c", "while true; do date; sleep 5; done"])
+
+    sup.start_all()
+    print("Supervisor running. Ctrl+C to stop.")
+    sup.monitor()
+}
+
+main()
