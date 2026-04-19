@@ -1,0 +1,159 @@
+// tetris.ltl — Terminal Tetris
+// Run: lateralus run games/tetris.ltl
+
+use std.terminal.{clear, cursor, hide_cursor, show_cursor, raw_mode}
+use std.io.{stdin, Key}
+use std.time.{sleep, Duration, Instant}
+use std.rand
+
+const COLS = 10
+const ROWS = 20
+
+type Board = [[int]]
+
+let PIECES: [[[int]]] = [
+    [[1,1,1,1]],                            // I
+    [[1,1],[1,1]],                           // O
+    [[0,1,0],[1,1,1]],                       // T
+    [[1,0],[1,0],[1,1]],                     // L
+    [[0,1],[0,1],[1,1]],                     // J
+    [[0,1,1],[1,1,0]],                       // S
+    [[1,1,0],[0,1,1]],                       // Z
+]
+
+struct Piece { shape: [[int]], x: int, y: int, color: int }
+
+impl Piece {
+    fn random() -> Piece {
+        let shape = PIECES[rand.int(0, PIECES.len())]
+        Piece { shape, x: COLS / 2 - shape[0].len() / 2, y: 0, color: rand.int(1, 8) }
+    }
+
+    fn rotate(self) -> Piece {
+        let rows = self.shape.len()
+        let cols = self.shape[0].len()
+        let rotated = range(0, cols) |> map(c =>
+            range(0, rows) |> map(r => self.shape[rows - 1 - r][c]) |> collect()
+        ) |> collect()
+        Piece { shape: rotated, ..self }
+    }
+
+    fn cells(self) -> [Point] {
+        self.shape |> enumerate() |> flat_map(|(r, row)| {
+            row |> enumerate()
+                |> filter(|(_, v)| v != 0)
+                |> map(|(c, _)| Point { x: self.x + c, y: self.y + r })
+        }) |> collect()
+    }
+}
+
+struct Point { x: int, y: int }
+
+fn empty_board() -> Board {
+    range(0, ROWS) |> map(_ => vec![0; COLS]) |> collect()
+}
+
+fn collides(board: Board, piece: Piece) -> bool {
+    piece.cells() |> any(|p|
+        p.x < 0 || p.x >= COLS || p.y >= ROWS ||
+        (p.y >= 0 && board[p.y][p.x] != 0)
+    )
+}
+
+fn lock(mut board: Board, piece: Piece) -> Board {
+    piece.cells() |> filter(|p| p.y >= 0) |> each(|p| {
+        board[p.y][p.x] = piece.color
+    })
+    board
+}
+
+fn clear_lines(mut board: Board) -> (Board, int) {
+    let cleared = board |> filter(|row| row |> any(|c| c == 0)) |> collect()
+    let lines   = ROWS - cleared.len()
+    let new_top = range(0, lines) |> map(_ => vec![0; COLS]) |> collect()
+    ([...new_top, ...cleared], lines)
+}
+
+fn draw(board: Board, piece: Piece, score: int, level: int) {
+    clear()
+    cursor(0, 0)
+    print("Score: ${score}  Level: ${level}")
+    print("+" + "-".repeat(COLS) + "+")
+    for y in range(0, ROWS) {
+        mut row = "|"
+        for x in range(0, COLS) {
+            let in_piece = piece.cells() |> any(|p| p.x == x && p.y == y)
+            let v = if in_piece { piece.color } else { board[y][x] }
+            row += if v == 0 { " " } else { "#" }
+        }
+        print(row + "|")
+    }
+    print("+" + "-".repeat(COLS) + "+")
+    print("Controls: a/d = move, w = rotate, s = drop, q = quit")
+}
+
+fn main() {
+    hide_cursor()
+    raw_mode(true)
+
+    mut board   = empty_board()
+    mut piece   = Piece.random()
+    mut score   = 0
+    mut level   = 1
+    mut lines   = 0
+    mut running = true
+    mut last_drop = Instant.now()
+    let drop_interval = Duration.ms(500)
+
+    while running {
+        match stdin.try_read_key() {
+            some(Key.Char('q')) => running = false,
+            some(Key.Char('a')) | some(Key.Left) => {
+                let moved = Piece { x: piece.x - 1, ..piece }
+                if !collides(board, moved) { piece = moved }
+            },
+            some(Key.Char('d')) | some(Key.Right) => {
+                let moved = Piece { x: piece.x + 1, ..piece }
+                if !collides(board, moved) { piece = moved }
+            },
+            some(Key.Char('w')) | some(Key.Up) => {
+                let rotated = piece.rotate()
+                if !collides(board, rotated) { piece = rotated }
+            },
+            some(Key.Char('s')) | some(Key.Down) => {
+                let dropped = Piece { y: piece.y + 1, ..piece }
+                if !collides(board, dropped) { piece = dropped }
+            },
+            _ => {},
+        }
+
+        if last_drop.elapsed() >= drop_interval {
+            let dropped = Piece { y: piece.y + 1, ..piece }
+            if collides(board, dropped) {
+                board = lock(board, piece)
+                let (new_board, cleared) = clear_lines(board)
+                board = new_board
+                lines += cleared
+                score += match cleared { 0=>0, 1=>100, 2=>300, 3=>500, _=>800 } * level
+                level = lines / 10 + 1
+                piece = Piece.random()
+                if collides(board, piece) {
+                    print("
+Game Over! Score: ${score}")
+                    running = false
+                }
+            } else {
+                piece = dropped
+            }
+            last_drop = Instant.now()
+        }
+
+        if running { draw(board, piece, score, level) }
+        sleep(Duration.ms(50))
+    }
+
+    raw_mode(false)
+    show_cursor()
+}
+
+main()
