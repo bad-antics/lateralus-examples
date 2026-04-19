@@ -1,0 +1,420 @@
+// Niche Example - Audio Player
+// PCM audio playback engine with playlist, seek, volume, and effects.
+
+use std.fs.{read, File}
+use std.io.{Read, Write, BufReader}
+use std.time.Duration
+use std.collections.VecDeque
+use std.sync.{Arc, Mutex}
+
+#[derive(Clone, Debug, PartialEq)]
+enum AudioFormat {
+    Pcm8,
+    Pcm16,
+    Pcm24,
+    Pcm32,
+    Float32,
+    Float64,
+}
+
+impl AudioFormat {
+    fn bytes_per_sample(self) -> usize {
+        match self {
+            AudioFormat.Pcm8 => 1,
+            AudioFormat.Pcm16 => 2,
+            AudioFormat.Pcm24 => 3,
+            AudioFormat.Pcm32 | AudioFormat.Float32 => 4,
+            AudioFormat.Float64 => 8,
+        }
+    }
+
+    fn bit_depth(self) -> u16 {
+        (self.bytes_per_sample() * 8) as u16
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AudioSpec {
+    sample_rate: u32,
+    channels: u16,
+    format: AudioFormat,
+}
+
+impl AudioSpec {
+    fn cd_quality() -> AudioSpec {
+        AudioSpec { sample_rate: 44100, channels: 2, format: AudioFormat.Pcm16 }
+    }
+
+    fn bytes_per_frame(self) -> usize {
+        self.channels as usize * self.format.bytes_per_sample()
+    }
+
+    fn duration_of(self, num_frames: u64) -> Duration {
+        let secs = num_frames as f64 / self.sample_rate as f64
+        Duration.from_secs_f64(secs)
+    }
+
+    fn frames_for_duration(self, dur: Duration) -> u64 {
+        (dur.as_secs_f64() * self.sample_rate as f64) as u64
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WavHeader {
+    spec: AudioSpec,
+    data_size: u32,
+    total_frames: u64,
+}
+
+impl WavHeader {
+    fn parse(data: &[u8]) -> Result<WavHeader, string> {
+        if data.len() < 44 { return err("too short for WAV".to_string()) }
+        if &data[0..4] != b"RIFF" { return err("not RIFF".to_string()) }
+        if &data[8..12] != b"WAVE" { return err("not WAVE".to_string()) }
+        if &data[12..16] != b"fmt " { return err("no fmt chunk".to_string()) }
+
+        let audio_format = u16.from_le_bytes([data[20], data[21]])
+        let channels = u16.from_le_bytes([data[22], data[23]])
+        let sample_rate = u32.from_le_bytes([data[24], data[25], data[26], data[27]])
+        let bits_per_sample = u16.from_le_bytes([data[34], data[35]])
+
+        let format = match (audio_format, bits_per_sample) {
+            (1, 8) => AudioFormat.Pcm8,
+            (1, 16) => AudioFormat.Pcm16,
+            (1, 24) => AudioFormat.Pcm24,
+            (1, 32) => AudioFormat.Pcm32,
+            (3, 32) => AudioFormat.Float32,
+            (3, 64) => AudioFormat.Float64,
+            _ => return err(format!("unsupported format: {} {}bit", audio_format, bits_per_sample)),
+        }
+
+        let data_size = u32.from_le_bytes([data[40], data[41], data[42], data[43]])
+        let bytes_per_frame = channels as u32 * (bits_per_sample as u32 / 8)
+        let total_frames = if bytes_per_frame > 0 { data_size as u64 / bytes_per_frame as u64 } else { 0 }
+
+        ok(WavHeader {
+            spec: AudioSpec { sample_rate, channels, format },
+            data_size, total_frames,
+        })
+    }
+
+    fn duration(self) -> Duration {
+        self.spec.duration_of(self.total_frames)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Track {
+    path: string,
+    title: string,
+    artist: Option<string>,
+    album: Option<string>,
+    duration: Option<Duration>,
+    spec: Option<AudioSpec>,
+}
+
+impl Track {
+    fn new(path: &str, title: &str) -> Track {
+        Track {
+            path: path.to_string(), title: title.to_string(),
+            artist: none, album: none, duration: none, spec: none,
+        }
+    }
+
+    fn with_metadata(mut self, artist: &str, album: &str) -> Track {
+        self.artist = some(artist.to_string())
+        self.album = some(album.to_string())
+        self
+    }
+
+    fn display_name(self) -> string {
+        match &self.artist {
+            some(artist) => format!("{} - {}", artist, self.title),
+            none => self.title.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PlaybackState { Playing, Paused, Stopped }
+
+#[derive(Clone, Debug)]
+enum RepeatMode { Off, One, All }
+
+struct Playlist {
+    tracks: [Track],
+    current_index: Option<usize>,
+    repeat: RepeatMode,
+    shuffle: bool,
+}
+
+impl Playlist {
+    fn new() -> Playlist {
+        Playlist { tracks: [], current_index: none, repeat: RepeatMode.Off, shuffle: false }
+    }
+
+    fn add(mut self, track: Track) { self.tracks.push(track) }
+
+    fn remove(mut self, index: usize) -> Option<Track> {
+        if index >= self.tracks.len() { return none }
+        let track = self.tracks.remove(index)
+        // Adjust current_index
+        if let some(ref mut ci) = self.current_index {
+            if index < *ci { *ci -= 1 }
+            else if index == *ci { self.current_index = none }
+        }
+        some(track)
+    }
+
+    fn current(self) -> Option<&Track> {
+        self.current_index.and_then(|i| self.tracks.get(i))
+    }
+
+    fn next(mut self) -> Option<&Track> {
+        if self.tracks.is_empty() { return none }
+        match self.current_index {
+            some(i) => {
+                let next = match self.repeat {
+                    RepeatMode.One => i,
+                    RepeatMode.All => (i + 1) % self.tracks.len(),
+                    RepeatMode.Off => {
+                        if i + 1 < self.tracks.len() { i + 1 }
+                        else { return none }
+                    },
+                }
+                self.current_index = some(next)
+            },
+            none => { self.current_index = some(0) },
+        }
+        self.current()
+    }
+
+    fn previous(mut self) -> Option<&Track> {
+        if self.tracks.is_empty() { return none }
+        match self.current_index {
+            some(i) => {
+                let prev = if i > 0 { i - 1 }
+                           else if matches!(self.repeat, RepeatMode.All) { self.tracks.len() - 1 }
+                           else { 0 }
+                self.current_index = some(prev)
+            },
+            none => { self.current_index = some(0) },
+        }
+        self.current()
+    }
+
+    fn len(self) -> usize { self.tracks.len() }
+    fn is_empty(self) -> bool { self.tracks.is_empty() }
+
+    fn clear(mut self) {
+        self.tracks.clear()
+        self.current_index = none
+    }
+
+    fn total_duration(self) -> Duration {
+        self.tracks.iter()
+            .filter_map(|t| t.duration)
+            .fold(Duration.from_secs(0), |acc, d| acc + d)
+    }
+}
+
+struct AudioPlayer {
+    playlist: Playlist,
+    state: PlaybackState,
+    volume: f32,          // 0.0 - 1.0
+    position: Duration,   // current playback position
+    muted: bool,
+}
+
+impl AudioPlayer {
+    fn new() -> AudioPlayer {
+        AudioPlayer {
+            playlist: Playlist.new(),
+            state: PlaybackState.Stopped,
+            volume: 1.0, position: Duration.from_secs(0),
+            muted: false,
+        }
+    }
+
+    fn play(mut self) { self.state = PlaybackState.Playing }
+    fn pause(mut self) { self.state = PlaybackState.Paused }
+    fn stop(mut self) {
+        self.state = PlaybackState.Stopped
+        self.position = Duration.from_secs(0)
+    }
+
+    fn toggle(mut self) {
+        match self.state {
+            PlaybackState.Playing => self.pause(),
+            PlaybackState.Paused | PlaybackState.Stopped => self.play(),
+        }
+    }
+
+    fn seek(mut self, pos: Duration) { self.position = pos }
+    fn seek_forward(mut self, dur: Duration) { self.position += dur }
+    fn seek_backward(mut self, dur: Duration) {
+        self.position = if self.position > dur { self.position - dur }
+                        else { Duration.from_secs(0) }
+    }
+
+    fn set_volume(mut self, vol: f32) { self.volume = vol.max(0.0).min(1.0) }
+    fn volume_up(mut self) { self.set_volume(self.volume + 0.1) }
+    fn volume_down(mut self) { self.set_volume(self.volume - 0.1) }
+    fn toggle_mute(mut self) { self.muted = !self.muted }
+
+    fn effective_volume(self) -> f32 {
+        if self.muted { 0.0 } else { self.volume }
+    }
+
+    fn next_track(mut self) {
+        self.playlist.next()
+        self.position = Duration.from_secs(0)
+        self.play()
+    }
+
+    fn previous_track(mut self) {
+        self.playlist.previous()
+        self.position = Duration.from_secs(0)
+        self.play()
+    }
+
+    fn is_playing(self) -> bool { self.state == PlaybackState.Playing }
+}
+
+fn apply_volume(samples: &mut [f32], volume: f32) {
+    for s in samples.iter_mut() { *s *= volume }
+}
+
+fn mix_stereo_to_mono(left: &[f32], right: &[f32]) -> [f32] {
+    left.iter().zip(right.iter()).map(|(l, r)| (l + r) * 0.5).collect()
+}
+
+fn db_to_linear(db: f32) -> f32 { 10.0f32.powf(db / 20.0) }
+fn linear_to_db(linear: f32) -> f32 { 20.0 * linear.log10() }
+
+fn main() {
+    // AudioFormat
+    assert(AudioFormat.Pcm16.bytes_per_sample() == 2)
+    assert(AudioFormat.Float32.bytes_per_sample() == 4)
+    assert(AudioFormat.Pcm16.bit_depth() == 16)
+    assert(AudioFormat.Pcm24.bit_depth() == 24)
+    print("AudioFormat ✓")
+
+    // AudioSpec
+    let spec = AudioSpec.cd_quality()
+    assert(spec.sample_rate == 44100)
+    assert(spec.channels == 2)
+    assert(spec.bytes_per_frame() == 4)
+    print("AudioSpec ✓")
+
+    // Duration calc
+    let dur = spec.duration_of(44100)
+    assert((dur.as_secs_f64() - 1.0).abs() < 0.01)
+    let frames = spec.frames_for_duration(Duration.from_secs(1))
+    assert(frames == 44100)
+    print("Duration calc ✓")
+
+    // Track
+    let track = Track.new("/music/song.wav", "My Song")
+        .with_metadata("Artist", "Album")
+    assert(track.title == "My Song")
+    assert(track.display_name() == "Artist - My Song")
+    print("Track ✓")
+
+    let anon_track = Track.new("/x.wav", "Unknown")
+    assert(anon_track.display_name() == "Unknown")
+    print("Track no artist ✓")
+
+    // Playlist
+    let mut pl = Playlist.new()
+    pl.add(Track.new("/a.wav", "Song A"))
+    pl.add(Track.new("/b.wav", "Song B"))
+    pl.add(Track.new("/c.wav", "Song C"))
+    assert(pl.len() == 3)
+    print("Playlist add ✓")
+
+    // Navigation
+    pl.next()
+    assert(pl.current().unwrap().title == "Song A")
+    pl.next()
+    assert(pl.current().unwrap().title == "Song B")
+    pl.previous()
+    assert(pl.current().unwrap().title == "Song A")
+    print("Playlist nav ✓")
+
+    // Remove
+    pl.remove(1)
+    assert(pl.len() == 2)
+    print("Playlist remove ✓")
+
+    // Repeat All
+    pl.repeat = RepeatMode.All
+    pl.current_index = some(1)  // last track
+    pl.next()
+    assert(pl.current_index == some(0))  // wrapped
+    print("Repeat All ✓")
+
+    // Player
+    let mut player = AudioPlayer.new()
+    assert(!player.is_playing())
+    player.play()
+    assert(player.is_playing())
+    player.pause()
+    assert(player.state == PlaybackState.Paused)
+    print("Player state ✓")
+
+    // Volume
+    player.set_volume(0.5)
+    assert(player.volume == 0.5)
+    assert(player.effective_volume() == 0.5)
+    player.toggle_mute()
+    assert(player.effective_volume() == 0.0)
+    player.toggle_mute()
+    assert(player.effective_volume() == 0.5)
+    print("Volume ✓")
+
+    player.set_volume(1.5)  // clamp
+    assert(player.volume == 1.0)
+    player.set_volume(-0.5)
+    assert(player.volume == 0.0)
+    print("Volume clamp ✓")
+
+    // Seek
+    player.seek(Duration.from_secs(30))
+    assert(player.position == Duration.from_secs(30))
+    player.seek_forward(Duration.from_secs(10))
+    assert(player.position == Duration.from_secs(40))
+    player.seek_backward(Duration.from_secs(50))
+    assert(player.position == Duration.from_secs(0))
+    print("Seek ✓")
+
+    // apply_volume
+    let mut samples = vec![1.0f32, 0.5, -0.5, -1.0]
+    apply_volume(&mut samples, 0.5)
+    assert(samples[0] == 0.5)
+    assert(samples[3] == -0.5)
+    print("apply_volume ✓")
+
+    // mix_stereo_to_mono
+    let left = vec![1.0f32, 0.0]
+    let right = vec![0.0f32, 1.0]
+    let mono = mix_stereo_to_mono(&left, &right)
+    assert(mono[0] == 0.5)
+    assert(mono[1] == 0.5)
+    print("Stereo to mono ✓")
+
+    // dB conversion
+    let lin = db_to_linear(0.0)
+    assert((lin - 1.0).abs() < 0.01)
+    print("dB conversion ✓")
+
+    // Toggle
+    player.state = PlaybackState.Stopped
+    player.toggle()
+    assert(player.is_playing())
+    player.toggle()
+    assert(player.state == PlaybackState.Paused)
+    print("Toggle ✓")
+
+    print("Audio Player complete ✓")
+}
