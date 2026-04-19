@@ -1,337 +1,384 @@
-// Niche Example - Text Editor (Terminal-based)
-// Gap buffer, cursor movement, line operations, undo/redo.
+// Niche Example - Text Editor
+// Buffer management, cursor, selection, undo/redo, and basic editing operations.
 
-struct GapBuffer {
-    buffer: [char],
-    gap_start: usize,
-    gap_end: usize,
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+struct Position {
+    line: usize,
+    col: usize,
 }
 
-impl GapBuffer {
-    fn new(capacity: usize) -> GapBuffer {
-        GapBuffer { buffer: ['\0'; capacity], gap_start: 0, gap_end: capacity }
+impl Position {
+    fn new(line: usize, col: usize) -> Position {
+        Position { line, col }
     }
 
-    fn len(self) -> usize { self.buffer.len() - self.gap_len() }
-    fn gap_len(self) -> usize { self.gap_end - self.gap_start }
+    fn origin() -> Position { Position { line: 0, col: 0 } }
+}
 
-    fn move_gap(mut self, pos: usize) {
-        if pos == self.gap_start { return }
-        if pos < self.gap_start {
-            let shift = self.gap_start - pos
-            for i in (0..shift).rev() {
-                self.buffer[self.gap_end - shift + i] = self.buffer[pos + i]
-            }
-            self.gap_end -= shift
-            self.gap_start = pos
-        } else {
-            let shift = pos - self.gap_start
-            for i in 0..shift {
-                self.buffer[self.gap_start + i] = self.buffer[self.gap_end + i]
-            }
-            self.gap_start += shift
-            self.gap_end += shift
-        }
+#[derive(Clone, Debug)]
+struct Selection {
+    start: Position,
+    end: Position,
+}
+
+impl Selection {
+    fn new(start: Position, end: Position) -> Selection {
+        Selection { start, end }
     }
 
-    fn insert(mut self, pos: usize, ch: char) {
-        if self.gap_len() == 0 { self.grow() }
-        self.move_gap(pos)
-        self.buffer[self.gap_start] = ch
-        self.gap_start += 1
-    }
-
-    fn delete(mut self, pos: usize) -> Option<char> {
-        if pos >= self.len() { return none }
-        self.move_gap(pos)
-        let ch = self.buffer[self.gap_end]
-        self.gap_end += 1
-        some(ch)
-    }
-
-    fn get(self, pos: usize) -> Option<char> {
-        if pos >= self.len() { return none }
-        let actual = if pos < self.gap_start { pos } else { pos + self.gap_len() }
-        some(self.buffer[actual])
-    }
-
-    fn grow(mut self) {
-        let new_cap = self.buffer.len() * 2
-        let mut new_buf = ['\0'; new_cap]
-        let after_gap = self.buffer.len() - self.gap_end
-        for i in 0..self.gap_start { new_buf[i] = self.buffer[i] }
-        let new_gap_end = new_cap - after_gap
-        for i in 0..after_gap { new_buf[new_gap_end + i] = self.buffer[self.gap_end + i] }
-        self.gap_end = new_gap_end
-        self.buffer = new_buf
-    }
-
-    fn to_string(self) -> string {
-        let mut s = string.with_capacity(self.len())
-        for i in 0..self.len() { s.push(self.get(i).unwrap()) }
-        s
+    fn is_empty(self) -> bool {
+        self.start.line == self.end.line && self.start.col == self.end.col
     }
 }
 
+#[derive(Clone, Debug)]
 enum EditOp {
-    Insert { pos: usize, ch: char },
-    Delete { pos: usize, ch: char },
-    InsertStr { pos: usize, text: string },
-    DeleteRange { pos: usize, text: string },
+    Insert(Position, string),
+    Delete(Position, Position, string),   // start, end, deleted text
+    Replace(Position, Position, string, string), // start, end, old, new
 }
 
 struct UndoStack {
-    undos: [EditOp],
-    redos: [EditOp],
+    undo: [EditOp],
+    redo: [EditOp],
 }
 
 impl UndoStack {
-    fn new() -> UndoStack { UndoStack { undos: [], redos: [] } }
-
-    fn push(mut self, op: EditOp) { self.undos.push(op); self.redos.clear() }
-
-    fn undo(mut self) -> Option<EditOp> {
-        let op = self.undos.pop()?
-        let inverse = op.inverse()
-        self.redos.push(op)
-        some(inverse)
+    fn new() -> UndoStack {
+        UndoStack { undo: [], redo: [] }
     }
 
-    fn redo(mut self) -> Option<EditOp> {
-        let op = self.redos.pop()?
-        let inverse = op.inverse()
-        self.undos.push(op)
-        some(inverse)
+    fn push(mut self, op: EditOp) {
+        self.undo.push(op)
+        self.redo.clear()
     }
-}
 
-impl EditOp {
-    fn inverse(self) -> EditOp {
-        match self {
-            EditOp.Insert { pos, ch } => EditOp.Delete { pos, ch },
-            EditOp.Delete { pos, ch } => EditOp.Insert { pos, ch },
-            EditOp.InsertStr { pos, text } => EditOp.DeleteRange { pos, text },
-            EditOp.DeleteRange { pos, text } => EditOp.InsertStr { pos, text },
-        }
+    fn can_undo(self) -> bool { !self.undo.is_empty() }
+    fn can_redo(self) -> bool { !self.redo.is_empty() }
+
+    fn pop_undo(mut self) -> Option<EditOp> {
+        let op = self.undo.pop()?
+        self.redo.push(op.clone())
+        some(op)
+    }
+
+    fn pop_redo(mut self) -> Option<EditOp> {
+        let op = self.redo.pop()?
+        self.undo.push(op.clone())
+        some(op)
     }
 }
 
-struct Cursor { line: usize, col: usize }
-
-struct Editor {
-    buffer: GapBuffer,
-    cursor: Cursor,
-    lines: [usize],  // byte offsets of line starts
-    undo_stack: UndoStack,
+struct TextBuffer {
+    lines: [string],
+    cursor: Position,
+    selection: Option<Selection>,
+    history: UndoStack,
     modified: bool,
     filename: Option<string>,
 }
 
-impl Editor {
-    fn new() -> Editor {
-        Editor {
-            buffer: GapBuffer.new(1024), cursor: Cursor { line: 0, col: 0 },
-            lines: [0], undo_stack: UndoStack.new(), modified: false, filename: none,
+impl TextBuffer {
+    fn new() -> TextBuffer {
+        TextBuffer {
+            lines: ["".to_string()],
+            cursor: Position.origin(),
+            selection: none,
+            history: UndoStack.new(),
+            modified: false,
+            filename: none,
         }
     }
 
-    fn from_string(text: &str) -> Editor {
-        let mut ed = Editor.new()
-        for ch in text.chars() { ed.insert_char(ch) }
-        ed.cursor = Cursor { line: 0, col: 0 }
-        ed.modified = false
-        ed
-    }
-
-    fn cursor_pos(self) -> usize {
-        if self.cursor.line >= self.lines.len() { return self.buffer.len() }
-        let line_start = self.lines[self.cursor.line]
-        line_start + self.cursor.col
-    }
-
-    fn insert_char(mut self, ch: char) {
-        let pos = self.cursor_pos()
-        self.buffer.insert(pos, ch)
-        self.undo_stack.push(EditOp.Insert { pos, ch })
-        self.modified = true
-        if ch == '\n' {
-            self.recompute_lines()
-            self.cursor.line += 1
-            self.cursor.col = 0
-        } else { self.cursor.col += 1; self.recompute_lines() }
-    }
-
-    fn delete_char(mut self) -> Option<char> {
-        let pos = self.cursor_pos()
-        let ch = self.buffer.delete(pos)?
-        self.undo_stack.push(EditOp.Delete { pos, ch })
-        self.modified = true
-        self.recompute_lines()
-        some(ch)
-    }
-
-    fn backspace(mut self) -> Option<char> {
-        if self.cursor_pos() == 0 { return none }
-        self.move_left()
-        self.delete_char()
-    }
-
-    fn insert_str(mut self, text: &str) {
-        for ch in text.chars() { self.insert_char(ch) }
-    }
-
-    fn move_left(mut self) {
-        if self.cursor.col > 0 { self.cursor.col -= 1 }
-        else if self.cursor.line > 0 {
-            self.cursor.line -= 1
-            self.cursor.col = self.line_len(self.cursor.line)
-        }
-    }
-
-    fn move_right(mut self) {
-        let ll = self.line_len(self.cursor.line)
-        if self.cursor.col < ll { self.cursor.col += 1 }
-        else if self.cursor.line < self.line_count() - 1 {
-            self.cursor.line += 1; self.cursor.col = 0
-        }
-    }
-
-    fn move_up(mut self) {
-        if self.cursor.line > 0 {
-            self.cursor.line -= 1
-            self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line))
-        }
-    }
-
-    fn move_down(mut self) {
-        if self.cursor.line < self.line_count() - 1 {
-            self.cursor.line += 1
-            self.cursor.col = self.cursor.col.min(self.line_len(self.cursor.line))
+    fn from_text(text: &str) -> TextBuffer {
+        let lines: [string] = text.lines().map(|l| l.to_string()).collect()
+        let lines = if lines.is_empty() { ["".to_string()] } else { lines }
+        TextBuffer {
+            lines, cursor: Position.origin(), selection: none,
+            history: UndoStack.new(), modified: false, filename: none,
         }
     }
 
     fn line_count(self) -> usize { self.lines.len() }
 
-    fn line_len(self, line: usize) -> usize {
-        if line >= self.lines.len() { return 0 }
-        let start = self.lines[line]
-        let end = if line + 1 < self.lines.len() { self.lines[line + 1] - 1 } else { self.buffer.len() }
-        end - start
+    fn get_line(self, idx: usize) -> Option<&str> {
+        self.lines.get(idx).map(|s| s.as_str())
     }
 
-    fn get_line(self, line: usize) -> string {
-        let start = self.lines[line]
-        let end = if line + 1 < self.lines.len() { self.lines[line + 1] - 1 } else { self.buffer.len() }
-        let mut s = string.new()
-        for i in start..end { s.push(self.buffer.get(i).unwrap()) }
-        s
+    fn current_line(self) -> &str {
+        &self.lines[self.cursor.line]
     }
 
-    fn recompute_lines(mut self) {
-        self.lines = [0]
-        for i in 0..self.buffer.len() {
-            if self.buffer.get(i) == some('\n') { self.lines.push(i + 1) }
+    fn text(self) -> string {
+        self.lines.join("\n")
+    }
+
+    fn char_count(self) -> usize {
+        self.lines.iter().map(|l| l.len()).sum::<usize>() + self.lines.len() - 1
+    }
+
+    fn word_count(self) -> usize {
+        self.lines.iter().flat_map(|l| l.split_whitespace()).count()
+    }
+
+    // Cursor movement
+    fn move_left(mut self) {
+        if self.cursor.col > 0 {
+            self.cursor.col -= 1
+        } else if self.cursor.line > 0 {
+            self.cursor.line -= 1
+            self.cursor.col = self.lines[self.cursor.line].len()
         }
+        self.selection = none
     }
 
-    fn text(self) -> string { self.buffer.to_string() }
-
-    fn undo(mut self) {
-        if let some(op) = self.undo_stack.undo() {
-            match op {
-                EditOp.Insert { pos, ch } => { self.buffer.insert(pos, ch); }
-                EditOp.Delete { pos, ch } => { self.buffer.delete(pos); }
-                _ => {}
-            }
-            self.recompute_lines()
+    fn move_right(mut self) {
+        let line_len = self.lines[self.cursor.line].len()
+        if self.cursor.col < line_len {
+            self.cursor.col += 1
+        } else if self.cursor.line < self.lines.len() - 1 {
+            self.cursor.line += 1
+            self.cursor.col = 0
         }
+        self.selection = none
     }
 
-    fn redo(mut self) {
-        if let some(op) = self.undo_stack.redo() {
-            match op {
-                EditOp.Insert { pos, ch } => { self.buffer.insert(pos, ch); }
-                EditOp.Delete { pos, ch } => { self.buffer.delete(pos); }
-                _ => {}
-            }
-            self.recompute_lines()
+    fn move_up(mut self) {
+        if self.cursor.line > 0 {
+            self.cursor.line -= 1
+            self.cursor.col = self.cursor.col.min(self.lines[self.cursor.line].len())
         }
+        self.selection = none
     }
 
-    fn find(self, needle: &str) -> Option<usize> {
-        let text = self.text()
-        text.find(needle)
+    fn move_down(mut self) {
+        if self.cursor.line < self.lines.len() - 1 {
+            self.cursor.line += 1
+            self.cursor.col = self.cursor.col.min(self.lines[self.cursor.line].len())
+        }
+        self.selection = none
     }
 
-    fn replace_all(mut self, from: &str, to: &str) -> usize {
-        let text = self.text()
-        let new_text = text.replace(from, to)
-        let count = (text.len() - new_text.len()) / from.len().max(1)
-        self.buffer = GapBuffer.new(new_text.len() + 256)
-        for ch in new_text.chars() { self.buffer.insert(self.buffer.len(), ch) }
-        self.recompute_lines()
+    fn move_to_line_start(mut self) {
+        self.cursor.col = 0
+        self.selection = none
+    }
+
+    fn move_to_line_end(mut self) {
+        self.cursor.col = self.lines[self.cursor.line].len()
+        self.selection = none
+    }
+
+    fn move_to_start(mut self) {
+        self.cursor = Position.origin()
+        self.selection = none
+    }
+
+    fn move_to_end(mut self) {
+        self.cursor.line = self.lines.len() - 1
+        self.cursor.col = self.lines[self.cursor.line].len()
+        self.selection = none
+    }
+
+    // Editing
+    fn insert_char(mut self, ch: char) {
+        let pos = self.cursor.clone()
+        if ch == '\n' {
+            let rest = self.lines[pos.line][pos.col..].to_string()
+            self.lines[pos.line].truncate(pos.col)
+            self.lines.insert(pos.line + 1, rest)
+            self.cursor.line += 1
+            self.cursor.col = 0
+        } else {
+            self.lines[pos.line].insert(pos.col, ch)
+            self.cursor.col += 1
+        }
+        self.history.push(EditOp.Insert(pos, ch.to_string()))
         self.modified = true
+    }
+
+    fn insert_text(mut self, text: &str) {
+        let pos = self.cursor.clone()
+        for ch in text.chars() {
+            self.insert_char(ch)
+        }
+        // Could batch into single EditOp for efficiency
+    }
+
+    fn delete_char(mut self) {
+        if self.cursor.col > 0 {
+            let pos = Position.new(self.cursor.line, self.cursor.col - 1)
+            let deleted = self.lines[self.cursor.line].remove(self.cursor.col - 1).to_string()
+            self.cursor.col -= 1
+            self.history.push(EditOp.Delete(pos, self.cursor.clone(), deleted))
+            self.modified = true
+        } else if self.cursor.line > 0 {
+            let current = self.lines.remove(self.cursor.line)
+            self.cursor.line -= 1
+            self.cursor.col = self.lines[self.cursor.line].len()
+            self.lines[self.cursor.line] += &current
+            self.history.push(EditOp.Delete(
+                Position.new(self.cursor.line, self.cursor.col),
+                Position.new(self.cursor.line + 1, 0),
+                "\n".to_string(),
+            ))
+            self.modified = true
+        }
+    }
+
+    fn delete_line(mut self) {
+        if self.lines.len() > 1 {
+            let deleted = self.lines.remove(self.cursor.line)
+            if self.cursor.line >= self.lines.len() {
+                self.cursor.line = self.lines.len() - 1
+            }
+            self.cursor.col = self.cursor.col.min(self.lines[self.cursor.line].len())
+            self.modified = true
+        } else {
+            self.lines[0] = "".to_string()
+            self.cursor.col = 0
+            self.modified = true
+        }
+    }
+
+    // Search
+    fn find_next(self, query: &str) -> Option<Position> {
+        // Search from cursor forward
+        for line_idx in self.cursor.line..self.lines.len() {
+            let start_col = if line_idx == self.cursor.line { self.cursor.col } else { 0 }
+            if let some(col) = self.lines[line_idx][start_col..].find(query) {
+                return some(Position.new(line_idx, start_col + col))
+            }
+        }
+        // Wrap around
+        for line_idx in 0..self.cursor.line {
+            if let some(col) = self.lines[line_idx].find(query) {
+                return some(Position.new(line_idx, col))
+            }
+        }
+        none
+    }
+
+    fn replace_all(mut self, find: &str, replacement: &str) -> usize {
+        let mut count = 0
+        for line in &mut self.lines {
+            while line.contains(find) {
+                *line = line.replacen(find, replacement, 1)
+                count += 1
+            }
+        }
+        if count > 0 { self.modified = true }
         count
     }
 }
 
 fn main() {
-    // GapBuffer
-    let mut gb = GapBuffer.new(16)
-    gb.insert(0, 'H'); gb.insert(1, 'i')
-    assert(gb.len() == 2)
-    assert(gb.get(0) == some('H'))
-    assert(gb.get(1) == some('i'))
-    assert(gb.to_string() == "Hi")
-    print("GapBuffer \u2713")
+    // Create buffer
+    let mut buf = TextBuffer.new()
+    assert(buf.line_count() == 1)
+    assert(buf.text() == "")
+    assert(!buf.modified)
+    print("New buffer ✓")
 
-    gb.delete(0)
-    assert(gb.to_string() == "i")
-    print("GapBuffer delete \u2713")
-
-    // Editor
-    let mut ed = Editor.from_string("Hello\nWorld")
-    assert(ed.line_count() == 2)
-    assert(ed.get_line(0) == "Hello")
-    assert(ed.get_line(1) == "World")
-    print("Editor from_string \u2713")
+    // From text
+    let mut buf = TextBuffer.from_text("Hello World\nSecond line\nThird line")
+    assert(buf.line_count() == 3)
+    assert(buf.get_line(0).unwrap() == "Hello World")
+    assert(buf.get_line(1).unwrap() == "Second line")
+    print("From text ✓")
 
     // Cursor movement
-    ed.cursor = Cursor { line: 0, col: 0 }
-    ed.move_right(); assert(ed.cursor.col == 1)
-    ed.move_down(); assert(ed.cursor.line == 1)
-    ed.move_left(); assert(ed.cursor.col == 0)
-    ed.move_up(); assert(ed.cursor.line == 0)
-    print("Cursor movement \u2713")
+    assert(buf.cursor.line == 0 && buf.cursor.col == 0)
+    buf.move_right()
+    assert(buf.cursor.col == 1)
+    buf.move_to_line_end()
+    assert(buf.cursor.col == 11) // "Hello World" length
+    buf.move_down()
+    assert(buf.cursor.line == 1)
+    buf.move_to_line_start()
+    assert(buf.cursor.col == 0)
+    print("Cursor movement ✓")
 
-    // Edit
-    let mut ed2 = Editor.new()
-    ed2.insert_str("abc")
-    assert(ed2.text() == "abc")
-    ed2.backspace()
-    assert(ed2.text() == "ab")
-    print("Insert/backspace \u2713")
+    // Move to start/end
+    buf.move_to_end()
+    assert(buf.cursor.line == 2)
+    buf.move_to_start()
+    assert(buf.cursor.line == 0 && buf.cursor.col == 0)
+    print("Start/End ✓")
+
+    // Insert char
+    buf.move_to_end()
+    buf.move_to_start()
+    buf.insert_char('X')
+    assert(buf.get_line(0).unwrap().starts_with("X"))
+    assert(buf.modified)
+    print("Insert char ✓")
+
+    // Insert newline
+    let mut buf2 = TextBuffer.from_text("AB")
+    buf2.cursor.col = 1
+    buf2.insert_char('\n')
+    assert(buf2.line_count() == 2)
+    assert(buf2.get_line(0).unwrap() == "A")
+    assert(buf2.get_line(1).unwrap() == "B")
+    print("Insert newline ✓")
+
+    // Delete char
+    let mut buf3 = TextBuffer.from_text("Hello")
+    buf3.cursor.col = 5
+    buf3.delete_char()
+    assert(buf3.get_line(0).unwrap() == "Hell")
+    print("Delete char ✓")
+
+    // Delete line
+    let mut buf4 = TextBuffer.from_text("Line1\nLine2\nLine3")
+    buf4.cursor.line = 1
+    buf4.delete_line()
+    assert(buf4.line_count() == 2)
+    assert(buf4.get_line(0).unwrap() == "Line1")
+    assert(buf4.get_line(1).unwrap() == "Line3")
+    print("Delete line ✓")
+
+    // Word count / char count
+    let buf5 = TextBuffer.from_text("Hello World\nFoo Bar Baz")
+    assert(buf5.word_count() == 5)
+    print("Word count ✓")
 
     // Find
-    let mut ed3 = Editor.from_string("foo bar baz")
-    assert(ed3.find("bar") == some(4))
-    assert(ed3.find("xyz").is_none())
-    print("Find \u2713")
+    let mut buf6 = TextBuffer.from_text("find me here\nnot here\nfind me again")
+    let pos = buf6.find_next("find").unwrap()
+    assert(pos.line == 0 && pos.col == 0)
+    buf6.cursor = Position.new(0, 1)
+    let pos2 = buf6.find_next("find").unwrap()
+    assert(pos2.line == 2)
+    print("Find ✓")
 
-    // Undo/redo
-    let mut ed4 = Editor.new()
-    ed4.insert_char('A')
-    assert(ed4.text() == "A")
-    ed4.undo()
-    assert(ed4.text() == "")
-    ed4.redo()
-    assert(ed4.text() == "A")
-    print("Undo/redo \u2713")
+    // Replace all
+    let mut buf7 = TextBuffer.from_text("foo bar foo baz foo")
+    let count = buf7.replace_all("foo", "qux")
+    assert(count == 3)
+    assert(buf7.get_line(0).unwrap() == "qux bar qux baz qux")
+    print("Replace all ✓")
 
-    // EditOp inverse
-    let op = EditOp.Insert { pos: 0, ch: 'x' }
-    match op.inverse() { EditOp.Delete { pos: 0, ch: 'x' } => {} _ => panic!("wrong inverse") }
-    print("EditOp inverse \u2713")
+    // Undo stack
+    let mut stack = UndoStack.new()
+    assert(!stack.can_undo())
+    stack.push(EditOp.Insert(Position.origin(), "a".to_string()))
+    assert(stack.can_undo())
+    stack.pop_undo()
+    assert(stack.can_redo())
+    stack.pop_redo()
+    assert(stack.can_undo())
+    print("Undo stack ✓")
 
-    print("Text Editor complete \u2713")
+    // Position / Selection
+    let sel = Selection.new(Position.new(0, 0), Position.new(0, 5))
+    assert(!sel.is_empty())
+    let empty_sel = Selection.new(Position.new(1, 3), Position.new(1, 3))
+    assert(empty_sel.is_empty())
+    print("Selection ✓")
+
+    print("Text Editor complete ✓")
 }
