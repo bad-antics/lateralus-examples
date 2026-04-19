@@ -1,0 +1,80 @@
+// jwt.ltl — JSON Web Token encode / decode
+use std.encoding.{base64url, json}
+use std.crypto.hmac_sha256
+use std.time.unix_now
+
+struct Claims {
+    sub: string,
+    exp: int,
+    iat: int,
+    custom: dict<string, string>,
+}
+
+struct JWT {
+    header:    dict<string, string>,
+    claims:    Claims,
+    signature: [u8],
+}
+
+fn encode_jwt(claims: Claims, secret: string) -> string {
+    let header = json.stringify({"alg": "HS256", "typ": "JWT"})
+    let payload = json.stringify({
+        "sub": claims.sub,
+        "exp": claims.exp,
+        "iat": claims.iat,
+        ...claims.custom,
+    })
+    let h = base64url.encode(header.as_bytes())
+    let p = base64url.encode(payload.as_bytes())
+    let signing_input = "${h}.${p}"
+    let sig = hmac_sha256(secret.as_bytes(), signing_input.as_bytes())
+    let s = base64url.encode(sig)
+    "${signing_input}.${s}"
+}
+
+fn decode_jwt(token: string, secret: string) -> Result<Claims, string> {
+    let parts = token.split(".")
+    if parts.len() != 3 {
+        return err("invalid token format")
+    }
+    let signing_input = "${parts[0]}.${parts[1]}"
+    let expected_sig  = hmac_sha256(secret.as_bytes(), signing_input.as_bytes())
+    let provided_sig  = base64url.decode(parts[2]).unwrap_or([])
+    if expected_sig != provided_sig {
+        return err("invalid signature")
+    }
+    let payload_json = base64url.decode(parts[1])
+        .and_then(|b| string.from_utf8(b))
+        .map_err(|_| "invalid payload encoding")?
+    let obj = json.parse(payload_json)?
+    let now = unix_now()
+    if let some(exp) = obj.get("exp").and_then(|v| v.as_int()) {
+        if now > exp { return err("token expired") }
+    }
+    ok(Claims {
+        sub: obj["sub"].as_str().unwrap_or(""),
+        exp: obj["exp"].as_int().unwrap_or(0),
+        iat: obj["iat"].as_int().unwrap_or(0),
+        custom: {},
+    })
+}
+
+fn main() {
+    let secret = "super-secret-key"
+    let now    = unix_now()
+    let claims = Claims { sub: "user:42", exp: now + 3600, iat: now, custom: {"role": "admin"} }
+
+    let token = encode_jwt(claims, secret)
+    print("Token: ${token[0..40]}...")
+    assert(token.split(".").len() == 3)
+
+    let decoded = decode_jwt(token, secret).unwrap()
+    assert(decoded.sub == "user:42")
+    print("Decoded sub: ${decoded.sub} ✓")
+
+    let bad = decode_jwt(token, "wrong-secret")
+    assert(bad.is_err())
+    print("Rejected bad secret ✓")
+
+    print("jwt — all assertions passed ✓")
+}
