@@ -1,69 +1,44 @@
 # lateralus-examples
 
-> Real-world Lateralus code examples, categorised by domain.
+Real-world example programs written in the [Lateralus](https://github.com/bad-antics/lateralus-lang) programming language.
 
 ## Categories
 
 | Category | Files | Description |
-|---|---|---|
-| [algorithms](algorithms/) | 5 | sorting, searching, graph algorithms |
-| [challenges](challenges/) | 5 | competitive-programming style problems |
-| [cli](cli/) | 4 | command-line tool examples |
-| [data-processing](data-processing/) | 4 | CSV, JSON, streaming data |
-| [web-api](web-api/) | 5 | REST API, middleware, auth |
-| [networking](networking/) | 3 | TCP client, port scanner, DNS resolver |
-| [concurrency](concurrency/) | 3 | worker pool, pipeline stages, rate limiter |
-| [systems](systems/) | 2 | file watcher, process manager/supervisor |
-| [math](math/) | 3 | matrix ops, statistics, FFT/signal processing |
-| [functional](functional/) | 3 | monads, parser combinators, transducers |
-| [games](games/) | 4 | Snake, Tetris, Game of Life, 2048 |
-| [ml](ml/) | 3 | linear regression, k-means, neural network |
-| [security](security/) | 4 | hashing/HMAC, JWT, rate limiting, input sanitisation |
+|----------|-------|-------------|
+| `basics/` | 3 | Hello world, fizzbuzz, fibonacci |
+| `cli/` | 4 | Argument parsing, file tools, progress bars, interactive prompts |
+| `data/` | 3 | JSON, CSV, SQLite |
+| `web/` | 4 | HTTP server, REST API, WebSocket, static file server |
+| `concurrency/` | 3 | Threads, channels, async tasks |
+| `games/` | 4 | Snake, tetris, pong, dungeon |
+| `ml/` | 3 | Linear regression, neural net, k-means |
+| `security/` | 3 | AES, RSA, JWT |
+| `audio/` | 3 | Software synth, beat sequencer, **MIDI parser** |
+| `graphics/` | 3 | Ray tracer, L-System fractals, **Mandelbrot set** |
+| `embedded/` | 2 | RP2040 GPIO driver, I2C driver |
+| `tooling/` | 3 | LSP server skeleton, source formatter, **REPL** |
+| `simulation/` | 3 | Cellular automata, N-body, **2D fluid (Navier-Stokes)** |
+| `networking/` | 1 | HTTP/2 frame parser/encoder |
+| `demoscene/` | 3 | Terminal plasma, tunnel effect, **3D starfield** |
 
-**Total: 53 `.ltl` files across 13 categories**
+**Total: 66 `.ltl` files**
 
-## Highlights
-
-### Games
-```lateralus
-// Spawn a glider in Conway's Game of Life
-let mut grid = Grid.new(40, 20)
-grid = glider(grid, 1, 1)
-for _ in range(0, 200) { grid = grid.step(); render(grid) }
-```
-
-### ML
-```lateralus
-// Fit a linear model and check R²
-let model = LinearRegression.fit(x, y)
-print("R² = ${model.r_squared(x, y):.4}")
-```
-
-### Security
-```lateralus
-// Sign and verify a JWT
-let token   = encode_jwt(claims, secret)
-let decoded = decode_jwt(token, secret)?
-assert(decoded.sub == "user:42")
-```
-
-### Concurrency
-```lateralus
-// Bounded worker pool
-let pool = WorkerPool.new(8)
-let results = pool.map(jobs, process_job).await
-```
-
-## Running Examples
+## Running
 
 ```bash
-ltl run games/snake.ltl
-ltl run ml/linear_regression.ltl
-ltl run security/hashing.ltl
-ltl run networking/port_scanner.ltl
+ltl run audio/midi_parser.ltl
+ltl run graphics/mandelbrot.ltl
+ltl run simulation/fluid.ltl
+ltl run demoscene/starfield.ltl
+ltl run tooling/repl.ltl
 ```
 
 ## Contributing
 
-Pick any `.ltl` example, study the style, and open a PR with a new one!
-See [lateralus-lang](https://github.com/bad-antics/lateralus-lang) for language reference.
+All examples follow these conventions:
+- `fn main()` or `async fn main()` entry point
+- `|>` pipelines where natural
+- Structs with `impl` blocks and methods
+- Assertions to verify correctness
+- Comments explaining key concepts
