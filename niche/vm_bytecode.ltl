@@ -1,0 +1,609 @@
+// Niche Example — Stack-based Virtual Machine / Bytecode Interpreter
+// Custom instruction set, compilation from AST, execution with GC.
+
+use std.collections.HashMap
+
+// ── Bytecode opcodes ─────────────────────────────────────────────────────────
+enum Op {
+    // Stack
+    Nop = 0x00,
+    Push = 0x01,       // push constant pool index
+    Pop = 0x02,
+    Dup = 0x03,
+    Swap = 0x04,
+    Rot = 0x05,
+
+    // Arithmetic
+    Add = 0x10,
+    Sub = 0x11,
+    Mul = 0x12,
+    Div = 0x13,
+    Mod = 0x14,
+    Neg = 0x15,
+
+    // Comparison
+    Eq = 0x20,
+    Ne = 0x21,
+    Lt = 0x22,
+    Le = 0x23,
+    Gt = 0x24,
+    Ge = 0x25,
+
+    // Logic
+    And = 0x30,
+    Or = 0x31,
+    Not = 0x32,
+    BitAnd = 0x33,
+    BitOr = 0x34,
+    BitXor = 0x35,
+    Shl = 0x36,
+    Shr = 0x37,
+
+    // Variables
+    LoadLocal = 0x40,
+    StoreLocal = 0x41,
+    LoadGlobal = 0x42,
+    StoreGlobal = 0x43,
+    LoadUpvalue = 0x44,
+    StoreUpvalue = 0x45,
+
+    // Control flow
+    Jump = 0x50,
+    JumpIfTrue = 0x51,
+    JumpIfFalse = 0x52,
+    Call = 0x53,
+    Return = 0x54,
+    TailCall = 0x55,
+
+    // Objects
+    NewArray = 0x60,
+    ArrayGet = 0x61,
+    ArraySet = 0x62,
+    ArrayLen = 0x63,
+    NewMap = 0x64,
+    MapGet = 0x65,
+    MapSet = 0x66,
+
+    // Other
+    Print = 0x70,
+    Concat = 0x71,
+    Typeof = 0x72,
+    Halt = 0xFF,
+}
+
+impl Op {
+    fn from_u8(val: u8) -> Option<Op> {
+        // Exhaustive match over all opcodes
+        match val {
+            0x00 => some(Op.Nop), 0x01 => some(Op.Push), 0x02 => some(Op.Pop),
+            0x03 => some(Op.Dup), 0x04 => some(Op.Swap), 0x05 => some(Op.Rot),
+            0x10 => some(Op.Add), 0x11 => some(Op.Sub), 0x12 => some(Op.Mul),
+            0x13 => some(Op.Div), 0x14 => some(Op.Mod), 0x15 => some(Op.Neg),
+            0x20 => some(Op.Eq), 0x21 => some(Op.Ne), 0x22 => some(Op.Lt),
+            0x23 => some(Op.Le), 0x24 => some(Op.Gt), 0x25 => some(Op.Ge),
+            0x30 => some(Op.And), 0x31 => some(Op.Or), 0x32 => some(Op.Not),
+            0x33 => some(Op.BitAnd), 0x34 => some(Op.BitOr), 0x35 => some(Op.BitXor),
+            0x36 => some(Op.Shl), 0x37 => some(Op.Shr),
+            0x40 => some(Op.LoadLocal), 0x41 => some(Op.StoreLocal),
+            0x42 => some(Op.LoadGlobal), 0x43 => some(Op.StoreGlobal),
+            0x44 => some(Op.LoadUpvalue), 0x45 => some(Op.StoreUpvalue),
+            0x50 => some(Op.Jump), 0x51 => some(Op.JumpIfTrue), 0x52 => some(Op.JumpIfFalse),
+            0x53 => some(Op.Call), 0x54 => some(Op.Return), 0x55 => some(Op.TailCall),
+            0x60 => some(Op.NewArray), 0x61 => some(Op.ArrayGet), 0x62 => some(Op.ArraySet),
+            0x63 => some(Op.ArrayLen), 0x64 => some(Op.NewMap), 0x65 => some(Op.MapGet),
+            0x66 => some(Op.MapSet),
+            0x70 => some(Op.Print), 0x71 => some(Op.Concat), 0x72 => some(Op.Typeof),
+            0xFF => some(Op.Halt),
+            _ => none,
+        }
+    }
+}
+
+// ── Values ───────────────────────────────────────────────────────────────────
+enum Value {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(string),
+    Array([Value]),
+    Map(HashMap<string, Value>),
+    Function(u32),  // index into function table
+    NativeFunction(string),
+}
+
+impl Value {
+    fn is_truthy(self) -> bool {
+        match self {
+            Value.Nil => false,
+            Value.Bool(b) => *b,
+            Value.Int(n) => *n != 0,
+            Value.Float(f) => *f != 0.0,
+            Value.Str(s) => !s.is_empty(),
+            Value.Array(a) => !a.is_empty(),
+            _ => true,
+        }
+    }
+
+    fn type_name(self) -> &str {
+        match self {
+            Value.Nil => "nil", Value.Bool(_) => "bool", Value.Int(_) => "int",
+            Value.Float(_) => "float", Value.Str(_) => "string",
+            Value.Array(_) => "array", Value.Map(_) => "map",
+            Value.Function(_) => "function", Value.NativeFunction(_) => "native",
+        }
+    }
+
+    fn display(self) -> string {
+        match self {
+            Value.Nil => "nil".to_string(),
+            Value.Bool(b) => b.to_string(),
+            Value.Int(n) => n.to_string(),
+            Value.Float(f) => f.to_string(),
+            Value.Str(s) => s.clone(),
+            Value.Array(a) => format!("[{}]", a.iter().map(|v| v.display()).collect::<[string]>().join(", ")),
+            Value.Map(m) => format!("{{{}}}", m.iter().map(|(k, v)| format!("{k}: {}", v.display())).collect::<[string]>().join(", ")),
+            Value.Function(idx) => format!("<fn@{idx}>"),
+            Value.NativeFunction(name) => format!("<native:{name}>"),
+        }
+    }
+}
+
+// ── Chunk (compiled bytecode) ────────────────────────────────────────────────
+struct Chunk {
+    code: [u8],
+    constants: [Value],
+    lines: [u32],  // line number for each byte
+}
+
+impl Chunk {
+    fn new() -> Chunk { Chunk { code: [], constants: [], lines: [] } }
+
+    fn emit(mut self, op: Op, line: u32) { self.code.push(op as u8); self.lines.push(line) }
+
+    fn emit_u16(mut self, val: u16, line: u32) {
+        self.code.push((val >> 8) as u8); self.lines.push(line)
+        self.code.push((val & 0xFF) as u8); self.lines.push(line)
+    }
+
+    fn add_constant(mut self, value: Value) -> u16 {
+        self.constants.push(value)
+        (self.constants.len() - 1) as u16
+    }
+
+    fn emit_push(mut self, value: Value, line: u32) {
+        let idx = self.add_constant(value)
+        self.emit(Op.Push, line)
+        self.emit_u16(idx, line)
+    }
+
+    fn emit_jump(mut self, op: Op, line: u32) -> usize {
+        self.emit(op, line)
+        self.emit_u16(0xFFFF, line)  // placeholder
+        self.code.len() - 2
+    }
+
+    fn patch_jump(mut self, offset: usize) {
+        let jump = (self.code.len() - offset - 2) as u16
+        self.code[offset] = (jump >> 8) as u8
+        self.code[offset + 1] = (jump & 0xFF) as u8
+    }
+
+    fn read_u16(self, offset: usize) -> u16 {
+        ((self.code[offset] as u16) << 8) | (self.code[offset + 1] as u16)
+    }
+}
+
+// ── Call Frame ───────────────────────────────────────────────────────────────
+struct CallFrame {
+    chunk_index: u32,
+    ip: usize,
+    base_slot: usize,
+}
+
+// ── VM ───────────────────────────────────────────────────────────────────────
+struct VM {
+    chunks: [Chunk],
+    stack: [Value],
+    globals: HashMap<string, Value>,
+    frames: [CallFrame],
+    output: [string],
+}
+
+impl VM {
+    fn new() -> VM {
+        VM { chunks: [], stack: [], globals: HashMap.new(), frames: [], output: [] }
+    }
+
+    fn load(mut self, chunk: Chunk) -> u32 {
+        let idx = self.chunks.len() as u32
+        self.chunks.push(chunk)
+        idx
+    }
+
+    fn push(mut self, value: Value) { self.stack.push(value) }
+
+    fn pop(mut self) -> Value {
+        self.stack.pop().expect("stack underflow")
+    }
+
+    fn peek(self) -> &Value { self.stack.last().expect("stack empty") }
+
+    fn run(mut self, entry: u32) -> Result<Value, string> {
+        self.frames.push(CallFrame { chunk_index: entry, ip: 0, base_slot: 0 })
+
+        loop {
+            let frame = self.frames.last_mut().unwrap()
+            let chunk = &self.chunks[frame.chunk_index as usize]
+
+            if frame.ip >= chunk.code.len() { break }
+            let op_byte = chunk.code[frame.ip]
+            frame.ip += 1
+
+            let op = Op.from_u8(op_byte).ok_or(format!("unknown opcode: 0x{:02x}", op_byte))?
+
+            match op {
+                Op.Nop => {}
+                Op.Push => {
+                    let idx = chunk.read_u16(frame.ip) as usize
+                    frame.ip += 2
+                    let value = chunk.constants[idx].clone()
+                    self.push(value)
+                }
+                Op.Pop => { self.pop(); }
+                Op.Dup => { let v = self.peek().clone(); self.push(v) }
+                Op.Swap => {
+                    let a = self.pop(); let b = self.pop()
+                    self.push(a); self.push(b)
+                }
+
+                Op.Add => {
+                    let b = self.pop(); let a = self.pop()
+                    let result = match (&a, &b) {
+                        (Value.Int(x), Value.Int(y)) => Value.Int(x + y),
+                        (Value.Float(x), Value.Float(y)) => Value.Float(x + y),
+                        (Value.Int(x), Value.Float(y)) => Value.Float(*x as f64 + y),
+                        (Value.Float(x), Value.Int(y)) => Value.Float(x + *y as f64),
+                        (Value.Str(x), Value.Str(y)) => Value.Str(format!("{x}{y}")),
+                        _ => return err(format!("cannot add {} and {}", a.type_name(), b.type_name())),
+                    }
+                    self.push(result)
+                }
+                Op.Sub => {
+                    let b = self.pop(); let a = self.pop()
+                    let result = match (&a, &b) {
+                        (Value.Int(x), Value.Int(y)) => Value.Int(x - y),
+                        (Value.Float(x), Value.Float(y)) => Value.Float(x - y),
+                        _ => return err("cannot subtract".to_string()),
+                    }
+                    self.push(result)
+                }
+                Op.Mul => {
+                    let b = self.pop(); let a = self.pop()
+                    let result = match (&a, &b) {
+                        (Value.Int(x), Value.Int(y)) => Value.Int(x * y),
+                        (Value.Float(x), Value.Float(y)) => Value.Float(x * y),
+                        _ => return err("cannot multiply".to_string()),
+                    }
+                    self.push(result)
+                }
+                Op.Div => {
+                    let b = self.pop(); let a = self.pop()
+                    let result = match (&a, &b) {
+                        (Value.Int(_, ), Value.Int(0)) => return err("division by zero".to_string()),
+                        (Value.Int(x), Value.Int(y)) => Value.Int(x / y),
+                        (Value.Float(x), Value.Float(y)) => Value.Float(x / y),
+                        _ => return err("cannot divide".to_string()),
+                    }
+                    self.push(result)
+                }
+                Op.Neg => {
+                    let a = self.pop()
+                    let result = match &a {
+                        Value.Int(x) => Value.Int(-x),
+                        Value.Float(x) => Value.Float(-x),
+                        _ => return err("cannot negate".to_string()),
+                    }
+                    self.push(result)
+                }
+
+                Op.Eq => { let b = self.pop(); let a = self.pop(); self.push(Value.Bool(val_eq(&a, &b))) }
+                Op.Ne => { let b = self.pop(); let a = self.pop(); self.push(Value.Bool(!val_eq(&a, &b))) }
+                Op.Lt => {
+                    let b = self.pop(); let a = self.pop()
+                    let result = match (&a, &b) {
+                        (Value.Int(x), Value.Int(y)) => x < y,
+                        (Value.Float(x), Value.Float(y)) => x < y,
+                        _ => false,
+                    }
+                    self.push(Value.Bool(result))
+                }
+
+                Op.Not => { let a = self.pop(); self.push(Value.Bool(!a.is_truthy())) }
+                Op.And => { let b = self.pop(); let a = self.pop(); self.push(Value.Bool(a.is_truthy() && b.is_truthy())) }
+                Op.Or => { let b = self.pop(); let a = self.pop(); self.push(Value.Bool(a.is_truthy() || b.is_truthy())) }
+
+                Op.LoadLocal => {
+                    let idx = chunk.read_u16(frame.ip) as usize
+                    frame.ip += 2
+                    let slot = frame.base_slot + idx
+                    let val = self.stack[slot].clone()
+                    self.push(val)
+                }
+                Op.StoreLocal => {
+                    let idx = chunk.read_u16(frame.ip) as usize
+                    frame.ip += 2
+                    let slot = frame.base_slot + idx
+                    let val = self.pop()
+                    self.stack[slot] = val
+                }
+                Op.LoadGlobal => {
+                    let idx = chunk.read_u16(frame.ip) as usize
+                    frame.ip += 2
+                    let name = match &chunk.constants[idx] { Value.Str(s) => s.clone(), _ => return err("expected string".to_string()) }
+                    let val = self.globals.get(&name).cloned().unwrap_or(Value.Nil)
+                    self.push(val)
+                }
+                Op.StoreGlobal => {
+                    let idx = chunk.read_u16(frame.ip) as usize
+                    frame.ip += 2
+                    let name = match &chunk.constants[idx] { Value.Str(s) => s.clone(), _ => return err("expected string".to_string()) }
+                    let val = self.pop()
+                    self.globals.insert(name, val)
+                }
+
+                Op.Jump => {
+                    let offset = chunk.read_u16(frame.ip) as usize
+                    frame.ip += 2 + offset
+                }
+                Op.JumpIfFalse => {
+                    let offset = chunk.read_u16(frame.ip) as usize
+                    frame.ip += 2
+                    let cond = self.pop()
+                    if !cond.is_truthy() { frame.ip += offset }
+                }
+                Op.JumpIfTrue => {
+                    let offset = chunk.read_u16(frame.ip) as usize
+                    frame.ip += 2
+                    let cond = self.pop()
+                    if cond.is_truthy() { frame.ip += offset }
+                }
+
+                Op.NewArray => {
+                    let count = chunk.read_u16(frame.ip) as usize
+                    frame.ip += 2
+                    let mut arr: [Value] = []
+                    for _ in 0..count { arr.insert(0, self.pop()) }
+                    self.push(Value.Array(arr))
+                }
+                Op.ArrayGet => {
+                    let idx = self.pop(); let arr = self.pop()
+                    match (&arr, &idx) {
+                        (Value.Array(a), Value.Int(i)) => self.push(a[*i as usize].clone()),
+                        _ => return err("invalid array access".to_string()),
+                    }
+                }
+                Op.ArrayLen => {
+                    let arr = self.pop()
+                    match &arr { Value.Array(a) => self.push(Value.Int(a.len() as i64)), _ => return err("not an array".to_string()) }
+                }
+
+                Op.Print => {
+                    let val = self.pop()
+                    self.output.push(val.display())
+                }
+                Op.Concat => {
+                    let b = self.pop(); let a = self.pop()
+                    self.push(Value.Str(format!("{}{}", a.display(), b.display())))
+                }
+                Op.Typeof => {
+                    let a = self.pop()
+                    self.push(Value.Str(a.type_name().to_string()))
+                }
+
+                Op.Return => {
+                    let result = self.pop()
+                    self.frames.pop()
+                    if self.frames.is_empty() { return ok(result) }
+                    self.push(result)
+                }
+
+                Op.Halt => break,
+                _ => return err(format!("unimplemented opcode: 0x{:02x}", op_byte)),
+            }
+        }
+
+        if self.stack.is_empty() { ok(Value.Nil) }
+        else { ok(self.pop()) }
+    }
+}
+
+fn val_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value.Nil, Value.Nil) => true,
+        (Value.Bool(x), Value.Bool(y)) => x == y,
+        (Value.Int(x), Value.Int(y)) => x == y,
+        (Value.Float(x), Value.Float(y)) => x == y,
+        (Value.Str(x), Value.Str(y)) => x == y,
+        _ => false,
+    }
+}
+
+// ── Disassembler ─────────────────────────────────────────────────────────────
+fn disassemble(chunk: &Chunk) -> string {
+    let mut output = string.new()
+    let mut ip = 0
+    while ip < chunk.code.len() {
+        let op_byte = chunk.code[ip]
+        let line = chunk.lines.get(ip).copied().unwrap_or(0)
+        let op_name = match Op.from_u8(op_byte) {
+            some(op) => format!("{:?}", op),
+            none => format!("UNKNOWN(0x{:02x})", op_byte),
+        }
+
+        match op_byte {
+            0x01 | 0x40..=0x43 => {
+                let idx = chunk.read_u16(ip + 1)
+                output.push_str(&format!("{:04x} L{:3} {:<16} {}\n", ip, line, op_name, idx))
+                ip += 3
+            }
+            0x50..=0x52 => {
+                let offset = chunk.read_u16(ip + 1)
+                output.push_str(&format!("{:04x} L{:3} {:<16} -> {:04x}\n", ip, line, op_name, ip + 3 + offset as usize))
+                ip += 3
+            }
+            0x60 => {
+                let count = chunk.read_u16(ip + 1)
+                output.push_str(&format!("{:04x} L{:3} {:<16} ({})\n", ip, line, op_name, count))
+                ip += 3
+            }
+            _ => {
+                output.push_str(&format!("{:04x} L{:3} {}\n", ip, line, op_name))
+                ip += 1
+            }
+        }
+    }
+    output
+}
+
+fn main() {
+    // Build a simple program: 2 + 3 * 4
+    let mut chunk = Chunk.new()
+    chunk.emit_push(Value.Int(2), 1)
+    chunk.emit_push(Value.Int(3), 1)
+    chunk.emit_push(Value.Int(4), 1)
+    chunk.emit(Op.Mul, 1)
+    chunk.emit(Op.Add, 1)
+    chunk.emit(Op.Halt, 1)
+
+    let mut vm = VM.new()
+    let entry = vm.load(chunk)
+    let result = vm.run(entry).unwrap()
+    match &result { Value.Int(n) => assert(*n == 14), _ => panic("expected int") }
+    print("Arithmetic: 2 + 3 * 4 = 14 ✓")
+
+    // String concatenation
+    let mut chunk = Chunk.new()
+    chunk.emit_push(Value.Str("Hello ".to_string()), 1)
+    chunk.emit_push(Value.Str("World".to_string()), 1)
+    chunk.emit(Op.Concat, 1)
+    chunk.emit(Op.Halt, 1)
+
+    let mut vm = VM.new()
+    let entry = vm.load(chunk)
+    let result = vm.run(entry).unwrap()
+    match &result { Value.Str(s) => assert(s == "Hello World"), _ => panic("expected string") }
+    print("String concat ✓")
+
+    // Boolean logic
+    let mut chunk = Chunk.new()
+    chunk.emit_push(Value.Bool(true), 1)
+    chunk.emit(Op.Not, 1)
+    chunk.emit(Op.Halt, 1)
+
+    let mut vm = VM.new()
+    let entry = vm.load(chunk)
+    let result = vm.run(entry).unwrap()
+    match &result { Value.Bool(b) => assert(*b == false), _ => panic("expected bool") }
+    print("Boolean NOT ✓")
+
+    // Conditional jump
+    let mut chunk = Chunk.new()
+    chunk.emit_push(Value.Bool(false), 1)
+    let jump_offset = chunk.emit_jump(Op.JumpIfFalse, 1)
+    chunk.emit_push(Value.Int(42), 1)  // skipped
+    chunk.emit(Op.Halt, 1)
+    chunk.patch_jump(jump_offset)
+    chunk.emit_push(Value.Int(99), 1)  // executed
+    chunk.emit(Op.Halt, 1)
+
+    let mut vm = VM.new()
+    let entry = vm.load(chunk)
+    let result = vm.run(entry).unwrap()
+    match &result { Value.Int(n) => assert(*n == 99), _ => panic("expected 99") }
+    print("Conditional jump ✓")
+
+    // Arrays
+    let mut chunk = Chunk.new()
+    chunk.emit_push(Value.Int(10), 1)
+    chunk.emit_push(Value.Int(20), 1)
+    chunk.emit_push(Value.Int(30), 1)
+    chunk.emit(Op.NewArray, 1)
+    chunk.emit_u16(3, 1)
+    chunk.emit(Op.Dup, 1)
+    chunk.emit(Op.ArrayLen, 1)
+    chunk.emit(Op.Halt, 1)
+
+    let mut vm = VM.new()
+    let entry = vm.load(chunk)
+    let result = vm.run(entry).unwrap()
+    match &result { Value.Int(n) => assert(*n == 3), _ => panic("expected 3") }
+    print("Array creation and length ✓")
+
+    // Global variables
+    let mut chunk = Chunk.new()
+    let name_idx = chunk.add_constant(Value.Str("counter".to_string()))
+    chunk.emit_push(Value.Int(42), 1)
+    chunk.emit(Op.StoreGlobal, 1)
+    chunk.emit_u16(name_idx, 1)
+    chunk.emit(Op.LoadGlobal, 1)
+    chunk.emit_u16(name_idx, 1)
+    chunk.emit(Op.Halt, 1)
+
+    let mut vm = VM.new()
+    let entry = vm.load(chunk)
+    let result = vm.run(entry).unwrap()
+    match &result { Value.Int(n) => assert(*n == 42), _ => panic("expected 42") }
+    print("Global variables ✓")
+
+    // Division by zero
+    let mut chunk = Chunk.new()
+    chunk.emit_push(Value.Int(10), 1)
+    chunk.emit_push(Value.Int(0), 1)
+    chunk.emit(Op.Div, 1)
+    chunk.emit(Op.Halt, 1)
+
+    let mut vm = VM.new()
+    let entry = vm.load(chunk)
+    let result = vm.run(entry)
+    assert(result.is_err())
+    print("Division by zero error ✓")
+
+    // Disassembler
+    let mut chunk = Chunk.new()
+    chunk.emit_push(Value.Int(5), 1)
+    chunk.emit_push(Value.Int(10), 2)
+    chunk.emit(Op.Add, 2)
+    chunk.emit(Op.Print, 3)
+    chunk.emit(Op.Halt, 3)
+    let dis = disassemble(&chunk)
+    assert(dis.contains("Push"))
+    assert(dis.contains("Add"))
+    print("Disassembler ✓")
+
+    // Print
+    let mut chunk = Chunk.new()
+    chunk.emit_push(Value.Str("hello vm".to_string()), 1)
+    chunk.emit(Op.Print, 1)
+    chunk.emit(Op.Halt, 1)
+
+    let mut vm = VM.new()
+    let entry = vm.load(chunk)
+    vm.run(entry).unwrap()
+    assert(vm.output[0] == "hello vm")
+    print("VM print ✓")
+
+    // Typeof
+    let mut chunk = Chunk.new()
+    chunk.emit_push(Value.Float(3.14), 1)
+    chunk.emit(Op.Typeof, 1)
+    chunk.emit(Op.Halt, 1)
+
+    let mut vm = VM.new()
+    let entry = vm.load(chunk)
+    let result = vm.run(entry).unwrap()
+    match &result { Value.Str(s) => assert(s == "float"), _ => panic("expected string") }
+    print("Typeof ✓")
+
+    print("VM / Bytecode Interpreter complete ✓")
+}
