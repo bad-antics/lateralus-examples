@@ -1,0 +1,380 @@
+// Niche Example - BitTorrent Client
+// Bencode parser, torrent file handling, peer wire protocol, piece management.
+
+use std.collections.{HashMap, BTreeMap, HashSet}
+use std.io.{Read, Write}
+use std.net.TcpStream
+use std.crypto.sha1
+
+// Bencode values
+#[derive(Clone, Debug, PartialEq)]
+enum BencodeValue {
+    Integer(i64),
+    ByteString([u8]),
+    List([BencodeValue]),
+    Dict(BTreeMap<string, BencodeValue>),
+}
+
+struct BencodeDecoder {
+    data: [u8],
+    pos: usize,
+}
+
+impl BencodeDecoder {
+    fn new(data: [u8]) -> BencodeDecoder {
+        BencodeDecoder { data, pos: 0 }
+    }
+
+    fn decode(mut self) -> Option<BencodeValue> {
+        if self.pos >= self.data.len() { return none }
+        match self.data[self.pos] {
+            b'i' => self.decode_integer(),
+            b'l' => self.decode_list(),
+            b'd' => self.decode_dict(),
+            b'0'..=b'9' => self.decode_string(),
+            _ => none,
+        }
+    }
+
+    fn decode_integer(mut self) -> Option<BencodeValue> {
+        self.pos += 1 // skip 'i'
+        let start = self.pos
+        while self.pos < self.data.len() && self.data[self.pos] != b'e' {
+            self.pos += 1
+        }
+        let s = string.from_utf8(&self.data[start..self.pos]).ok()?
+        self.pos += 1 // skip 'e'
+        some(BencodeValue.Integer(s.parse::<i64>().ok()?))
+    }
+
+    fn decode_string(mut self) -> Option<BencodeValue> {
+        let start = self.pos
+        while self.pos < self.data.len() && self.data[self.pos] != b':' {
+            self.pos += 1
+        }
+        let len_str = string.from_utf8(&self.data[start..self.pos]).ok()?
+        let len = len_str.parse::<usize>().ok()?
+        self.pos += 1 // skip ':'
+        let bytes = self.data[self.pos..self.pos + len].to_vec()
+        self.pos += len
+        some(BencodeValue.ByteString(bytes))
+    }
+
+    fn decode_list(mut self) -> Option<BencodeValue> {
+        self.pos += 1 // skip 'l'
+        let mut items: [BencodeValue] = []
+        while self.pos < self.data.len() && self.data[self.pos] != b'e' {
+            items.push(self.decode()?)
+        }
+        self.pos += 1 // skip 'e'
+        some(BencodeValue.List(items))
+    }
+
+    fn decode_dict(mut self) -> Option<BencodeValue> {
+        self.pos += 1 // skip 'd'
+        let mut map: BTreeMap<string, BencodeValue> = BTreeMap.new()
+        while self.pos < self.data.len() && self.data[self.pos] != b'e' {
+            let key = match self.decode()? {
+                BencodeValue.ByteString(bytes) => string.from_utf8(&bytes).ok()?,
+                _ => return none,
+            }
+            let value = self.decode()?
+            map.insert(key, value)
+        }
+        self.pos += 1 // skip 'e'
+        some(BencodeValue.Dict(map))
+    }
+}
+
+struct BencodeEncoder;
+
+impl BencodeEncoder {
+    fn encode(value: &BencodeValue) -> [u8] {
+        let mut buf: [u8] = []
+        Self.encode_into(value, &mut buf)
+        buf
+    }
+
+    fn encode_into(value: &BencodeValue, buf: &mut [u8]) {
+        match value {
+            BencodeValue.Integer(n) => {
+                buf.extend_from_slice(format!("i{}e", n).as_bytes())
+            },
+            BencodeValue.ByteString(bytes) => {
+                buf.extend_from_slice(format!("{}:", bytes.len()).as_bytes())
+                buf.extend_from_slice(bytes)
+            },
+            BencodeValue.List(items) => {
+                buf.push(b'l')
+                for item in items { Self.encode_into(item, buf) }
+                buf.push(b'e')
+            },
+            BencodeValue.Dict(map) => {
+                buf.push(b'd')
+                for (key, value) in map {
+                    buf.extend_from_slice(format!("{}:", key.len()).as_bytes())
+                    buf.extend_from_slice(key.as_bytes())
+                    Self.encode_into(value, buf)
+                }
+                buf.push(b'e')
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TorrentInfo {
+    name: string,
+    piece_length: usize,
+    pieces: [u8],       // SHA1 hashes concatenated
+    length: Option<u64>, // Single file
+    files: Option<[TorrentFile]>, // Multi-file
+    info_hash: [u8; 20],
+}
+
+#[derive(Clone, Debug)]
+struct TorrentFile {
+    length: u64,
+    path: [string],
+}
+
+#[derive(Clone, Debug)]
+struct Torrent {
+    info: TorrentInfo,
+    announce: string,
+    announce_list: Option<[[string]]>,
+    creation_date: Option<i64>,
+    comment: Option<string>,
+}
+
+impl Torrent {
+    fn total_size(self) -> u64 {
+        if let some(len) = self.info.length {
+            len
+        } else if let some(ref files) = self.info.files {
+            files.iter().map(|f| f.length).sum()
+        } else {
+            0
+        }
+    }
+
+    fn num_pieces(self) -> usize {
+        self.info.pieces.len() / 20
+    }
+
+    fn piece_hash(self, index: usize) -> Option<&[u8]> {
+        let start = index * 20
+        if start + 20 <= self.info.pieces.len() {
+            some(&self.info.pieces[start..start + 20])
+        } else {
+            none
+        }
+    }
+}
+
+// Peer wire protocol messages
+#[derive(Clone, Debug)]
+enum PeerMessage {
+    Choke,
+    Unchoke,
+    Interested,
+    NotInterested,
+    Have(u32),
+    Bitfield([u8]),
+    Request(u32, u32, u32),  // index, begin, length
+    Piece(u32, u32, [u8]),   // index, begin, block
+    Cancel(u32, u32, u32),
+    KeepAlive,
+}
+
+impl PeerMessage {
+    fn encode(self) -> [u8] {
+        let mut buf: [u8] = []
+        match self {
+            PeerMessage.KeepAlive => {
+                buf.extend_from_slice(&[0, 0, 0, 0])
+            },
+            PeerMessage.Choke => {
+                buf.extend_from_slice(&[0, 0, 0, 1, 0])
+            },
+            PeerMessage.Unchoke => {
+                buf.extend_from_slice(&[0, 0, 0, 1, 1])
+            },
+            PeerMessage.Interested => {
+                buf.extend_from_slice(&[0, 0, 0, 1, 2])
+            },
+            PeerMessage.NotInterested => {
+                buf.extend_from_slice(&[0, 0, 0, 1, 3])
+            },
+            PeerMessage.Have(index) => {
+                buf.extend_from_slice(&[0, 0, 0, 5, 4])
+                buf.extend_from_slice(&index.to_be_bytes())
+            },
+            PeerMessage.Request(index, begin, length) => {
+                buf.extend_from_slice(&[0, 0, 0, 13, 6])
+                buf.extend_from_slice(&index.to_be_bytes())
+                buf.extend_from_slice(&begin.to_be_bytes())
+                buf.extend_from_slice(&length.to_be_bytes())
+            },
+            _ => {},
+        }
+        buf
+    }
+}
+
+struct PieceManager {
+    num_pieces: usize,
+    piece_length: usize,
+    have: [bool],
+    pending: HashSet<usize>,
+    complete: HashSet<usize>,
+    data: HashMap<usize, [u8]>,
+}
+
+impl PieceManager {
+    fn new(num_pieces: usize, piece_length: usize) -> PieceManager {
+        PieceManager {
+            num_pieces,
+            piece_length,
+            have: vec![false; num_pieces],
+            pending: HashSet.new(),
+            complete: HashSet.new(),
+            data: HashMap.new(),
+        }
+    }
+
+    fn mark_have(mut self, index: usize) {
+        if index < self.num_pieces {
+            self.have[index] = true
+            self.complete.insert(index)
+            self.pending.remove(&index)
+        }
+    }
+
+    fn next_needed(self) -> Option<usize> {
+        for i in 0..self.num_pieces {
+            if !self.have[i] && !self.pending.contains(&i) {
+                return some(i)
+            }
+        }
+        none
+    }
+
+    fn mark_pending(mut self, index: usize) {
+        self.pending.insert(index)
+    }
+
+    fn store_piece(mut self, index: usize, data: [u8]) {
+        self.data.insert(index, data)
+        self.mark_have(index)
+    }
+
+    fn progress(self) -> f64 {
+        self.complete.len() as f64 / self.num_pieces as f64
+    }
+
+    fn is_complete(self) -> bool {
+        self.complete.len() == self.num_pieces
+    }
+}
+
+fn main() {
+    // Bencode integer
+    let data = b"i42e"
+    let mut dec = BencodeDecoder.new(data.to_vec())
+    let val = dec.decode().unwrap()
+    assert(val == BencodeValue.Integer(42))
+    print("Bencode integer ✓")
+
+    // Bencode string
+    let data2 = b"5:hello"
+    let mut dec2 = BencodeDecoder.new(data2.to_vec())
+    let val2 = dec2.decode().unwrap()
+    assert(val2 == BencodeValue.ByteString(b"hello".to_vec()))
+    print("Bencode string ✓")
+
+    // Bencode list
+    let data3 = b"li1ei2ei3ee"
+    let mut dec3 = BencodeDecoder.new(data3.to_vec())
+    let val3 = dec3.decode().unwrap()
+    match val3 {
+        BencodeValue.List(items) => assert(items.len() == 3),
+        _ => panic("Expected list"),
+    }
+    print("Bencode list ✓")
+
+    // Bencode dict
+    let data4 = b"d3:agei25e4:name5:Alicee"
+    let mut dec4 = BencodeDecoder.new(data4.to_vec())
+    let val4 = dec4.decode().unwrap()
+    match val4 {
+        BencodeValue.Dict(map) => {
+            assert(map.len() == 2)
+            assert(map.get("age").unwrap() == &BencodeValue.Integer(25))
+        },
+        _ => panic("Expected dict"),
+    }
+    print("Bencode dict ✓")
+
+    // Encode roundtrip
+    let original = BencodeValue.Dict({
+        let mut m = BTreeMap.new()
+        m.insert("key".to_string(), BencodeValue.Integer(100))
+        m.insert("list".to_string(), BencodeValue.List(vec![
+            BencodeValue.Integer(1),
+            BencodeValue.ByteString(b"two".to_vec()),
+        ]))
+        m
+    })
+    let encoded = BencodeEncoder.encode(&original)
+    let mut dec5 = BencodeDecoder.new(encoded)
+    let decoded = dec5.decode().unwrap()
+    assert(decoded == original)
+    print("Encode roundtrip ✓")
+
+    // Peer messages
+    let choke = PeerMessage.Choke.encode()
+    assert(choke == vec![0, 0, 0, 1, 0])
+    let interested = PeerMessage.Interested.encode()
+    assert(interested == vec![0, 0, 0, 1, 2])
+    let keepalive = PeerMessage.KeepAlive.encode()
+    assert(keepalive == vec![0, 0, 0, 0])
+    print("Peer messages ✓")
+
+    // Request message
+    let req = PeerMessage.Request(0, 0, 16384).encode()
+    assert(req.len() == 17) // 4 len + 1 id + 12 payload
+    print("Request message ✓")
+
+    // Piece manager
+    let mut pm = PieceManager.new(10, 262144)
+    assert(!pm.is_complete())
+    assert(pm.progress() == 0.0)
+
+    let next = pm.next_needed().unwrap()
+    assert(next == 0)
+    pm.mark_pending(0)
+
+    pm.store_piece(0, vec![0u8; 262144])
+    assert(pm.have[0])
+    assert(pm.complete.contains(&0))
+    assert(pm.progress() > 0.0)
+    print("Piece manager ✓")
+
+    // Complete all pieces
+    for i in 1..10 {
+        pm.store_piece(i, vec![0u8; 262144])
+    }
+    assert(pm.is_complete())
+    assert(pm.progress() == 1.0)
+    assert(pm.next_needed().is_none())
+    print("All pieces complete ✓")
+
+    // TorrentFile
+    let tf = TorrentFile { length: 1024, path: vec!["dir".to_string(), "file.txt".to_string()] }
+    assert(tf.length == 1024)
+    assert(tf.path.len() == 2)
+    print("TorrentFile ✓")
+
+    print("BitTorrent Client complete ✓")
+}
