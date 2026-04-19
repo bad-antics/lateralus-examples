@@ -1,0 +1,304 @@
+// Niche Example - Hex Editor
+// Binary file viewer/editor with hex dump, search, patch, and diff.
+
+use std.io.{File, Read, Write, Seek, SeekFrom}
+use std.collections.HashMap
+
+struct HexView {
+    data: [u8],
+    offset: usize,
+    bytes_per_line: usize,
+    cursor: usize,
+    marks: HashMap<string, usize>,
+}
+
+impl HexView {
+    fn new(data: [u8]) -> HexView {
+        HexView {
+            data,
+            offset: 0,
+            bytes_per_line: 16,
+            cursor: 0,
+            marks: HashMap.new(),
+        }
+    }
+
+    fn from_file(path: &str) -> Result<HexView, string> {
+        let mut f = File.open(path).map_err(|e| e.to_string())?
+        let mut data: [u8] = []
+        f.read_to_end(&mut data).map_err(|e| e.to_string())?
+        ok(Self.new(data))
+    }
+
+    fn len(self) -> usize { self.data.len() }
+
+    fn get_byte(self, offset: usize) -> Option<u8> {
+        self.data.get(offset).copied()
+    }
+
+    fn set_byte(mut self, offset: usize, value: u8) -> bool {
+        if offset < self.data.len() {
+            self.data[offset] = value
+            true
+        } else {
+            false
+        }
+    }
+
+    fn insert_byte(mut self, offset: usize, value: u8) {
+        if offset <= self.data.len() {
+            self.data.insert(offset, value)
+        }
+    }
+
+    fn delete_byte(mut self, offset: usize) -> Option<u8> {
+        if offset < self.data.len() {
+            some(self.data.remove(offset))
+        } else {
+            none
+        }
+    }
+
+    fn format_hex_line(self, offset: usize) -> string {
+        let end = (offset + self.bytes_per_line).min(self.data.len())
+        let mut hex_part = string.new()
+        let mut ascii_part = string.new()
+
+        for i in offset..offset + self.bytes_per_line {
+            if i < end {
+                hex_part += &format!("{:02X} ", self.data[i])
+                let c = self.data[i]
+                if c >= 0x20 && c < 0x7F {
+                    ascii_part.push(c as char)
+                } else {
+                    ascii_part.push('.')
+                }
+            } else {
+                hex_part += "   "
+                ascii_part.push(' ')
+            }
+            if (i - offset) == 7 { hex_part.push(' ') }
+        }
+
+        format!("{:08X}  {}|{}|", offset, hex_part, ascii_part)
+    }
+
+    fn hex_dump(self, start: usize, lines: usize) -> string {
+        let mut result = string.new()
+        let mut offset = start
+        for _ in 0..lines {
+            if offset >= self.data.len() { break }
+            result += &self.format_hex_line(offset)
+            result.push('\n')
+            offset += self.bytes_per_line
+        }
+        result
+    }
+
+    fn search_bytes(self, pattern: &[u8]) -> [usize] {
+        let mut results: [usize] = []
+        if pattern.is_empty() || pattern.len() > self.data.len() { return results }
+
+        for i in 0..=self.data.len() - pattern.len() {
+            if self.data[i..i + pattern.len()] == *pattern {
+                results.push(i)
+            }
+        }
+        results
+    }
+
+    fn search_string(self, s: &str) -> [usize] {
+        self.search_bytes(s.as_bytes())
+    }
+
+    fn patch(mut self, offset: usize, bytes: &[u8]) -> bool {
+        if offset + bytes.len() > self.data.len() { return false }
+        for (i, &b) in bytes.iter().enumerate() {
+            self.data[offset + i] = b
+        }
+        true
+    }
+
+    fn fill(mut self, offset: usize, len: usize, value: u8) {
+        let end = (offset + len).min(self.data.len())
+        for i in offset..end {
+            self.data[i] = value
+        }
+    }
+
+    fn slice(self, offset: usize, len: usize) -> [u8] {
+        let end = (offset + len).min(self.data.len())
+        self.data[offset..end].to_vec()
+    }
+
+    fn mark(mut self, name: &str, offset: usize) {
+        self.marks.insert(name.to_string(), offset)
+    }
+
+    fn goto_mark(mut self, name: &str) -> bool {
+        if let some(&offset) = self.marks.get(name) {
+            self.cursor = offset
+            true
+        } else {
+            false
+        }
+    }
+
+    fn save(self, path: &str) -> Result<(), string> {
+        let mut f = File.create(path).map_err(|e| e.to_string())?
+        f.write_all(&self.data).map_err(|e| e.to_string())?
+        ok(())
+    }
+}
+
+// Hex string conversion
+fn hex_to_bytes(hex: &str) -> Option<[u8]> {
+    let hex = hex.replace(" ", "")
+    if hex.len() % 2 != 0 { return none }
+    let mut bytes: [u8] = []
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8.from_str_radix(&hex[i..i+2], 16).ok()?
+        bytes.push(byte)
+    }
+    some(bytes)
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> string {
+    bytes.iter().map(|b| format!("{:02X}", b)).collect::<[string]>().join(" ")
+}
+
+// Diff two byte arrays
+struct ByteDiff {
+    offset: usize,
+    old_byte: u8,
+    new_byte: u8,
+}
+
+fn diff_bytes(a: &[u8], b: &[u8]) -> [ByteDiff] {
+    let mut diffs: [ByteDiff] = []
+    let max_len = a.len().max(b.len())
+    for i in 0..max_len {
+        let old = if i < a.len() { a[i] } else { 0 }
+        let new = if i < b.len() { b[i] } else { 0 }
+        if old != new {
+            diffs.push(ByteDiff { offset: i, old_byte: old, new_byte: new })
+        }
+    }
+    diffs
+}
+
+fn main() {
+    // Create hex view
+    let data: [u8] = vec![
+        0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x57, 0x6F,
+        0x72, 0x6C, 0x64, 0x21, 0x00, 0xFF, 0xDE, 0xAD,
+        0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01,
+        0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+    ]
+    let mut view = HexView.new(data)
+    assert(view.len() == 32)
+    print("HexView creation ✓")
+
+    // Get/set byte
+    assert(view.get_byte(0).unwrap() == 0x48)
+    assert(view.get_byte(100).is_none())
+    assert(view.set_byte(0, 0x41))
+    assert(view.get_byte(0).unwrap() == 0x41)
+    view.set_byte(0, 0x48) // restore
+    print("Get/set byte ✓")
+
+    // Hex dump
+    let dump = view.hex_dump(0, 2)
+    assert(dump.contains("48 65 6C"))
+    assert(dump.contains("Hello"))
+    print("Hex dump ✓")
+
+    // Search bytes
+    let results = view.search_bytes(&[0x6C, 0x6C])
+    assert(results.len() == 1)
+    assert(results[0] == 2)
+    print("Search bytes ✓")
+
+    // Search string
+    let results2 = view.search_string("Hello")
+    assert(results2.len() == 1)
+    assert(results2[0] == 0)
+    print("Search string ✓")
+
+    // Search not found
+    let results3 = view.search_string("xyz")
+    assert(results3.is_empty())
+    print("Search not found ✓")
+
+    // Patch
+    assert(view.patch(0, &[0x42, 0x79, 0x65]))
+    assert(view.get_byte(0).unwrap() == 0x42)
+    assert(view.get_byte(1).unwrap() == 0x79)
+    view.patch(0, &[0x48, 0x65, 0x6C]) // restore
+    print("Patch ✓")
+
+    // Fill
+    let mut view2 = HexView.new(vec![0u8; 16])
+    view2.fill(4, 8, 0xFF)
+    assert(view2.get_byte(3).unwrap() == 0x00)
+    assert(view2.get_byte(4).unwrap() == 0xFF)
+    assert(view2.get_byte(11).unwrap() == 0xFF)
+    assert(view2.get_byte(12).unwrap() == 0x00)
+    print("Fill ✓")
+
+    // Slice
+    let s = view.slice(0, 5)
+    assert(s.len() == 5)
+    assert(s[0] == 0x48)
+    print("Slice ✓")
+
+    // Marks
+    view.mark("start", 0)
+    view.mark("dead", 13)
+    view.cursor = 10
+    assert(view.goto_mark("start"))
+    assert(view.cursor == 0)
+    assert(view.goto_mark("dead"))
+    assert(view.cursor == 13)
+    assert(!view.goto_mark("missing"))
+    print("Marks ✓")
+
+    // Insert/delete
+    let mut view3 = HexView.new(vec![1, 2, 3])
+    view3.insert_byte(1, 0xFF)
+    assert(view3.len() == 4)
+    assert(view3.get_byte(1).unwrap() == 0xFF)
+    let deleted = view3.delete_byte(1).unwrap()
+    assert(deleted == 0xFF)
+    assert(view3.len() == 3)
+    print("Insert/delete ✓")
+
+    // Hex conversion
+    let bytes = hex_to_bytes("48 65 6C 6C 6F").unwrap()
+    assert(bytes == vec![0x48, 0x65, 0x6C, 0x6C, 0x6F])
+    assert(hex_to_bytes("ZZ").is_none())
+    assert(hex_to_bytes("123").is_none()) // odd length
+    print("Hex to bytes ✓")
+
+    let hex = bytes_to_hex(&[0xDE, 0xAD, 0xBE, 0xEF])
+    assert(hex == "DE AD BE EF")
+    print("Bytes to hex ✓")
+
+    // Diff
+    let a = vec![1, 2, 3, 4, 5]
+    let b = vec![1, 2, 9, 4, 5]
+    let diffs = diff_bytes(&a, &b)
+    assert(diffs.len() == 1)
+    assert(diffs[0].offset == 2)
+    assert(diffs[0].old_byte == 3)
+    assert(diffs[0].new_byte == 9)
+    print("Diff ✓")
+
+    // Diff different lengths
+    let diffs2 = diff_bytes(&[1, 2], &[1, 2, 3])
+    assert(diffs2.len() == 1)
+    assert(diffs2[0].offset == 2)
+    print("Diff different lengths ✓")
+
+    print("Hex Editor complete ✓")
+}
