@@ -1,0 +1,206 @@
+// Niche Example - SMTP Client
+// RFC 5321 SMTP protocol: connect, EHLO, AUTH, MAIL/RCPT/DATA, TLS upgrade.
+
+use std.net.TcpStream
+use std.io.{BufReader, BufWriter, Write, BufRead}
+use std.encoding.base64
+
+enum SmtpAuth {
+    None,
+    Plain { username: string, password: string },
+    Login { username: string, password: string },
+}
+
+struct SmtpMessage {
+    from: string,
+    to: [string],
+    cc: [string],
+    bcc: [string],
+    subject: string,
+    body: string,
+    headers: [(string, string)],
+}
+
+impl SmtpMessage {
+    fn new(from: &str, to: &str, subject: &str, body: &str) -> SmtpMessage {
+        SmtpMessage {
+            from: from.to_string(), to: [to.to_string()],
+            cc: [], bcc: [], subject: subject.to_string(),
+            body: body.to_string(), headers: [],
+        }
+    }
+
+    fn add_to(mut self, addr: &str) -> SmtpMessage { self.to.push(addr.to_string()); self }
+    fn add_cc(mut self, addr: &str) -> SmtpMessage { self.cc.push(addr.to_string()); self }
+    fn add_bcc(mut self, addr: &str) -> SmtpMessage { self.bcc.push(addr.to_string()); self }
+    fn add_header(mut self, key: &str, val: &str) -> SmtpMessage {
+        self.headers.push((key.to_string(), val.to_string())); self
+    }
+
+    fn all_recipients(self) -> [&str] {
+        let mut r: [&str] = self.to.iter().map(|s| s.as_str()).collect()
+        r.extend(self.cc.iter().map(|s| s.as_str()))
+        r.extend(self.bcc.iter().map(|s| s.as_str()))
+        r
+    }
+
+    fn format_data(self) -> string {
+        let mut data = string.new()
+        data.push_str(&format!("From: {}\r\n", self.from))
+        data.push_str(&format!("To: {}\r\n", self.to.join(", ")))
+        if !self.cc.is_empty() { data.push_str(&format!("Cc: {}\r\n", self.cc.join(", "))) }
+        data.push_str(&format!("Subject: {}\r\n", self.subject))
+        data.push_str("MIME-Version: 1.0\r\n")
+        data.push_str("Content-Type: text/plain; charset=UTF-8\r\n")
+        for (key, val) in &self.headers { data.push_str(&format!("{key}: {val}\r\n")) }
+        data.push_str("\r\n")
+        data.push_str(&self.body)
+        // Byte-stuff lines starting with '.'
+        data = data.replace("\r\n.", "\r\n..")
+        data
+    }
+}
+
+struct SmtpResponse {
+    code: u16,
+    message: string,
+}
+
+impl SmtpResponse {
+    fn is_positive(self) -> bool { self.code >= 200 && self.code < 400 }
+    fn is_error(self) -> bool { self.code >= 400 }
+}
+
+struct SmtpClient {
+    reader: BufReader<TcpStream>,
+    writer: BufWriter<TcpStream>,
+    extensions: [string],
+    domain: string,
+}
+
+impl SmtpClient {
+    fn connect(host: &str, port: u16) -> Result<SmtpClient, string> {
+        let stream = TcpStream.connect(host, port)?
+        let reader = BufReader.new(stream.try_clone()?)
+        let writer = BufWriter.new(stream)
+        let mut client = SmtpClient { reader, writer, extensions: [], domain: "localhost".to_string() }
+        let greeting = client.read_response()?
+        if !greeting.is_positive() { return err(format!("bad greeting: {}", greeting.code)) }
+        ok(client)
+    }
+
+    fn ehlo(mut self, domain: &str) -> Result<(), string> {
+        self.domain = domain.to_string()
+        let resp = self.command(&format!("EHLO {domain}"))?
+        if resp.is_positive() {
+            self.extensions = resp.message.lines().skip(1).map(|l| l.trim().to_string()).collect()
+        }
+        ok(())
+    }
+
+    fn supports(self, ext: &str) -> bool {
+        self.extensions.iter().any(|e| e.to_uppercase().starts_with(&ext.to_uppercase()))
+    }
+
+    fn starttls(mut self) -> Result<(), string> {
+        let resp = self.command("STARTTLS")?
+        if resp.code != 220 { return err("STARTTLS rejected".to_string()) }
+        // TLS upgrade handled by runtime
+        @intrinsic("tls_upgrade", &mut self.reader, &mut self.writer)
+        ok(())
+    }
+
+    fn auth(mut self, auth: &SmtpAuth) -> Result<(), string> {
+        match auth {
+            SmtpAuth.None => ok(()),
+            SmtpAuth.Plain { username, password } => {
+                let creds = base64.encode(&format!("\0{username}\0{password}"))
+                let resp = self.command(&format!("AUTH PLAIN {creds}"))?
+                if resp.code != 235 { err(format!("AUTH failed: {}", resp.code)) } else { ok(()) }
+            }
+            SmtpAuth.Login { username, password } => {
+                let resp = self.command("AUTH LOGIN")?
+                if resp.code != 334 { return err("AUTH LOGIN not accepted".to_string()) }
+                let resp = self.command(&base64.encode(username))?
+                if resp.code != 334 { return err("username rejected".to_string()) }
+                let resp = self.command(&base64.encode(password))?
+                if resp.code != 235 { err(format!("AUTH failed: {}", resp.code)) } else { ok(()) }
+            }
+        }
+    }
+
+    fn send(mut self, msg: &SmtpMessage) -> Result<(), string> {
+        let resp = self.command(&format!("MAIL FROM:<{}>", msg.from))?
+        if !resp.is_positive() { return err(format!("MAIL FROM rejected: {}", resp.code)) }
+
+        for rcpt in msg.all_recipients() {
+            let resp = self.command(&format!("RCPT TO:<{rcpt}>"))?
+            if !resp.is_positive() { return err(format!("RCPT TO rejected for {rcpt}: {}", resp.code)) }
+        }
+
+        let resp = self.command("DATA")?
+        if resp.code != 354 { return err("DATA not accepted".to_string()) }
+
+        self.send_raw(&msg.format_data())?
+        let resp = self.command("\r\n.")?
+        if !resp.is_positive() { return err(format!("message rejected: {}", resp.code)) }
+        ok(())
+    }
+
+    fn quit(mut self) -> Result<(), string> {
+        self.command("QUIT")?
+        ok(())
+    }
+
+    fn command(mut self, cmd: &str) -> Result<SmtpResponse, string> {
+        self.send_raw(&format!("{cmd}\r\n"))?
+        self.read_response()
+    }
+
+    fn send_raw(mut self, data: &str) -> Result<(), string> {
+        self.writer.write_all(data.as_bytes())?
+        self.writer.flush()?
+        ok(())
+    }
+
+    fn read_response(mut self) -> Result<SmtpResponse, string> {
+        let mut full_msg = string.new()
+        loop {
+            let mut line = string.new()
+            self.reader.read_line(&mut line)?
+            if line.len() < 4 { return err("truncated response".to_string()) }
+            let code: u16 = line[0..3].parse().map_err(|_| "invalid response code")?
+            let continued = line.as_bytes().get(3) == some(&b'-')
+            full_msg.push_str(&line[4..].trim_end())
+            if continued { full_msg.push('\n') } else {
+                return ok(SmtpResponse { code, message: full_msg })
+            }
+        }
+    }
+}
+
+fn main() {
+    let msg = SmtpMessage.new("alice@example.com", "bob@example.com", "Hello", "Hi Bob!")
+        .add_cc("charlie@example.com")
+        .add_header("X-Mailer", "Lateralus SMTP")
+    assert(msg.all_recipients().len() == 2)
+    print("Message build \u2713")
+
+    let data = msg.format_data()
+    assert(data.contains("From: alice@example.com"))
+    assert(data.contains("Subject: Hello"))
+    assert(data.contains("Hi Bob!"))
+    print("Format data \u2713")
+
+    let resp = SmtpResponse { code: 250, message: "OK".to_string() }
+    assert(resp.is_positive())
+    assert(!resp.is_error())
+    print("Response check \u2713")
+
+    let err_resp = SmtpResponse { code: 550, message: "Rejected".to_string() }
+    assert(!err_resp.is_positive())
+    assert(err_resp.is_error())
+    print("Error response \u2713")
+
+    print("SMTP Client complete \u2713")
+}
