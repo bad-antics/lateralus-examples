@@ -1,0 +1,54 @@
+// tcp_client.ltl — Raw TCP client with read/write
+// Run: lateralus run networking/tcp_client.ltl
+
+use std.net.{TcpStream, BufReader, BufWriter}
+
+fn send_command(host: string, port: int, cmd: string) -> Result<string, string> {
+    let stream = TcpStream.connect("${host}:${port}")
+        .map_err(|e| "Connect failed: ${e}")?
+    let mut writer = BufWriter.new(stream.clone())
+    let mut reader = BufReader.new(stream)
+
+    writer.writeln(cmd).map_err(|e| "Write failed: ${e}")?
+    writer.flush().map_err(|e| "Flush failed: ${e}")?
+
+    reader.read_line().map_err(|e| "Read failed: ${e}")
+}
+
+fn tcp_echo_demo() -> Result<(), string> {
+    // A simple daytime client (RFC 867 style)
+    let host = "time.nist.gov"
+    let port = 13
+    match TcpStream.connect("${host}:${port}") {
+        err(e) => print("Demo skipped (${e})"),
+        ok(stream) => {
+            let mut reader = BufReader.new(stream)
+            let response = reader.read_to_string().unwrap_or("(no data)")
+            print("Daytime: ${response.trim()}")
+        },
+    }
+    ok(())
+}
+
+fn http_raw(host: string, path: string) -> Result<string, string> {
+    let stream = TcpStream.connect("${host}:80")
+        .map_err(|e| "Connect: ${e}")?
+    let mut writer = BufWriter.new(stream.clone())
+    let mut reader = BufReader.new(stream)
+
+    writer.write("GET ${path} HTTP/1.0
+Host: ${host}
+Connection: close
+
+")
+        .map_err(|e| "Write: ${e}")?
+    writer.flush().map_err(|e| "Flush: ${e}")?
+
+    reader.read_to_string().map_err(|e| "Read: ${e}")
+}
+
+fn main() {
+    tcp_echo_demo().unwrap_or_else(|e| print("Error: ${e}"))
+}
+
+main()
