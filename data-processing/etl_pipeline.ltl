@@ -1,0 +1,108 @@
+// etl_pipeline.ltl — Extract / Transform / Load with pipelines
+// Run: lateralus run data-processing/etl_pipeline.ltl
+
+use std.csv
+use std.json
+use std.io
+
+struct RawRecord {
+    id:         string,
+    name:       string,
+    email:      string,
+    score:      string,
+    department: string,
+}
+
+struct CleanRecord {
+    id:         int,
+    name:       string,
+    email:      string,
+    score:      float,
+    department: string,
+    grade:      string,
+}
+
+fn grade(score: float) -> string {
+    match score {
+        s if s >= 90.0 => "A",
+        s if s >= 80.0 => "B",
+        s if s >= 70.0 => "C",
+        s if s >= 60.0 => "D",
+        _              => "F",
+    }
+}
+
+// Extract
+fn extract(path: string) -> [RawRecord] {
+    csv.read_file(path)
+        |> skip(1)  // header
+        |> map(row => RawRecord {
+            id:         row[0],
+            name:       row[1],
+            email:      row[2],
+            score:      row[3],
+            department: row[4],
+        })
+        |> collect()
+}
+
+// Transform
+fn transform(records: [RawRecord]) -> [CleanRecord] {
+    records
+        |> filter(r => !r.id.is_empty() && !r.score.is_empty())
+        |> filter_map(r => {
+            let id    = r.id.parse_int().ok()?
+            let score = r.score.parse_float().ok()?
+            let email = r.email.trim().to_lowercase()
+            if !email.contains("@") { return none }
+            some(CleanRecord {
+                id,
+                name:       r.name.trim().to_title_case(),
+                email,
+                score,
+                department: r.department.trim(),
+                grade:      grade(score),
+            })
+        })
+        |> collect()
+}
+
+// Load (write to JSON)
+fn load(records: [CleanRecord], out_path: string) {
+    let payload = records
+        |> map(r => json.object({
+            "id":         r.id,
+            "name":       r.name,
+            "email":      r.email,
+            "score":      r.score,
+            "grade":      r.grade,
+            "department": r.department,
+        }))
+        |> json.array()
+
+    io.write_file(out_path, payload.to_string_pretty())
+}
+
+fn main() {
+    let raw    = extract("students.csv")
+    let clean  = transform(raw)
+    load(clean, "students_clean.json")
+
+    // Summary stats
+    let by_dept = clean
+        |> group_by(r => r.department)
+        |> map_values(group => {
+            let avg = group |> map(r => r.score) |> mean()
+            let top = group |> filter(r => r.grade == "A") |> len()
+            (avg, top)
+        })
+
+    print("Department summary:")
+    for (dept, (avg, a_count)) in by_dept {
+        print("  ${dept}: avg=${avg.round(1)}, A-grades=${a_count}")
+    }
+
+    print("Processed ${raw.len()} raw → ${clean.len()} clean records")
+}
+
+main()
