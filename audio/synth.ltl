@@ -1,0 +1,111 @@
+// synth.ltl — Software synthesiser: oscillators, envelopes, WAV export
+use std.math.{sin, cos, PI, pow}
+use std.fs.File
+
+const SAMPLE_RATE: int   = 44100
+const TWO_PI:      float = 2.0 * PI
+
+enum Waveform { Sine, Square, Sawtooth, Triangle, Noise }
+
+fn sample_osc(wave: Waveform, freq: float, t: float, phase: float) -> float {
+    let p = TWO_PI * freq * t + phase
+    match wave {
+        Waveform.Sine     => sin(p),
+        Waveform.Square   => if (p % TWO_PI) < PI { 1.0 } else { -1.0 },
+        Waveform.Sawtooth => 2.0 * ((freq * t + phase / TWO_PI) % 1.0) - 1.0,
+        Waveform.Triangle => {
+            let r = (freq * t + phase / TWO_PI) % 1.0
+            if r < 0.5 { 4.0 * r - 1.0 } else { 3.0 - 4.0 * r }
+        },
+        Waveform.Noise => (std.random.rand_float() * 2.0 - 1.0),
+    }
+}
+
+struct Envelope {
+    attack:  float,   // seconds
+    decay:   float,
+    sustain: float,   // 0..1 level
+    release: float,
+}
+
+impl Envelope {
+    fn adsr() -> Envelope { Envelope { attack: 0.01, decay: 0.1, sustain: 0.7, release: 0.2 } }
+
+    fn amplitude(self, t: float, duration: float) -> float {
+        let a = self.attack
+        let d = self.decay
+        let r = self.release
+        let s = self.sustain
+        if t < a                         { t / a }
+        else if t < a + d                { 1.0 - (1.0 - s) * (t - a) / d }
+        else if t < duration - r         { s }
+        else if t < duration             { s * (duration - t) / r }
+        else                             { 0.0 }
+    }
+}
+
+struct Note { freq: float, duration: float, wave: Waveform, env: Envelope }
+
+impl Note {
+    fn render(self) -> [i16] {
+        let n_samples = (self.duration * SAMPLE_RATE as float) as int
+        range(0, n_samples) |> map(|i| {
+            let t   = i as float / SAMPLE_RATE as float
+            let amp = self.env.amplitude(t, self.duration)
+            let s   = sample_osc(self.wave, self.freq, t, 0.0) * amp
+            (s * 32767.0).clamp(-32768.0, 32767.0) as i16
+        }) |> collect()
+    }
+}
+
+fn freq_of(note: string) -> float {
+    let notes = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+    let octave = note.chars().last().unwrap().to_digit(10).unwrap() as int
+    let name   = note[..note.len()-1]
+    let idx    = notes |> position(|n| n == name) ?? 9
+    440.0 * pow(2.0, (idx as float - 9.0 + (octave - 4) * 12) as float / 12.0)
+}
+
+fn write_wav(path: string, samples: [i16], channels: int) {
+    let data_size = samples.len() * 2
+    let mut hdr   = []
+    // RIFF header
+    hdr.extend(b"RIFF")
+    hdr.extend((36 + data_size as u32).to_le_bytes())
+    hdr.extend(b"WAVEfmt ")
+    hdr.extend(16u32.to_le_bytes())
+    hdr.extend(1u16.to_le_bytes())          // PCM
+    hdr.extend((channels as u16).to_le_bytes())
+    hdr.extend((SAMPLE_RATE as u32).to_le_bytes())
+    hdr.extend(((SAMPLE_RATE * channels * 2) as u32).to_le_bytes())
+    hdr.extend(((channels * 2) as u16).to_le_bytes())
+    hdr.extend(16u16.to_le_bytes())         // bit depth
+    hdr.extend(b"data")
+    hdr.extend((data_size as u32).to_le_bytes())
+    let mut file = File.create(path)
+    file.write_all(hdr)
+    for s in samples { file.write_all(s.to_le_bytes()) }
+}
+
+fn main() {
+    let melody = [("C4",0.3),("E4",0.3),("G4",0.3),("C5",0.6),
+                  ("G4",0.3),("E4",0.3),("C4",0.6)]
+    let env    = Envelope.adsr()
+    let mut samples: [i16] = []
+    for (name, dur) in melody {
+        let note = Note { freq: freq_of(name), duration: dur, wave: Waveform.Sine, env }
+        samples.extend(note.render())
+    }
+    write_wav("/tmp/melody.wav", samples, 1)
+    print("Wrote /tmp/melody.wav  (${samples.len()} samples, ${samples.len() / SAMPLE_RATE}s)")
+
+    // Chord: C major
+    let freqs = [freq_of("C4"), freq_of("E4"), freq_of("G4")]
+    let chord: [i16] = range(0, SAMPLE_RATE) |> map(|i| {
+        let t = i as float / SAMPLE_RATE as float
+        let s = freqs |> map(|f| sample_osc(Waveform.Sine, f, t, 0.0)) |> sum() / 3.0
+        (s * 32767.0) as i16
+    }) |> collect()
+    write_wav("/tmp/chord.wav", chord, 1)
+    print("Wrote /tmp/chord.wav (C major) ✓")
+}
