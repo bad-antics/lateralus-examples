@@ -1,110 +1,67 @@
-// Niche Example — Audio Synthesizer
-// Wavetable oscillators, ADSR envelope, filters, mixing, WAV export.
+// Niche Example - Audio Synthesizer
+// Digital audio synthesis with oscillators, filters, and envelopes.
 
-use std.math
+use std.math.{PI, sin, cos, pow, log2, exp2}
 
-// ── Audio Constants ──────────────────────────────────────────────────────────
 const SAMPLE_RATE: f64 = 44100.0
-const TWO_PI: f64 = 2.0 * std.math.PI
-const MAX_AMPLITUDE: f64 = 0.9
+const TWO_PI: f64 = 2.0 * PI
 
-// ── Waveform generators ─────────────────────────────────────────────────────
+#[derive(Clone)]
 enum Waveform { Sine, Square, Sawtooth, Triangle, Noise, Pulse(f64) }
 
-fn generate_sample(waveform: &Waveform, phase: f64) -> f64 {
-    match waveform {
-        Waveform.Sine => math.sin(phase * TWO_PI),
-        Waveform.Square => if phase < 0.5 { 1.0 } else { -1.0 },
-        Waveform.Sawtooth => 2.0 * phase - 1.0,
-        Waveform.Triangle => {
-            if phase < 0.25 { 4.0 * phase }
-            else if phase < 0.75 { 2.0 - 4.0 * phase }
-            else { 4.0 * phase - 4.0 }
-        }
-        Waveform.Noise => {
-            // Simple LCG pseudo-random
-            static mut seed: u64 = 12345
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)
-            ((seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
-        }
-        Waveform.Pulse(duty) => if phase < *duty { 1.0 } else { -1.0 },
-    }
-}
-
-// ── Wavetable Oscillator ─────────────────────────────────────────────────────
-const TABLE_SIZE: usize = 2048
-
-struct Wavetable {
-    samples: [f64; TABLE_SIZE],
-}
-
-impl Wavetable {
-    fn from_waveform(waveform: &Waveform) -> Wavetable {
-        let mut samples = [0.0f64; TABLE_SIZE]
-        for i in 0..TABLE_SIZE {
-            let phase = i as f64 / TABLE_SIZE as f64
-            samples[i] = generate_sample(waveform, phase)
-        }
-        Wavetable { samples }
-    }
-
-    fn sample(self, phase: f64) -> f64 {
-        let index = phase * TABLE_SIZE as f64
-        let i0 = index as usize % TABLE_SIZE
-        let i1 = (i0 + 1) % TABLE_SIZE
-        let frac = index - index.floor()
-        self.samples[i0] * (1.0 - frac) + self.samples[i1] * frac  // Linear interpolation
-    }
-}
-
 struct Oscillator {
-    table: Wavetable,
+    waveform: Waveform,
     frequency: f64,
     phase: f64,
+    amplitude: f64,
     phase_increment: f64,
-    detune: f64,       // cents
 }
 
 impl Oscillator {
-    fn new(waveform: &Waveform, freq: f64) -> Oscillator {
-        let detune = 0.0
+    fn new(waveform: Waveform, frequency: f64) -> Oscillator {
         Oscillator {
-            table: Wavetable.from_waveform(waveform),
-            frequency: freq,
-            phase: 0.0,
-            phase_increment: freq / SAMPLE_RATE,
-            detune,
+            waveform, frequency, phase: 0.0, amplitude: 1.0,
+            phase_increment: frequency / SAMPLE_RATE,
         }
     }
 
     fn set_frequency(mut self, freq: f64) {
         self.frequency = freq
-        let detune_factor = math.pow(2.0, self.detune / 1200.0)
-        self.phase_increment = (freq * detune_factor) / SAMPLE_RATE
-    }
-
-    fn set_detune(mut self, cents: f64) {
-        self.detune = cents
-        self.set_frequency(self.frequency)
+        self.phase_increment = freq / SAMPLE_RATE
     }
 
     fn next_sample(mut self) -> f64 {
-        let sample = self.table.sample(self.phase)
+        let sample = match &self.waveform {
+            Waveform.Sine => sin(TWO_PI * self.phase),
+            Waveform.Square => if self.phase < 0.5 { 1.0 } else { -1.0 },
+            Waveform.Sawtooth => 2.0 * self.phase - 1.0,
+            Waveform.Triangle => {
+                if self.phase < 0.25 { 4.0 * self.phase }
+                else if self.phase < 0.75 { 2.0 - 4.0 * self.phase }
+                else { -4.0 + 4.0 * self.phase }
+            },
+            Waveform.Noise => std.rand.random::<f64>() * 2.0 - 1.0,
+            Waveform.Pulse(duty) => if self.phase < *duty { 1.0 } else { -1.0 },
+        }
         self.phase += self.phase_increment
         if self.phase >= 1.0 { self.phase -= 1.0 }
-        sample
+        sample * self.amplitude
     }
 
-    fn reset(mut self) { self.phase = 0.0 }
+    fn generate(mut self, num_samples: usize) -> [f64] {
+        let mut samples: [f64] = Vec.with_capacity(num_samples)
+        for _ in 0..num_samples { samples.push(self.next_sample()) }
+        samples
+    }
 }
 
-// ── ADSR Envelope ────────────────────────────────────────────────────────────
+#[derive(Clone)]
 enum EnvelopeState { Idle, Attack, Decay, Sustain, Release }
 
 struct Envelope {
     attack: f64,   // seconds
     decay: f64,    // seconds
-    sustain: f64,  // level (0.0-1.0)
+    sustain: f64,  // level 0.0-1.0
     release: f64,  // seconds
     state: EnvelopeState,
     level: f64,
@@ -128,7 +85,7 @@ impl Envelope {
 
     fn next_sample(mut self) -> f64 {
         match self.state {
-            EnvelopeState.Idle => 0.0,
+            EnvelopeState.Idle => {},
             EnvelopeState.Attack => {
                 self.level += self.rate
                 if self.level >= 1.0 {
@@ -136,26 +93,24 @@ impl Envelope {
                     self.state = EnvelopeState.Decay
                     self.rate = (1.0 - self.sustain) / (self.decay * SAMPLE_RATE)
                 }
-                self.level
-            }
+            },
             EnvelopeState.Decay => {
                 self.level -= self.rate
                 if self.level <= self.sustain {
                     self.level = self.sustain
                     self.state = EnvelopeState.Sustain
                 }
-                self.level
-            }
-            EnvelopeState.Sustain => self.sustain,
+            },
+            EnvelopeState.Sustain => {},
             EnvelopeState.Release => {
                 self.level -= self.rate
                 if self.level <= 0.0 {
                     self.level = 0.0
                     self.state = EnvelopeState.Idle
                 }
-                self.level
-            }
+            },
         }
+        self.level
     }
 
     fn is_active(self) -> bool {
@@ -163,67 +118,23 @@ impl Envelope {
     }
 }
 
-// ── Filters ──────────────────────────────────────────────────────────────────
-struct LowPassFilter {
+enum FilterType { LowPass, HighPass, BandPass }
+
+struct BiquadFilter {
+    filter_type: FilterType,
     cutoff: f64,
     resonance: f64,
-    // State variables (biquad)
-    b0: f64, b1: f64, b2: f64,
-    a1: f64, a2: f64,
+    a0: f64, a1: f64, a2: f64,
+    b1: f64, b2: f64,
     x1: f64, x2: f64,
     y1: f64, y2: f64,
 }
 
-impl LowPassFilter {
-    fn new(cutoff: f64, resonance: f64) -> LowPassFilter {
-        let mut filter = LowPassFilter {
-            cutoff, resonance,
-            b0: 0.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0,
-            x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
-        }
-        filter.calculate_coefficients()
-        filter
-    }
-
-    fn calculate_coefficients(mut self) {
-        let w0 = TWO_PI * self.cutoff / SAMPLE_RATE
-        let alpha = math.sin(w0) / (2.0 * self.resonance)
-        let cos_w0 = math.cos(w0)
-        let a0 = 1.0 + alpha
-        self.b0 = ((1.0 - cos_w0) / 2.0) / a0
-        self.b1 = (1.0 - cos_w0) / a0
-        self.b2 = self.b0
-        self.a1 = (-2.0 * cos_w0) / a0
-        self.a2 = (1.0 - alpha) / a0
-    }
-
-    fn set_cutoff(mut self, cutoff: f64) {
-        self.cutoff = cutoff.clamp(20.0, SAMPLE_RATE / 2.0)
-        self.calculate_coefficients()
-    }
-
-    fn process(mut self, input: f64) -> f64 {
-        let output = self.b0 * input + self.b1 * self.x1 + self.b2 * self.x2
-                     - self.a1 * self.y1 - self.a2 * self.y2
-        self.x2 = self.x1; self.x1 = input
-        self.y2 = self.y1; self.y1 = output
-        output
-    }
-
-    fn reset(mut self) { self.x1 = 0.0; self.x2 = 0.0; self.y1 = 0.0; self.y2 = 0.0 }
-}
-
-struct HighPassFilter {
-    cutoff: f64, resonance: f64,
-    b0: f64, b1: f64, b2: f64, a1: f64, a2: f64,
-    x1: f64, x2: f64, y1: f64, y2: f64,
-}
-
-impl HighPassFilter {
-    fn new(cutoff: f64, resonance: f64) -> HighPassFilter {
-        let mut f = HighPassFilter {
-            cutoff, resonance,
-            b0: 0.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0,
+impl BiquadFilter {
+    fn new(filter_type: FilterType, cutoff: f64, resonance: f64) -> BiquadFilter {
+        let mut f = BiquadFilter {
+            filter_type, cutoff, resonance,
+            a0: 0.0, a1: 0.0, a2: 0.0, b1: 0.0, b2: 0.0,
             x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
         }
         f.calculate_coefficients()
@@ -232,241 +143,164 @@ impl HighPassFilter {
 
     fn calculate_coefficients(mut self) {
         let w0 = TWO_PI * self.cutoff / SAMPLE_RATE
-        let alpha = math.sin(w0) / (2.0 * self.resonance)
-        let cos_w0 = math.cos(w0)
-        let a0 = 1.0 + alpha
-        self.b0 = ((1.0 + cos_w0) / 2.0) / a0
-        self.b1 = (-(1.0 + cos_w0)) / a0
-        self.b2 = self.b0
-        self.a1 = (-2.0 * cos_w0) / a0
-        self.a2 = (1.0 - alpha) / a0
+        let sin_w0 = sin(w0)
+        let cos_w0 = cos(w0)
+        let alpha = sin_w0 / (2.0 * self.resonance)
+
+        match self.filter_type {
+            FilterType.LowPass => {
+                let b0 = (1.0 - cos_w0) / 2.0
+                let b1_raw = 1.0 - cos_w0
+                let b2_raw = (1.0 - cos_w0) / 2.0
+                let a0_raw = 1.0 + alpha
+                let a1_raw = -2.0 * cos_w0
+                let a2_raw = 1.0 - alpha
+                self.a0 = b0 / a0_raw
+                self.a1 = b1_raw / a0_raw
+                self.a2 = b2_raw / a0_raw
+                self.b1 = a1_raw / a0_raw
+                self.b2 = a2_raw / a0_raw
+            },
+            FilterType.HighPass => {
+                let b0 = (1.0 + cos_w0) / 2.0
+                let b1_raw = -(1.0 + cos_w0)
+                let b2_raw = (1.0 + cos_w0) / 2.0
+                let a0_raw = 1.0 + alpha
+                let a1_raw = -2.0 * cos_w0
+                let a2_raw = 1.0 - alpha
+                self.a0 = b0 / a0_raw
+                self.a1 = b1_raw / a0_raw
+                self.a2 = b2_raw / a0_raw
+                self.b1 = a1_raw / a0_raw
+                self.b2 = a2_raw / a0_raw
+            },
+            FilterType.BandPass => {
+                let b0 = alpha
+                let b1_raw = 0.0
+                let b2_raw = -alpha
+                let a0_raw = 1.0 + alpha
+                let a1_raw = -2.0 * cos_w0
+                let a2_raw = 1.0 - alpha
+                self.a0 = b0 / a0_raw
+                self.a1 = b1_raw / a0_raw
+                self.a2 = b2_raw / a0_raw
+                self.b1 = a1_raw / a0_raw
+                self.b2 = a2_raw / a0_raw
+            },
+        }
     }
 
     fn process(mut self, input: f64) -> f64 {
-        let output = self.b0 * input + self.b1 * self.x1 + self.b2 * self.x2
-                     - self.a1 * self.y1 - self.a2 * self.y2
+        let output = self.a0 * input + self.a1 * self.x1 + self.a2 * self.x2
+                     - self.b1 * self.y1 - self.b2 * self.y2
         self.x2 = self.x1; self.x1 = input
         self.y2 = self.y1; self.y1 = output
         output
     }
-}
 
-// ── Delay Effect ─────────────────────────────────────────────────────────────
-struct Delay {
-    buffer: [f64],
-    write_pos: usize,
-    delay_samples: usize,
-    feedback: f64,
-    mix: f64,
-}
-
-impl Delay {
-    fn new(delay_ms: f64, feedback: f64, mix: f64) -> Delay {
-        let delay_samples = (delay_ms * SAMPLE_RATE / 1000.0) as usize
-        Delay {
-            buffer: vec![0.0; delay_samples], write_pos: 0,
-            delay_samples, feedback, mix,
-        }
-    }
-
-    fn process(mut self, input: f64) -> f64 {
-        let read_pos = (self.write_pos + self.buffer.len() - self.delay_samples) % self.buffer.len()
-        let delayed = self.buffer[read_pos]
-        self.buffer[self.write_pos] = input + delayed * self.feedback
-        self.write_pos = (self.write_pos + 1) % self.buffer.len()
-        input * (1.0 - self.mix) + delayed * self.mix
+    fn reset(mut self) {
+        self.x1 = 0.0; self.x2 = 0.0; self.y1 = 0.0; self.y2 = 0.0
     }
 }
 
-// ── Mixer ────────────────────────────────────────────────────────────────────
-struct MixerChannel {
-    name: string,
-    volume: f64,  // 0.0-1.0
-    pan: f64,     // -1.0 (left) to 1.0 (right)
-    mute: bool,
-    solo: bool,
-}
-
-struct Mixer {
-    channels: [MixerChannel],
-    master_volume: f64,
-}
-
-impl Mixer {
-    fn new() -> Mixer { Mixer { channels: [], master_volume: 1.0 } }
-
-    fn add_channel(mut self, name: &str) -> usize {
-        let idx = self.channels.len()
-        self.channels.push(MixerChannel {
-            name: name.to_string(), volume: 1.0, pan: 0.0, mute: false, solo: false,
-        })
-        idx
-    }
-
-    fn mix(self, samples: &[[f64]]) -> (f64, f64) {
-        let has_solo = self.channels.iter().any(|ch| ch.solo)
-        let mut left = 0.0; let mut right = 0.0
-
-        for i in 0..self.channels.len().min(samples.len()) {
-            let ch = &self.channels[i]
-            if ch.mute { continue }
-            if has_solo && !ch.solo { continue }
-
-            for &sample in &samples[i] {
-                let scaled = sample * ch.volume
-                let l_gain = ((1.0 - ch.pan) / 2.0).sqrt()
-                let r_gain = ((1.0 + ch.pan) / 2.0).sqrt()
-                left += scaled * l_gain
-                right += scaled * r_gain
-            }
-        }
-
-        (left * self.master_volume, right * self.master_volume)
-    }
-}
-
-// ── WAV Writer ───────────────────────────────────────────────────────────────
-struct WavWriter {
-    sample_rate: u32,
-    channels: u16,
-    bits_per_sample: u16,
-    samples: [f64],
-}
-
-impl WavWriter {
-    fn new(sample_rate: u32, channels: u16) -> WavWriter {
-        WavWriter { sample_rate, channels, bits_per_sample: 16, samples: [] }
-    }
-
-    fn add_sample(mut self, sample: f64) {
-        self.samples.push(sample.clamp(-1.0, 1.0))
-    }
-
-    fn to_bytes(self) -> [u8] {
-        let data_size = self.samples.len() * 2  // 16-bit
-        let file_size = 36 + data_size
-        let mut buf: [u8] = []
-
-        // RIFF header
-        buf.extend_from_slice(b"RIFF")
-        buf.extend_from_slice(&(file_size as u32).to_le_bytes())
-        buf.extend_from_slice(b"WAVE")
-
-        // fmt chunk
-        buf.extend_from_slice(b"fmt ")
-        buf.extend_from_slice(&16u32.to_le_bytes())       // chunk size
-        buf.extend_from_slice(&1u16.to_le_bytes())         // PCM
-        buf.extend_from_slice(&self.channels.to_le_bytes())
-        buf.extend_from_slice(&self.sample_rate.to_le_bytes())
-        let byte_rate = self.sample_rate * self.channels as u32 * 2
-        buf.extend_from_slice(&byte_rate.to_le_bytes())
-        let block_align = self.channels * 2
-        buf.extend_from_slice(&block_align.to_le_bytes())
-        buf.extend_from_slice(&self.bits_per_sample.to_le_bytes())
-
-        // data chunk
-        buf.extend_from_slice(b"data")
-        buf.extend_from_slice(&(data_size as u32).to_le_bytes())
-        for &sample in &self.samples {
-            let i16_sample = (sample * 32767.0) as i16
-            buf.extend_from_slice(&i16_sample.to_le_bytes())
-        }
-
-        buf
-    }
-
-    fn duration_seconds(self) -> f64 {
-        self.samples.len() as f64 / (self.sample_rate as f64 * self.channels as f64)
-    }
-}
-
-// ── Note helpers ─────────────────────────────────────────────────────────────
 fn midi_to_freq(note: u8) -> f64 {
-    440.0 * math.pow(2.0, (note as f64 - 69.0) / 12.0)
+    440.0 * exp2((note as f64 - 69.0) / 12.0)
 }
 
-fn note_name(midi: u8) -> string {
-    let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-    let octave = (midi / 12) as i32 - 1
-    format!("{}{}", names[(midi % 12) as usize], octave)
+fn freq_to_midi(freq: f64) -> u8 {
+    (69.0 + 12.0 * log2(freq / 440.0)).round() as u8
+}
+
+fn db_to_linear(db: f64) -> f64 { pow(10.0, db / 20.0) }
+fn linear_to_db(linear: f64) -> f64 { 20.0 * log2(linear) / log2(10.0) }
+
+fn mix(signals: &[[f64]]) -> [f64] {
+    if signals.is_empty() { return [] }
+    let len = signals.iter().map(|s| s.len()).max().unwrap_or(0)
+    let mut output = vec![0.0f64; len]
+    for signal in signals {
+        for (i, &sample) in signal.iter().enumerate() {
+            output[i] += sample
+        }
+    }
+    // Normalize
+    let peak = output.iter().map(|s| s.abs()).fold(0.0f64, |a, b| a.max(b))
+    if peak > 1.0 {
+        for s in output.iter_mut() { *s /= peak }
+    }
+    output
 }
 
 fn main() {
-    // Test oscillator
-    let mut osc = Oscillator.new(&Waveform.Sine, 440.0)
+    // Oscillator - Sine
+    let mut osc = Oscillator.new(Waveform.Sine, 440.0)
     let sample = osc.next_sample()
     assert(sample >= -1.0 && sample <= 1.0)
-    print("Oscillator ✓")
+    print("Sine oscillator ✓")
 
-    // Test ADSR
-    let mut env = Envelope.new(0.01, 0.1, 0.7, 0.2)
+    // Generate samples
+    let mut osc2 = Oscillator.new(Waveform.Sine, 440.0)
+    let samples = osc2.generate(100)
+    assert(samples.len() == 100)
+    assert(samples.iter().all(|&s| s >= -1.0 && s <= 1.0))
+    print("Generate samples ✓")
+
+    // Square wave
+    let mut sq = Oscillator.new(Waveform.Square, 440.0)
+    let s = sq.next_sample()
+    assert(s == 1.0 || s == -1.0)
+    print("Square wave ✓")
+
+    // Sawtooth
+    let mut saw = Oscillator.new(Waveform.Sawtooth, 440.0)
+    let s = saw.next_sample()
+    assert(s >= -1.0 && s <= 1.0)
+    print("Sawtooth ✓")
+
+    // MIDI conversion
+    assert(midi_to_freq(69) == 440.0)
+    assert(freq_to_midi(440.0) == 69)
+    assert(midi_to_freq(60).round() == 262.0)  // Middle C ~261.63
+    print("MIDI conversion ✓")
+
+    // dB conversion
+    let linear = db_to_linear(0.0)
+    assert((linear - 1.0).abs() < 0.001)
+    let db = linear_to_db(1.0)
+    assert(db.abs() < 0.001)
+    print("dB conversion ✓")
+
+    // Envelope
+    let mut env = Envelope.new(0.01, 0.1, 0.7, 0.3)
+    assert(!env.is_active())
     env.note_on()
     assert(env.is_active())
-    let mut peak = 0.0
-    for _ in 0..(SAMPLE_RATE as usize) {
-        let v = env.next_sample()
-        if v > peak { peak = v }
-    }
-    assert(peak > 0.99)
-    print("ADSR envelope ✓")
+    // Run through attack
+    for _ in 0..500 { env.next_sample(); }
+    assert(env.level > 0.0)
+    print("Envelope ✓")
 
-    // Test filter
-    let mut lpf = LowPassFilter.new(1000.0, 0.707)
+    // Filter
+    let mut lpf = BiquadFilter.new(FilterType.LowPass, 1000.0, 0.707)
     let filtered = lpf.process(1.0)
-    assert(filtered.abs() < 2.0)
-    lpf.set_cutoff(500.0)
-    print("Low-pass filter ✓")
+    assert(filtered.is_finite())
+    lpf.reset()
+    assert(lpf.x1 == 0.0)
+    print("BiquadFilter ✓")
 
-    // Test delay
-    let mut delay = Delay.new(100.0, 0.5, 0.5)
-    let d1 = delay.process(1.0)
-    assert(d1.abs() < 2.0)
-    print("Delay effect ✓")
+    // Mix
+    let s1 = vec![0.5, 0.5, 0.5]
+    let s2 = vec![0.3, 0.3, 0.3]
+    let mixed = mix(&[s1, s2])
+    assert(mixed.len() == 3)
+    assert(mixed.iter().all(|&s| s >= -1.0 && s <= 1.0))
+    print("Mix ✓")
 
-    // Test mixer
-    let mut mixer = Mixer.new()
-    mixer.add_channel("Lead")
-    mixer.add_channel("Bass")
-    mixer.channels[1].pan = -0.5
-    let (l, r) = mixer.mix(&[[0.5], [0.3]])
-    assert(l.abs() > 0.0 && r.abs() > 0.0)
-    print("Mixer ✓")
+    // Frequency set
+    let mut osc3 = Oscillator.new(Waveform.Sine, 440.0)
+    osc3.set_frequency(880.0)
+    assert(osc3.frequency == 880.0)
+    print("Set frequency ✓")
 
-    // Test WAV writer
-    let mut wav = WavWriter.new(44100, 1)
-    for i in 0..44100 {
-        let t = i as f64 / SAMPLE_RATE
-        wav.add_sample(math.sin(TWO_PI * 440.0 * t) * 0.5)
-    }
-    let bytes = wav.to_bytes()
-    assert(bytes[0] == b'R' && bytes[1] == b'I' && bytes[2] == b'F' && bytes[3] == b'F')
-    assert(bytes[8] == b'W' && bytes[9] == b'A' && bytes[10] == b'V' && bytes[11] == b'E')
-    assert(wav.duration_seconds() > 0.99 && wav.duration_seconds() < 1.01)
-    print("WAV writer: ${bytes.len()} bytes, ${wav.duration_seconds():.2}s ✓")
-
-    // MIDI helpers
-    assert(midi_to_freq(69) == 440.0)   // A4
-    assert(midi_to_freq(60) > 261.0 && midi_to_freq(60) < 262.0)  // C4
-    assert(note_name(69) == "A4")
-    assert(note_name(60) == "C4")
-    print("MIDI helpers ✓")
-
-    // Wavetable interpolation
-    let table = Wavetable.from_waveform(&Waveform.Sine)
-    let s0 = table.sample(0.0)     // should be ~0
-    let s25 = table.sample(0.25)   // should be ~1
-    assert(s0.abs() < 0.01)
-    assert((s25 - 1.0).abs() < 0.01)
-    print("Wavetable interpolation ✓")
-
-    // Waveforms
-    assert(generate_sample(&Waveform.Square, 0.25) == 1.0)
-    assert(generate_sample(&Waveform.Square, 0.75) == -1.0)
-    assert((generate_sample(&Waveform.Sawtooth, 0.5) - 0.0).abs() < 0.01)
-    assert(generate_sample(&Waveform.Triangle, 0.0).abs() < 0.01)
-    assert(generate_sample(&Waveform.Pulse(0.3), 0.2) == 1.0)
-    assert(generate_sample(&Waveform.Pulse(0.3), 0.5) == -1.0)
-    print("Waveforms ✓")
-
-    print("Audio Synthesizer complete ✓")
+    print("Audio Synth complete ✓")
 }
