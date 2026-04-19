@@ -1,0 +1,265 @@
+// Niche Example - MQTT Client
+// Lightweight pub/sub messaging protocol for IoT.
+
+use std.net.TcpStream
+use std.io.{Read, Write}
+
+enum QoS { AtMostOnce, AtLeastOnce, ExactlyOnce }
+
+impl QoS {
+    fn to_u8(self) -> u8 { match self { QoS.AtMostOnce => 0, QoS.AtLeastOnce => 1, QoS.ExactlyOnce => 2 } }
+    fn from_u8(val: u8) -> QoS { match val { 0 => QoS.AtMostOnce, 1 => QoS.AtLeastOnce, 2 => QoS.ExactlyOnce, _ => QoS.AtMostOnce } }
+}
+
+enum PacketType {
+    Connect, ConnAck, Publish, PubAck, PubRec, PubRel, PubComp,
+    Subscribe, SubAck, Unsubscribe, UnsubAck, PingReq, PingResp, Disconnect,
+}
+
+impl PacketType {
+    fn to_u8(self) -> u8 {
+        match self {
+            PacketType.Connect => 1, PacketType.ConnAck => 2, PacketType.Publish => 3,
+            PacketType.PubAck => 4, PacketType.PubRec => 5, PacketType.PubRel => 6,
+            PacketType.PubComp => 7, PacketType.Subscribe => 8, PacketType.SubAck => 9,
+            PacketType.Unsubscribe => 10, PacketType.UnsubAck => 11,
+            PacketType.PingReq => 12, PacketType.PingResp => 13, PacketType.Disconnect => 14,
+        }
+    }
+    fn from_u8(val: u8) -> Option<PacketType> {
+        match val {
+            1 => some(PacketType.Connect), 2 => some(PacketType.ConnAck),
+            3 => some(PacketType.Publish), 4 => some(PacketType.PubAck),
+            8 => some(PacketType.Subscribe), 9 => some(PacketType.SubAck),
+            12 => some(PacketType.PingReq), 13 => some(PacketType.PingResp),
+            14 => some(PacketType.Disconnect), _ => none,
+        }
+    }
+}
+
+struct ConnectOptions {
+    client_id: string,
+    keep_alive: u16,
+    clean_session: bool,
+    username: Option<string>,
+    password: Option<[u8]>,
+    will: Option<Will>,
+}
+
+struct Will { topic: string, payload: [u8], qos: QoS, retain: bool }
+
+struct Message { topic: string, payload: [u8], qos: QoS, retain: bool, packet_id: Option<u16> }
+
+impl Message {
+    fn new(topic: &str, payload: &[u8]) -> Message {
+        Message { topic: topic.to_string(), payload: payload.to_vec(), qos: QoS.AtMostOnce, retain: false, packet_id: none }
+    }
+    fn with_qos(mut self, qos: QoS) -> Message { self.qos = qos; self }
+    fn with_retain(mut self, retain: bool) -> Message { self.retain = retain; self }
+    fn payload_str(self) -> Result<string, string> {
+        string.from_utf8(self.payload.clone()).map_err(|e| e.to_string())
+    }
+}
+
+fn encode_remaining_length(length: usize) -> [u8] {
+    let mut result: [u8] = []
+    let mut x = length
+    loop {
+        let mut byte = (x % 128) as u8
+        x /= 128
+        if x > 0 { byte |= 0x80 }
+        result.push(byte)
+        if x == 0 { break }
+    }
+    result
+}
+
+fn decode_remaining_length(bytes: &[u8]) -> (usize, usize) {
+    let mut multiplier = 1usize
+    let mut value = 0usize
+    let mut idx = 0
+    loop {
+        let byte = bytes[idx]
+        value += (byte as usize & 0x7F) * multiplier
+        multiplier *= 128
+        idx += 1
+        if byte & 0x80 == 0 { break }
+    }
+    (value, idx)
+}
+
+fn encode_utf8_string(s: &str) -> [u8] {
+    let bytes = s.as_bytes()
+    let len = bytes.len() as u16
+    let mut result = [(len >> 8) as u8, (len & 0xFF) as u8]
+    result.extend_from_slice(bytes)
+    result
+}
+
+struct MqttClient {
+    stream: Option<TcpStream>,
+    options: ConnectOptions,
+    next_packet_id: u16,
+    subscriptions: HashMap<string, QoS>,
+    connected: bool,
+}
+
+impl MqttClient {
+    fn new(options: ConnectOptions) -> MqttClient {
+        MqttClient { stream: none, options, next_packet_id: 1, subscriptions: HashMap.new(), connected: false }
+    }
+
+    fn connect(mut self, host: &str, port: u16) -> Result<(), string> {
+        let stream = TcpStream.connect(format!("{}:{}", host, port)).map_err(|e| e.to_string())?
+        self.stream = some(stream)
+
+        let mut packet: [u8] = []
+        // Fixed header
+        packet.push(PacketType.Connect.to_u8() << 4)
+
+        // Variable header + payload
+        let mut var_header: [u8] = []
+        var_header.extend_from_slice(&encode_utf8_string("MQTT"))
+        var_header.push(4)  // Protocol level (MQTT 3.1.1)
+
+        let mut flags = 0u8
+        if self.options.clean_session { flags |= 0x02 }
+        if self.options.username.is_some() { flags |= 0x80 }
+        if self.options.password.is_some() { flags |= 0x40 }
+        if let some(will) = &self.options.will {
+            flags |= 0x04
+            flags |= (will.qos.to_u8() & 0x03) << 3
+            if will.retain { flags |= 0x20 }
+        }
+        var_header.push(flags)
+        var_header.push((self.options.keep_alive >> 8) as u8)
+        var_header.push((self.options.keep_alive & 0xFF) as u8)
+
+        // Payload
+        var_header.extend_from_slice(&encode_utf8_string(&self.options.client_id))
+        if let some(will) = &self.options.will {
+            var_header.extend_from_slice(&encode_utf8_string(&will.topic))
+            let wlen = will.payload.len() as u16
+            var_header.push((wlen >> 8) as u8)
+            var_header.push((wlen & 0xFF) as u8)
+            var_header.extend_from_slice(&will.payload)
+        }
+        if let some(username) = &self.options.username {
+            var_header.extend_from_slice(&encode_utf8_string(username))
+        }
+        if let some(password) = &self.options.password {
+            let plen = password.len() as u16
+            var_header.push((plen >> 8) as u8)
+            var_header.push((plen & 0xFF) as u8)
+            var_header.extend_from_slice(password)
+        }
+
+        packet.extend_from_slice(&encode_remaining_length(var_header.len()))
+        packet.extend_from_slice(&var_header)
+
+        self.send_raw(&packet)?
+        self.connected = true
+        ok(())
+    }
+
+    fn publish(mut self, msg: &Message) -> Result<(), string> {
+        let mut header_byte = PacketType.Publish.to_u8() << 4
+        header_byte |= (msg.qos.to_u8() & 0x03) << 1
+        if msg.retain { header_byte |= 0x01 }
+
+        let mut var: [u8] = encode_utf8_string(&msg.topic)
+        if msg.qos.to_u8() > 0 {
+            let pid = self.next_packet_id; self.next_packet_id += 1
+            var.push((pid >> 8) as u8); var.push((pid & 0xFF) as u8)
+        }
+        var.extend_from_slice(&msg.payload)
+
+        let mut packet = [header_byte]
+        packet.extend_from_slice(&encode_remaining_length(var.len()))
+        packet.extend_from_slice(&var)
+        self.send_raw(&packet)
+    }
+
+    fn subscribe(mut self, topic: &str, qos: QoS) -> Result<u16, string> {
+        let pid = self.next_packet_id; self.next_packet_id += 1
+        let mut var: [u8] = [(pid >> 8) as u8, (pid & 0xFF) as u8]
+        var.extend_from_slice(&encode_utf8_string(topic))
+        var.push(qos.to_u8())
+
+        let mut packet = [(PacketType.Subscribe.to_u8() << 4) | 0x02]
+        packet.extend_from_slice(&encode_remaining_length(var.len()))
+        packet.extend_from_slice(&var)
+        self.send_raw(&packet)?
+        self.subscriptions.insert(topic.to_string(), qos)
+        ok(pid)
+    }
+
+    fn ping(mut self) -> Result<(), string> {
+        self.send_raw(&[PacketType.PingReq.to_u8() << 4, 0])
+    }
+
+    fn disconnect(mut self) -> Result<(), string> {
+        self.send_raw(&[PacketType.Disconnect.to_u8() << 4, 0])?
+        self.connected = false
+        ok(())
+    }
+
+    fn send_raw(mut self, data: &[u8]) -> Result<(), string> {
+        match &mut self.stream {
+            some(s) => s.write_all(data).map_err(|e| e.to_string()),
+            none => err("not connected".to_string()),
+        }
+    }
+}
+
+fn main() {
+    // Remaining length encoding
+    assert(encode_remaining_length(0) == [0])
+    assert(encode_remaining_length(127) == [127])
+    assert(encode_remaining_length(128) == [0x80, 0x01])
+    assert(encode_remaining_length(16383) == [0xFF, 0x7F])
+    print("Remaining length encode \u2713")
+
+    // Remaining length decoding
+    let (val, consumed) = decode_remaining_length(&[0x00])
+    assert(val == 0 && consumed == 1)
+    let (val2, consumed2) = decode_remaining_length(&[0x80, 0x01])
+    assert(val2 == 128 && consumed2 == 2)
+    print("Remaining length decode \u2713")
+
+    // UTF-8 string encoding
+    let encoded = encode_utf8_string("hello")
+    assert(encoded.len() == 7)  // 2 bytes length + 5 bytes data
+    assert(encoded[0] == 0 && encoded[1] == 5)
+    print("UTF-8 string encode \u2713")
+
+    // QoS
+    assert(QoS.AtMostOnce.to_u8() == 0)
+    assert(QoS.ExactlyOnce.to_u8() == 2)
+    print("QoS \u2713")
+
+    // Message
+    let msg = Message.new("sensor/temp", b"23.5").with_qos(QoS.AtLeastOnce).with_retain(true)
+    assert(msg.topic == "sensor/temp")
+    assert(msg.payload_str().unwrap() == "23.5")
+    assert(msg.retain)
+    print("Message \u2713")
+
+    // PacketType
+    assert(PacketType.Connect.to_u8() == 1)
+    assert(PacketType.from_u8(3) == some(PacketType.Publish))
+    assert(PacketType.from_u8(99).is_none())
+    print("PacketType \u2713")
+
+    // Client creation
+    let client = MqttClient.new(ConnectOptions {
+        client_id: "test-client".to_string(),
+        keep_alive: 60, clean_session: true,
+        username: none, password: none, will: none,
+    })
+    assert(!client.connected)
+    assert(client.subscriptions.is_empty())
+    print("Client creation \u2713")
+
+    print("MQTT Client complete \u2713")
+}
