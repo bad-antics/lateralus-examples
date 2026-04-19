@@ -1,0 +1,86 @@
+// l_system.ltl — L-System fractal generator (SVG output)
+use std.math.{sin, cos, PI}
+use std.fs.File
+
+struct LSystem {
+    axiom:       string,
+    rules:       dict<char, string>,
+    angle_deg:   float,
+}
+
+impl LSystem {
+    fn expand(self, n: int) -> string {
+        let mut s = self.axiom.clone()
+        for _ in range(0, n) {
+            s = s.chars() |> map(|c| self.rules.get(c) |> unwrap_or(c.to_string())) |> join("")
+        }
+        s
+    }
+}
+
+fn to_svg(instructions: string, angle_deg: float, step: float, start: (float,float), start_angle: float) -> string {
+    let angle_rad = angle_deg * PI / 180.0
+    let (mut x, mut y) = start
+    let mut heading    = start_angle
+    let mut stack: [(float, float, float)] = []
+    let mut paths      = vec![format!("M {:.2} {:.2}", x, y)]
+
+    for c in instructions.chars() {
+        match c {
+            'F' | 'G' => {
+                x += step * cos(heading)
+                y += step * sin(heading)
+                paths.push(format!("L {:.2} {:.2}", x, y))
+            },
+            '+' => heading += angle_rad,
+            '-' => heading -= angle_rad,
+            '[' => stack.push((x, y, heading)),
+            ']' => {
+                let (px, py, ph) = stack.pop().unwrap()
+                x = px; y = py; heading = ph
+                paths.push(format!("M {:.2} {:.2}", x, y))
+            },
+            _   => {},
+        }
+    }
+
+    let d = paths |> join(" ")
+    "<svg xmlns='http://www.w3.org/2000/svg' width='800' height='800' style='background:#0a0a0a'>
+  <path d='${d}' stroke='#44ff88' stroke-width='0.8' fill='none'/>
+</svg>"
+}
+
+fn main() {
+    // Koch snowflake
+    let koch = LSystem {
+        axiom: "F--F--F",
+        rules: {'F': "F+F--F+F"},
+        angle_deg: 60.0,
+    }
+    let instructions = koch.expand(4)
+    let svg = to_svg(instructions, 60.0, 4.0, (100.0, 400.0), 0.0)
+    File.create("/tmp/koch.svg").write_all(svg.as_bytes())
+    print("Koch snowflake (${instructions.len()} instructions) → /tmp/koch.svg ✓")
+
+    // Dragon curve
+    let dragon = LSystem {
+        axiom: "FX",
+        rules: {'X': "X+YF+", 'Y': "-FX-Y"},
+        angle_deg: 90.0,
+    }
+    let d_instr = dragon.expand(12)
+    let d_svg   = to_svg(d_instr, 90.0, 6.0, (350.0, 450.0), 0.0)
+    File.create("/tmp/dragon.svg").write_all(d_svg.as_bytes())
+    print("Dragon curve (${d_instr.len()} instructions) → /tmp/dragon.svg ✓")
+
+    // Barnsley fern
+    let fern = LSystem {
+        axiom: "X",
+        rules: {'X': "F+[[X]-X]-F[-FX]+X", 'F': "FF"},
+        angle_deg: 25.0,
+    }
+    let f_instr = fern.expand(6)
+    let f_svg   = to_svg(f_instr, 25.0, 3.0, (400.0, 780.0), -PI/2.0)
+    File.create("/tmp/fern.svg").write_all(f_svg.as_bytes())
+    print("Barnsley fern (${f_instr.len()} instructions) → /tmp/fern.svg ✓")
+}
