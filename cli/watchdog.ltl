@@ -1,0 +1,46 @@
+// watchdog.ltl — Watch a directory and run a command on changes
+// Run: lateralus run cli/watchdog.ltl <dir> <cmd...>
+
+use std.fs.Watcher
+use std.process.Command
+use std.time.Instant
+
+fn main() {
+    let args = env.args()
+    if args.len() < 3 {
+        eprintln("Usage: watchdog <dir> <cmd> [args...]")
+        process.exit(1)
+    }
+
+    let dir     = args[1]
+    let cmd     = args[2]
+    let cmd_args = args[3..]
+    mut last_run = Instant.now()
+
+    print("👁  Watching ${dir} — running \`${cmd} ${cmd_args.join(" ")}\` on changes")
+    print("Press Ctrl+C to stop
+")
+
+    let watcher = Watcher.new(dir, recursive: true)
+
+    watcher.on_change(|event| {
+        // Debounce — ignore events within 300 ms of the last run
+        if last_run.elapsed_ms() < 300 { return }
+        last_run = Instant.now()
+
+        let rel_path = event.path.strip_prefix(dir).unwrap_or(event.path)
+        print("\e[33m[${event.kind}]\e[0m ${rel_path}")
+
+        let result = Command.run(cmd, cmd_args)
+        match result.status {
+            0 => print("\e[32m✓ Done (${result.elapsed_ms}ms)\e[0m"),
+            n => print("\e[31m✗ Exit ${n}\e[0m
+${result.stderr}"),
+        }
+        print("")
+    })
+
+    watcher.run()
+}
+
+main()
