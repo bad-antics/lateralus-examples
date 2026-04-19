@@ -1,0 +1,325 @@
+// Niche Example — Data Compression
+// LZ77, Huffman coding, DEFLATE-like compression/decompression.
+
+use std.collections.{HashMap, BinaryHeap}
+
+// ── Bit Writer / Reader ──────────────────────────────────────────────────────
+struct BitWriter {
+    bytes: [u8],
+    current_byte: u8,
+    bit_pos: u8,
+}
+
+impl BitWriter {
+    fn new() -> BitWriter { BitWriter { bytes: [], current_byte: 0, bit_pos: 0 } }
+
+    fn write_bit(mut self, bit: bool) {
+        if bit { self.current_byte |= 1 << self.bit_pos }
+        self.bit_pos += 1
+        if self.bit_pos == 8 {
+            self.bytes.push(self.current_byte)
+            self.current_byte = 0
+            self.bit_pos = 0
+        }
+    }
+
+    fn write_bits(mut self, value: u32, count: u8) {
+        for i in 0..count { self.write_bit((value >> i) & 1 != 0) }
+    }
+
+    fn flush(mut self) -> [u8] {
+        if self.bit_pos > 0 { self.bytes.push(self.current_byte) }
+        self.bytes.clone()
+    }
+
+    fn bit_count(self) -> usize { self.bytes.len() * 8 + self.bit_pos as usize }
+}
+
+struct BitReader {
+    bytes: [u8],
+    byte_pos: usize,
+    bit_pos: u8,
+}
+
+impl BitReader {
+    fn new(bytes: [u8]) -> BitReader { BitReader { bytes, byte_pos: 0, bit_pos: 0 } }
+
+    fn read_bit(mut self) -> Option<bool> {
+        if self.byte_pos >= self.bytes.len() { return none }
+        let bit = (self.bytes[self.byte_pos] >> self.bit_pos) & 1 != 0
+        self.bit_pos += 1
+        if self.bit_pos == 8 { self.byte_pos += 1; self.bit_pos = 0 }
+        some(bit)
+    }
+
+    fn read_bits(mut self, count: u8) -> Option<u32> {
+        let mut value: u32 = 0
+        for i in 0..count {
+            if self.read_bit()? { value |= 1 << i }
+        }
+        some(value)
+    }
+
+    fn has_more(self) -> bool { self.byte_pos < self.bytes.len() }
+}
+
+// ── LZ77 Compression ────────────────────────────────────────────────────────
+const LZ77_WINDOW_SIZE: usize = 32768
+const LZ77_MIN_MATCH: usize = 3
+const LZ77_MAX_MATCH: usize = 258
+
+enum LZ77Token {
+    Literal(u8),
+    Match { distance: u16, length: u16 },
+}
+
+fn lz77_compress(data: &[u8]) -> [LZ77Token] {
+    let mut tokens: [LZ77Token] = []
+    let mut pos = 0
+
+    while pos < data.len() {
+        let window_start = if pos > LZ77_WINDOW_SIZE { pos - LZ77_WINDOW_SIZE } else { 0 }
+        let mut best_distance: u16 = 0
+        let mut best_length: u16 = 0
+
+        // Search for longest match in window
+        for start in window_start..pos {
+            let mut length: usize = 0
+            while pos + length < data.len()
+                && length < LZ77_MAX_MATCH
+                && data[start + length] == data[pos + length]
+            {
+                length += 1
+            }
+            if length >= LZ77_MIN_MATCH && length as u16 > best_length {
+                best_distance = (pos - start) as u16
+                best_length = length as u16
+            }
+        }
+
+        if best_length >= LZ77_MIN_MATCH as u16 {
+            tokens.push(LZ77Token.Match { distance: best_distance, length: best_length })
+            pos += best_length as usize
+        } else {
+            tokens.push(LZ77Token.Literal(data[pos]))
+            pos += 1
+        }
+    }
+    tokens
+}
+
+fn lz77_decompress(tokens: &[LZ77Token]) -> [u8] {
+    let mut output: [u8] = []
+    for token in tokens {
+        match token {
+            LZ77Token.Literal(byte) => output.push(*byte),
+            LZ77Token.Match { distance, length } => {
+                let start = output.len() - *distance as usize
+                for i in 0..*length as usize {
+                    output.push(output[start + i])
+                }
+            }
+        }
+    }
+    output
+}
+
+// ── Huffman Coding ───────────────────────────────────────────────────────────
+struct HuffmanNode {
+    frequency: u64,
+    symbol: Option<u8>,
+    left: Option<Box<HuffmanNode>>,
+    right: Option<Box<HuffmanNode>>,
+}
+
+impl HuffmanNode {
+    fn leaf(symbol: u8, frequency: u64) -> HuffmanNode {
+        HuffmanNode { frequency, symbol: some(symbol), left: none, right: none }
+    }
+
+    fn branch(left: HuffmanNode, right: HuffmanNode) -> HuffmanNode {
+        let freq = left.frequency + right.frequency
+        HuffmanNode { frequency: freq, symbol: none, left: some(Box.new(left)), right: some(Box.new(right)) }
+    }
+
+    fn is_leaf(self) -> bool { self.symbol.is_some() }
+}
+
+impl PartialOrd for HuffmanNode {
+    fn partial_cmp(self, other: &HuffmanNode) -> Option<std.cmp.Ordering> {
+        some(other.frequency.cmp(&self.frequency))  // Min-heap: lower frequency = higher priority
+    }
+}
+
+struct HuffmanTable {
+    codes: HashMap<u8, (u32, u8)>,  // symbol -> (code, length)
+}
+
+impl HuffmanTable {
+    fn build(data: &[u8]) -> HuffmanTable {
+        // Count frequencies
+        let mut freq = [0u64; 256]
+        for &byte in data { freq[byte as usize] += 1 }
+
+        // Build priority queue
+        let mut heap: BinaryHeap<HuffmanNode> = BinaryHeap.new()
+        for i in 0..256 {
+            if freq[i] > 0 { heap.push(HuffmanNode.leaf(i as u8, freq[i])) }
+        }
+
+        // Edge case: single symbol or empty
+        if heap.len() == 0 { return HuffmanTable { codes: HashMap.new() } }
+        if heap.len() == 1 {
+            let node = heap.pop().unwrap()
+            let mut codes = HashMap.new()
+            codes.insert(node.symbol.unwrap(), (0u32, 1u8))
+            return HuffmanTable { codes }
+        }
+
+        // Build tree
+        while heap.len() > 1 {
+            let left = heap.pop().unwrap()
+            let right = heap.pop().unwrap()
+            heap.push(HuffmanNode.branch(left, right))
+        }
+
+        // Generate codes
+        let root = heap.pop().unwrap()
+        let mut codes: HashMap<u8, (u32, u8)> = HashMap.new()
+        Self.generate_codes(&root, 0, 0, &mut codes)
+
+        HuffmanTable { codes }
+    }
+
+    fn generate_codes(node: &HuffmanNode, code: u32, depth: u8, codes: &mut HashMap<u8, (u32, u8)>) {
+        if let some(symbol) = node.symbol {
+            codes.insert(symbol, (code, depth.max(1)))
+            return
+        }
+        if let some(left) = &node.left { Self.generate_codes(left, code, depth + 1, codes) }
+        if let some(right) = &node.right { Self.generate_codes(right, code | (1 << depth), depth + 1, codes) }
+    }
+
+    fn encode(self, data: &[u8]) -> BitWriter {
+        let mut writer = BitWriter.new()
+        for &byte in data {
+            if let some((code, len)) = self.codes.get(&byte) {
+                writer.write_bits(*code, *len)
+            }
+        }
+        writer
+    }
+}
+
+// ── Run-Length Encoding ──────────────────────────────────────────────────────
+fn rle_encode(data: &[u8]) -> [u8] {
+    let mut result: [u8] = []
+    let mut i = 0
+    while i < data.len() {
+        let byte = data[i]
+        let mut count: u8 = 1
+        while i + count as usize < data.len() && data[i + count as usize] == byte && count < 255 {
+            count += 1
+        }
+        result.push(count)
+        result.push(byte)
+        i += count as usize
+    }
+    result
+}
+
+fn rle_decode(data: &[u8]) -> [u8] {
+    let mut result: [u8] = []
+    let mut i = 0
+    while i + 1 < data.len() {
+        let count = data[i] as usize
+        let byte = data[i + 1]
+        for _ in 0..count { result.push(byte) }
+        i += 2
+    }
+    result
+}
+
+// ── Compression Stats ────────────────────────────────────────────────────────
+struct CompressionStats {
+    original_size: usize,
+    compressed_size: usize,
+}
+
+impl CompressionStats {
+    fn ratio(self) -> f64 {
+        if self.original_size == 0 { return 0.0 }
+        self.compressed_size as f64 / self.original_size as f64
+    }
+
+    fn savings_percent(self) -> f64 { (1.0 - self.ratio()) * 100.0 }
+}
+
+fn main() {
+    // LZ77
+    let data = b"ABCABCABCABC"
+    let tokens = lz77_compress(data)
+    let decompressed = lz77_decompress(&tokens)
+    assert(decompressed == data.to_vec())
+    let literal_count = tokens.iter().filter(|t| match t { LZ77Token.Literal(_) => true, _ => false }).count()
+    assert(literal_count < data.len())  // Some should be matches
+    print("LZ77 roundtrip ✓ (tokens: ${tokens.len()}, literals: ${literal_count})")
+
+    // LZ77 with longer repetition
+    let repeated = b"AAAAAAAAAAAAAAAA"
+    let tokens2 = lz77_compress(repeated)
+    let dec2 = lz77_decompress(&tokens2)
+    assert(dec2 == repeated.to_vec())
+    print("LZ77 repeated data ✓")
+
+    // Huffman
+    let text = b"aaaaaabbbbccdd"
+    let table = HuffmanTable.build(text)
+    assert(table.codes.len() == 4)  // a, b, c, d
+    // 'a' should have shortest code (most frequent)
+    let (_, a_len) = table.codes.get(&b'a').unwrap()
+    let (_, d_len) = table.codes.get(&b'd').unwrap()
+    assert(*a_len <= *d_len)
+    print("Huffman table ✓ (${table.codes.len()} symbols)")
+
+    let mut writer = table.encode(text)
+    let bits = writer.bit_count()
+    assert(bits < text.len() * 8)
+    print("Huffman encoded: ${bits} bits vs ${} original bits ✓", text.len() * 8)
+
+    // Bit writer/reader roundtrip
+    let mut bw = BitWriter.new()
+    bw.write_bits(42, 8)
+    bw.write_bits(7, 4)
+    let bytes = bw.flush()
+    let mut br = BitReader.new(bytes)
+    assert(br.read_bits(8).unwrap() == 42)
+    assert(br.read_bits(4).unwrap() == 7)
+    print("Bit writer/reader ✓")
+
+    // RLE
+    let rle_data = [1, 1, 1, 1, 2, 2, 3, 3, 3]
+    let encoded = rle_encode(&rle_data)
+    let decoded = rle_decode(&encoded)
+    assert(decoded == rle_data.to_vec())
+    assert(encoded.len() < rle_data.len() * 2)
+    print("RLE roundtrip ✓ (${rle_data.len()} -> ${encoded.len()} bytes)")
+
+    // Compression stats
+    let stats = CompressionStats { original_size: 1000, compressed_size: 400 }
+    assert(stats.ratio() == 0.4)
+    assert(stats.savings_percent() == 60.0)
+    print("Compression stats: ${stats.savings_percent():.1}% savings ✓")
+
+    // Edge cases
+    let empty_tokens = lz77_compress(b"")
+    assert(empty_tokens.is_empty())
+    assert(lz77_decompress(&empty_tokens).is_empty())
+    print("Empty data ✓")
+
+    let single = lz77_compress(b"X")
+    assert(lz77_decompress(&single) == [b'X'])
+    print("Single byte ✓")
+
+    print("Data Compression complete ✓")
+}
