@@ -1,0 +1,134 @@
+// http2_frames.ltl — HTTP/2 frame parsing and serialisation
+// RFC 7540
+
+const FRAME_HEADER_SIZE: int = 9
+
+enum FrameType {
+    Data        = 0x0,
+    Headers     = 0x1,
+    Priority    = 0x2,
+    RstStream   = 0x3,
+    Settings    = 0x4,
+    PushPromise = 0x5,
+    Ping        = 0x6,
+    GoAway      = 0x7,
+    WindowUpdate= 0x8,
+    Continuation= 0x9,
+}
+
+impl FrameType {
+    fn from_u8(v: u8) -> FrameType? {
+        match v {
+            0x0 => some(FrameType.Data),
+            0x1 => some(FrameType.Headers),
+            0x3 => some(FrameType.RstStream),
+            0x4 => some(FrameType.Settings),
+            0x6 => some(FrameType.Ping),
+            0x7 => some(FrameType.GoAway),
+            0x8 => some(FrameType.WindowUpdate),
+            _   => none,
+        }
+    }
+}
+
+struct FrameHeader {
+    length:    int,
+    frame_type: FrameType,
+    flags:     u8,
+    stream_id: int,
+}
+
+fn parse_frame_header(buf: [u8]) -> Result<FrameHeader, string> {
+    if buf.len() < FRAME_HEADER_SIZE { return err("buffer too short") }
+    let length     = ((buf[0] as int) << 16) | ((buf[1] as int) << 8) | buf[2] as int
+    let frame_type = FrameType.from_u8(buf[3]).ok_or("unknown frame type: ${buf[3]}")?
+    let flags      = buf[4]
+    let stream_id  = (((buf[5] & 0x7F) as int) << 24) | ((buf[6] as int) << 16)
+                   | ((buf[7] as int) << 8) | buf[8] as int
+    ok(FrameHeader { length, frame_type, flags, stream_id })
+}
+
+fn encode_frame_header(hdr: FrameHeader) -> [u8] {
+    let n = hdr.length
+    [
+        ((n >> 16) & 0xFF) as u8,
+        ((n >>  8) & 0xFF) as u8,
+        (n & 0xFF) as u8,
+        hdr.frame_type as u8,
+        hdr.flags,
+        ((hdr.stream_id >> 24) & 0x7F) as u8,
+        ((hdr.stream_id >> 16) & 0xFF) as u8,
+        ((hdr.stream_id >>  8) & 0xFF) as u8,
+        (hdr.stream_id & 0xFF) as u8,
+    ]
+}
+
+// SETTINGS frame
+struct Setting { id: u16, value: u32 }
+
+const SETTINGS_HEADER_TABLE_SIZE:      u16 = 0x1
+const SETTINGS_ENABLE_PUSH:            u16 = 0x2
+const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3
+const SETTINGS_INITIAL_WINDOW_SIZE:    u16 = 0x4
+const SETTINGS_MAX_FRAME_SIZE:         u16 = 0x5
+const SETTINGS_MAX_HEADER_LIST_SIZE:   u16 = 0x6
+
+fn parse_settings_frame(payload: [u8]) -> Result<[Setting], string> {
+    if payload.len() % 6 != 0 { return err("SETTINGS payload length must be multiple of 6") }
+    ok(range(0, payload.len() / 6) |> map(|i| {
+        let off = i * 6
+        let id  = ((payload[off] as u16) << 8) | payload[off+1] as u16
+        let val = ((payload[off+2] as u32) << 24) | ((payload[off+3] as u32) << 16)
+                | ((payload[off+4] as u32) << 8)  | payload[off+5] as u32
+        Setting { id, value: val }
+    }) |> collect())
+}
+
+fn encode_settings_frame(settings: [Setting], ack: bool) -> [u8] {
+    let payload: [u8] = settings |> flat_map(|s| [
+        ((s.id >> 8) & 0xFF) as u8, (s.id & 0xFF) as u8,
+        ((s.value >> 24) & 0xFF) as u8, ((s.value >> 16) & 0xFF) as u8,
+        ((s.value >> 8) & 0xFF) as u8,  (s.value & 0xFF) as u8,
+    ]) |> collect()
+    let hdr = FrameHeader {
+        length:     payload.len(),
+        frame_type: FrameType.Settings,
+        flags:      if ack { 0x1 } else { 0x0 },
+        stream_id:  0,
+    }
+    [...encode_frame_header(hdr), ...payload]
+}
+
+fn main() {
+    // Encode then parse a SETTINGS frame
+    let settings = [
+        Setting { id: SETTINGS_MAX_CONCURRENT_STREAMS, value: 100 },
+        Setting { id: SETTINGS_INITIAL_WINDOW_SIZE,    value: 65535 },
+        Setting { id: SETTINGS_MAX_FRAME_SIZE,         value: 16384 },
+    ]
+    let encoded = encode_settings_frame(settings, false)
+    let hdr     = parse_frame_header(encoded).unwrap()
+    let payload = encoded[FRAME_HEADER_SIZE..]
+    let parsed  = parse_settings_frame(payload).unwrap()
+
+    assert(matches!(hdr.frame_type, FrameType.Settings))
+    assert(parsed.len() == 3)
+    assert(parsed[0].value == 100)
+    assert(parsed[1].value == 65535)
+    print("HTTP/2 SETTINGS frame encode/parse ✓")
+
+    // ACK frame
+    let ack = encode_settings_frame([], true)
+    let ack_hdr = parse_frame_header(ack).unwrap()
+    assert(ack_hdr.flags == 0x1)
+    assert(ack_hdr.length == 0)
+    print("HTTP/2 SETTINGS ACK ✓")
+
+    // WINDOW_UPDATE
+    let wu_payload = [0x00u8, 0x00, 0x40, 0x00]  // increment = 16384
+    let wu_hdr = FrameHeader { length: 4, frame_type: FrameType.WindowUpdate, flags: 0, stream_id: 1 }
+    let wu = [...encode_frame_header(wu_hdr), ...wu_payload]
+    let ph = parse_frame_header(wu).unwrap()
+    assert(ph.stream_id == 1)
+    print("HTTP/2 WINDOW_UPDATE ✓")
+}
