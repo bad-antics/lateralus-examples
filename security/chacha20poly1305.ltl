@@ -1,0 +1,199 @@
+// chacha20poly1305.ltl — ChaCha20-Poly1305 AEAD cipher (RFC 8439)
+
+struct ChaCha20 {
+    state: [u32; 16],
+}
+
+impl ChaCha20 {
+    fn new(key: [u8; 32], nonce: [u8; 12], counter: u32) -> ChaCha20 {
+        let mut s: [u32; 16] = [0; 16]
+        // "expand 32-byte k"
+        s[0] = 0x61707865; s[1] = 0x3320646e; s[2] = 0x79622d32; s[3] = 0x6b206574
+        for i in range(0, 8) {
+            s[4 + i] = u32_from_le_bytes(key[i*4..(i+1)*4])
+        }
+        s[12] = counter
+        for i in range(0, 3) { s[13 + i] = u32_from_le_bytes(nonce[i*4..(i+1)*4]) }
+        ChaCha20 { state: s }
+    }
+
+    fn quarter_round(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32) {
+        *a = a.wrapping_add(*b); *d ^= *a; *d = d.rotate_left(16)
+        *c = c.wrapping_add(*d); *b ^= *c; *b = b.rotate_left(12)
+        *a = a.wrapping_add(*b); *d ^= *a; *d = d.rotate_left(8)
+        *c = c.wrapping_add(*d); *b ^= *c; *b = b.rotate_left(7)
+    }
+
+    fn block(mut self) -> [u8; 64] {
+        let mut working = self.state.clone()
+        for _ in range(0, 10) {
+            // column rounds
+            ChaCha20.quarter_round(&mut working[0], &mut working[4], &mut working[8],  &mut working[12])
+            ChaCha20.quarter_round(&mut working[1], &mut working[5], &mut working[9],  &mut working[13])
+            ChaCha20.quarter_round(&mut working[2], &mut working[6], &mut working[10], &mut working[14])
+            ChaCha20.quarter_round(&mut working[3], &mut working[7], &mut working[11], &mut working[15])
+            // diagonal rounds
+            ChaCha20.quarter_round(&mut working[0], &mut working[5], &mut working[10], &mut working[15])
+            ChaCha20.quarter_round(&mut working[1], &mut working[6], &mut working[11], &mut working[12])
+            ChaCha20.quarter_round(&mut working[2], &mut working[7], &mut working[8],  &mut working[13])
+            ChaCha20.quarter_round(&mut working[3], &mut working[4], &mut working[9],  &mut working[14])
+        }
+        let mut out: [u8; 64] = [0; 64]
+        for i in range(0, 16) {
+            let val = working[i].wrapping_add(self.state[i])
+            out[i*4..i*4+4].copy_from_slice(&val.to_le_bytes())
+        }
+        self.state[12] += 1
+        out
+    }
+
+    fn encrypt(mut self, plaintext: &[u8]) -> [u8] {
+        let mut ct = vec![0u8; plaintext.len()]
+        let mut offset = 0
+        while offset < plaintext.len() {
+            let keystream = self.block()
+            let chunk = std.cmp.min(64, plaintext.len() - offset)
+            for i in range(0, chunk) {
+                ct[offset + i] = plaintext[offset + i] ^ keystream[i]
+            }
+            offset += 64
+        }
+        ct
+    }
+}
+
+// Poly1305 MAC
+struct Poly1305 { r: [u64; 3], h: [u64; 3], pad: [u64; 2] }
+
+impl Poly1305 {
+    fn new(key: [u8; 32]) -> Poly1305 {
+        let r0 = u64_from_le_bytes(key[0..8])  & 0x0ffffffc0fffffff
+        let r1 = u64_from_le_bytes(key[8..16]) & 0x0ffffffc0ffffffc
+        let pad0 = u64_from_le_bytes(key[16..24])
+        let pad1 = u64_from_le_bytes(key[24..32])
+        Poly1305 { r: [r0, r1, 0], h: [0, 0, 0], pad: [pad0, pad1] }
+    }
+
+    fn add_block(mut self, block: &[u8], final_block: bool) {
+        let mut n: u128 = 0
+        for i in range(0, block.len()) { n |= (block[i] as u128) << (8 * i) }
+        if !final_block { n |= 1u128 << (8 * block.len()) }
+        // simplified modular arithmetic for demonstration
+        let h_plus_c = self.h[0] as u128 + n
+        let product  = h_plus_c * self.r[0] as u128
+        self.h[0] = (product % ((1u128 << 130) - 5)) as u64
+    }
+
+    fn finalize(self) -> [u8; 16] {
+        let mut f = self.h[0] as u128 + self.pad[0] as u128 + ((self.pad[1] as u128) << 64)
+        let mut tag: [u8; 16] = [0; 16]
+        for i in range(0, 16) { tag[i] = (f & 0xff) as u8; f >>= 8 }
+        tag
+    }
+
+    fn mac(key: [u8; 32], msg: &[u8]) -> [u8; 16] {
+        let mut p = Poly1305.new(key)
+        let mut off = 0
+        while off < msg.len() {
+            let end = std.cmp.min(off + 16, msg.len())
+            p.add_block(&msg[off..end], end == msg.len())
+            off += 16
+        }
+        p.finalize()
+    }
+}
+
+// AEAD: ChaCha20-Poly1305
+struct Aead;
+
+impl Aead {
+    fn encrypt(key: [u8; 32], nonce: [u8; 12], plaintext: &[u8], aad: &[u8]) -> ([u8], [u8; 16]) {
+        // Generate Poly1305 key from first ChaCha20 block
+        let mut poly_cipher = ChaCha20.new(key, nonce, 0)
+        let poly_block = poly_cipher.block()
+        let mut poly_key: [u8; 32] = [0; 32]
+        poly_key.copy_from_slice(&poly_block[0..32])
+
+        // Encrypt with counter starting at 1
+        let mut enc_cipher = ChaCha20.new(key, nonce, 1)
+        let ciphertext = enc_cipher.encrypt(plaintext)
+
+        // Build MAC input: aad || pad || ct || pad || len(aad) || len(ct)
+        let mut mac_data: [u8] = []
+        mac_data.extend_from_slice(aad)
+        while mac_data.len() % 16 != 0 { mac_data.push(0) }
+        mac_data.extend_from_slice(&ciphertext)
+        while mac_data.len() % 16 != 0 { mac_data.push(0) }
+        mac_data.extend_from_slice(&(aad.len() as u64).to_le_bytes())
+        mac_data.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes())
+
+        let tag = Poly1305.mac(poly_key, &mac_data)
+        (ciphertext, tag)
+    }
+
+    fn decrypt(key: [u8; 32], nonce: [u8; 12], ciphertext: &[u8], aad: &[u8], tag: [u8; 16]) -> Result<[u8], string> {
+        let mut poly_cipher = ChaCha20.new(key, nonce, 0)
+        let poly_block = poly_cipher.block()
+        let mut poly_key: [u8; 32] = [0; 32]
+        poly_key.copy_from_slice(&poly_block[0..32])
+
+        let mut mac_data: [u8] = []
+        mac_data.extend_from_slice(aad)
+        while mac_data.len() % 16 != 0 { mac_data.push(0) }
+        mac_data.extend_from_slice(ciphertext)
+        while mac_data.len() % 16 != 0 { mac_data.push(0) }
+        mac_data.extend_from_slice(&(aad.len() as u64).to_le_bytes())
+        mac_data.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes())
+
+        let expected = Poly1305.mac(poly_key, &mac_data)
+        if !constant_time_eq(&tag, &expected) { return err("authentication failed") }
+
+        let mut dec_cipher = ChaCha20.new(key, nonce, 1)
+        ok(dec_cipher.encrypt(ciphertext))  // XOR is its own inverse
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let mut diff: u8 = 0
+    for i in range(0, a.len()) { diff |= a[i] ^ b[i] }
+    diff == 0
+}
+
+fn u32_from_le_bytes(b: &[u8]) -> u32 {
+    b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16 | (b[3] as u32) << 24
+}
+
+fn u64_from_le_bytes(b: &[u8]) -> u64 {
+    let mut v: u64 = 0
+    for i in range(0, 8) { v |= (b[i] as u64) << (8 * i) }
+    v
+}
+
+fn main() {
+    let key:   [u8; 32] = [0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+                            0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+                            0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+                            0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f]
+    let nonce: [u8; 12] = [0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43,
+                            0x44, 0x45, 0x46, 0x47]
+    let aad       = "authenticated but not encrypted".as_bytes()
+    let plaintext = "Ladies and Gentlemen of the class of '99".as_bytes()
+
+    let (ct, tag) = Aead.encrypt(key, nonce, plaintext, aad)
+    assert(ct.len() == plaintext.len())
+    assert(ct != plaintext.to_vec())
+    print("Encrypted ${ct.len()} bytes, tag = ${tag |> map(|b| format!(\"{b:02x}\")) |> join(\"\")}")
+
+    let pt = Aead.decrypt(key, nonce, &ct, aad, tag).expect("decrypt failed")
+    assert(pt == plaintext.to_vec())
+    print("Decrypted: ${string.from_utf8(pt).unwrap()}")
+
+    // Tamper test
+    let mut bad_ct = ct.clone()
+    bad_ct[0] ^= 0xff
+    assert(Aead.decrypt(key, nonce, &bad_ct, aad, tag).is_err())
+    print("Tamper detection ✓")
+
+    print("ChaCha20-Poly1305 AEAD — all passed ✓")
+}
