@@ -1,0 +1,240 @@
+// Niche Example - CSV Parser
+// RFC 4180 compliant: quoted fields, escaped quotes, headers, typed columns.
+
+use std.collections.HashMap
+
+struct CsvReader {
+    delimiter: char,
+    quote_char: char,
+    has_headers: bool,
+    trim_fields: bool,
+}
+
+impl CsvReader {
+    fn new() -> CsvReader {
+        CsvReader { delimiter: ',', quote_char: '"', has_headers: true, trim_fields: false }
+    }
+
+    fn with_delimiter(mut self, delim: char) -> CsvReader { self.delimiter = delim; self }
+    fn without_headers(mut self) -> CsvReader { self.has_headers = false; self }
+    fn with_trim(mut self) -> CsvReader { self.trim_fields = true; self }
+
+    fn parse(self, input: &str) -> Result<CsvTable, string> {
+        let mut rows: [[string]] = []
+        let mut current_row: [string] = []
+        let mut current_field = string.new()
+        let mut in_quotes = false
+        let chars: [char] = input.chars().collect()
+        let mut i = 0
+
+        while i < chars.len() {
+            let ch = chars[i]
+
+            if in_quotes {
+                if ch == self.quote_char {
+                    if i + 1 < chars.len() && chars[i + 1] == self.quote_char {
+                        current_field.push(self.quote_char)
+                        i += 2
+                        continue
+                    } else {
+                        in_quotes = false
+                        i += 1
+                        continue
+                    }
+                } else {
+                    current_field.push(ch)
+                    i += 1
+                    continue
+                }
+            }
+
+            if ch == self.quote_char {
+                in_quotes = true
+                i += 1
+            } else if ch == self.delimiter {
+                let field = if self.trim_fields { current_field.trim().to_string() } else { current_field.clone() }
+                current_row.push(field)
+                current_field = string.new()
+                i += 1
+            } else if ch == '\n' || (ch == '\r' && i + 1 < chars.len() && chars[i + 1] == '\n') {
+                let field = if self.trim_fields { current_field.trim().to_string() } else { current_field.clone() }
+                current_row.push(field)
+                current_field = string.new()
+                if !current_row.iter().all(|f| f.is_empty()) || current_row.len() > 1 {
+                    rows.push(current_row)
+                }
+                current_row = []
+                if ch == '\r' { i += 2 } else { i += 1 }
+            } else {
+                current_field.push(ch)
+                i += 1
+            }
+        }
+
+        if !current_field.is_empty() || !current_row.is_empty() {
+            let field = if self.trim_fields { current_field.trim().to_string() } else { current_field }
+            current_row.push(field)
+            rows.push(current_row)
+        }
+
+        if rows.is_empty() { return ok(CsvTable { headers: [], rows: [] }) }
+
+        if self.has_headers {
+            let headers = rows.remove(0)
+            ok(CsvTable { headers, rows })
+        } else {
+            ok(CsvTable { headers: [], rows })
+        }
+    }
+}
+
+struct CsvTable {
+    headers: [string],
+    rows: [[string]],
+}
+
+impl CsvTable {
+    fn row_count(self) -> usize { self.rows.len() }
+    fn col_count(self) -> usize {
+        if !self.headers.is_empty() { self.headers.len() }
+        else if !self.rows.is_empty() { self.rows[0].len() }
+        else { 0 }
+    }
+
+    fn get(self, row: usize, col: usize) -> Option<&str> {
+        self.rows.get(row).and_then(|r| r.get(col)).map(|s| s.as_str())
+    }
+
+    fn get_by_name(self, row: usize, col_name: &str) -> Option<&str> {
+        let col_idx = self.headers.iter().position(|h| h == col_name)?
+        self.get(row, col_idx)
+    }
+
+    fn column(self, col: usize) -> [&str] {
+        self.rows.iter().filter_map(|r| r.get(col).map(|s| s.as_str())).collect()
+    }
+
+    fn column_by_name(self, name: &str) -> [&str] {
+        if let some(idx) = self.headers.iter().position(|h| h == name) {
+            self.column(idx)
+        } else { [] }
+    }
+
+    fn filter(self, col: usize, predicate: fn(&str) -> bool) -> CsvTable {
+        let filtered: [[string]] = self.rows.iter()
+            .filter(|row| row.get(col).map(|f| predicate(f.as_str())).unwrap_or(false))
+            .cloned().collect()
+        CsvTable { headers: self.headers.clone(), rows: filtered }
+    }
+
+    fn sort_by(mut self, col: usize, ascending: bool) {
+        self.rows.sort_by(|a, b| {
+            let va = a.get(col).map(|s| s.as_str()).unwrap_or("")
+            let vb = b.get(col).map(|s| s.as_str()).unwrap_or("")
+            if ascending { va.cmp(vb) } else { vb.cmp(va) }
+        })
+    }
+
+    fn to_maps(self) -> [HashMap<string, string>] {
+        self.rows.iter().map(|row| {
+            let mut map = HashMap.new()
+            for i in 0..self.headers.len().min(row.len()) {
+                map.insert(self.headers[i].clone(), row[i].clone())
+            }
+            map
+        }).collect()
+    }
+}
+
+struct CsvWriter {
+    delimiter: char,
+    quote_char: char,
+}
+
+impl CsvWriter {
+    fn new() -> CsvWriter { CsvWriter { delimiter: ',', quote_char: '"' } }
+
+    fn write(self, table: &CsvTable) -> string {
+        let mut out = string.new()
+        if !table.headers.is_empty() {
+            out.push_str(&self.format_row(&table.headers))
+            out.push('\n')
+        }
+        for row in &table.rows {
+            out.push_str(&self.format_row(row))
+            out.push('\n')
+        }
+        out
+    }
+
+    fn format_row(self, fields: &[string]) -> string {
+        fields.iter().map(|f| self.quote_field(f)).collect::<[string]>().join(&self.delimiter.to_string())
+    }
+
+    fn quote_field(self, field: &str) -> string {
+        let needs_quoting = field.contains(self.delimiter)
+            || field.contains(self.quote_char)
+            || field.contains('\n')
+        if needs_quoting {
+            let escaped = field.replace(
+                &self.quote_char.to_string(),
+                &format!("{}{}", self.quote_char, self.quote_char),
+            )
+            format!("{}{}{}", self.quote_char, escaped, self.quote_char)
+        } else { field.to_string() }
+    }
+}
+
+fn column_sum(table: &CsvTable, col: usize) -> Result<f64, string> {
+    let values: [f64] = table.column(col).iter().map(|s| {
+        s.parse::<f64>().map_err(|_| format!("cannot parse '{}' as float", s))
+    }).collect::<Result<[f64], string>>()?
+    ok(values.iter().sum())
+}
+
+fn main() {
+    let csv = "name,age,city\nAlice,30,NYC\nBob,25,LA\nCharlie,35,Chicago"
+    let reader = CsvReader.new()
+    let table = reader.parse(csv).unwrap()
+
+    assert(table.row_count() == 3)
+    assert(table.col_count() == 3)
+    assert(table.get(0, 0).unwrap() == "Alice")
+    assert(table.get_by_name(2, "city").unwrap() == "Chicago")
+    print("CSV parsing \u2713")
+
+    let ages = table.column_by_name("age")
+    assert(ages == ["30", "25", "35"])
+    print("Column access \u2713")
+
+    let filtered = table.filter(1, |age| age.parse::<i64>().unwrap_or(0) >= 30)
+    assert(filtered.row_count() == 2)
+    print("Filter \u2713")
+
+    let sum = column_sum(&table, 1).unwrap()
+    assert(sum == 90.0)
+    print("Column sum \u2713")
+
+    let maps = table.to_maps()
+    assert(maps[0].get("name").unwrap() == "Alice")
+    print("to_maps \u2713")
+
+    let writer = CsvWriter.new()
+    let output = writer.write(&table)
+    let reparsed = reader.parse(&output).unwrap()
+    assert(reparsed.row_count() == table.row_count())
+    print("Writer roundtrip \u2713")
+
+    let raw = "1,2,3\n4,5,6"
+    let raw_table = CsvReader.new().without_headers().parse(raw).unwrap()
+    assert(raw_table.headers.is_empty())
+    assert(raw_table.get(0, 0).unwrap() == "1")
+    print("No headers \u2713")
+
+    let tsv = "name\tage\nAlice\t30"
+    let tsv_table = CsvReader.new().with_delimiter('\t').parse(tsv).unwrap()
+    assert(tsv_table.get(0, 0).unwrap() == "Alice")
+    print("TSV \u2713")
+
+    print("CSV Parser complete \u2713")
+}
