@@ -1,0 +1,56 @@
+// file_watcher.ltl — Watch filesystem events recursively
+// Run: lateralus run systems/file_watcher.ltl <path>
+
+use std.fs.{Watcher, WatchEvent, EventKind}
+use std.time.DateTime
+
+fn event_icon(kind: EventKind) -> string {
+    match kind {
+        EventKind.Create => "+",
+        EventKind.Modify => "~",
+        EventKind.Delete => "-",
+        EventKind.Rename => "r",
+        _                => "?",
+    }
+}
+
+fn human_size(bytes: int) -> string {
+    match bytes {
+        b if b < 1024         => "${b}B",
+        b if b < 1024 * 1024  => "${(b / 1024)}KB",
+        b                     => "${(b / 1024 / 1024)}MB",
+    }
+}
+
+fn main() {
+    let path = env.args().get(1) ?? "."
+    let watcher = Watcher.new(path, recursive: true)
+
+    print("Watching: ${path}")
+    print("Press Ctrl+C to stop
+")
+
+    watcher.on_event(|event: WatchEvent| {
+        let ts   = DateTime.now().format("%H:%M:%S")
+        let icon = event_icon(event.kind)
+        let size = event.metadata
+            .map(|m| " (${human_size(m.size)})")
+            .unwrap_or("")
+        print("[${ts}] ${icon} ${event.path}${size}")
+
+        match event.kind {
+            EventKind.Create => print("    -> created"),
+            EventKind.Delete => print("    -> deleted"),
+            EventKind.Rename => {
+                if let some(to) = event.to {
+                    print("    -> renamed to ${to}")
+                }
+            },
+            _ => {},
+        }
+    })
+
+    watcher.run()
+}
+
+main()
