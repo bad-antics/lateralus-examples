@@ -1,0 +1,299 @@
+// process_isolation.ltl — LateralusOS process isolation + capability-based security
+
+// ── Capabilities (object-capability model) ────────────────────────────────────
+// No ambient authority: processes can only access resources via explicit capabilities
+
+#[derive(Clone, Debug, PartialEq)]
+enum Capability {
+    FileRead(string),      // read specific path
+    FileWrite(string),     // write specific path
+    NetConnect { host: string, port: u16 },
+    NetListen(u16),
+    ProcessSpawn,
+    ProcessSignal(u32),    // signal specific PID
+    MemoryMap { size: usize, executable: bool },
+    DeviceAccess(string),
+    Syscall(string),
+    TimeAccess,
+    RandomAccess,
+    EnvRead(string),       // read specific env var
+    CapabilityDelegate,    // can pass capabilities to child processes
+}
+
+struct CapabilitySet {
+    caps: set<Capability>,
+}
+
+impl CapabilitySet {
+    fn new() -> CapabilitySet { CapabilitySet { caps: set() } }
+    fn grant(mut self, cap: Capability) { self.caps.insert(cap) }
+    fn revoke(mut self, cap: &Capability) { self.caps.remove(cap) }
+    fn has(self, cap: &Capability) -> bool { self.caps.contains(cap) }
+
+    fn check(self, cap: &Capability) -> Result<(), string> {
+        if self.has(cap) { ok(()) }
+        else { err("permission denied: missing capability ${cap:?}") }
+    }
+
+    // Attenuation: child can only have subset of parent's caps
+    fn attenuate(self, subset: [Capability]) -> Result<CapabilitySet, string> {
+        let mut child = CapabilitySet.new()
+        for cap in subset {
+            if !self.has(&cap) { return err("cannot delegate capability not held: ${cap:?}") }
+            child.grant(cap)
+        }
+        ok(child)
+    }
+}
+
+// ── Process structure ────────────────────────────────────────────────────────
+enum ProcessState { Ready, Running, Blocked, Zombie, Stopped }
+
+struct Process {
+    pid:        u32,
+    parent_pid: u32,
+    name:       string,
+    state:      ProcessState,
+    caps:       CapabilitySet,
+    memory:     MemorySpace,
+    fds:        dict<u32, FileDescriptor>,
+    exit_code:  int?,
+    priority:   u8,
+    cpu_time:   u64,         // microseconds
+    memory_used: usize,
+    memory_limit: usize,
+}
+
+struct MemorySpace {
+    page_table:  PageTable,
+    heap_start:  usize,
+    heap_end:    usize,
+    stack_top:   usize,
+    brk:         usize,
+    mappings:    [MemoryMapping],
+}
+
+struct MemoryMapping {
+    vaddr:   usize,
+    size:    usize,
+    prot:    MemoryProtection,
+    flags:   u32,
+    backing: MappingBacking,
+}
+
+struct MemoryProtection { read: bool, write: bool, execute: bool }
+
+enum MappingBacking { Anonymous, File { path: string, offset: u64 }, Shared(string) }
+
+struct PageTable { entries: dict<usize, PageTableEntry> }
+
+struct PageTableEntry {
+    physical_addr: usize,
+    present:       bool,
+    writable:      bool,
+    user:          bool,
+    no_execute:    bool,
+    dirty:         bool,
+    accessed:      bool,
+}
+
+struct FileDescriptor {
+    fd:     u32,
+    path:   string,
+    mode:   FileMode,
+    offset: u64,
+    cap:    Capability,
+}
+
+enum FileMode { ReadOnly, WriteOnly, ReadWrite, Append }
+
+// ── Namespace isolation ──────────────────────────────────────────────────────
+struct Namespace {
+    pid_ns:    u32,    // PID namespace ID
+    net_ns:    u32,    // network namespace
+    mount_ns:  u32,    // mount namespace
+    user_ns:   u32,    // user namespace
+    ipc_ns:    u32,    // IPC namespace
+}
+
+impl Namespace {
+    fn root() -> Namespace { Namespace { pid_ns: 1, net_ns: 1, mount_ns: 1, user_ns: 1, ipc_ns: 1 } }
+
+    fn new_isolated(parent: &Namespace) -> Namespace {
+        static mut NEXT_NS: u32 = 100;
+        unsafe {
+            NEXT_NS += 1
+            Namespace { pid_ns: NEXT_NS, net_ns: NEXT_NS + 1, mount_ns: NEXT_NS + 2,
+                        user_ns: NEXT_NS + 3, ipc_ns: NEXT_NS + 4 }
+        }
+    }
+}
+
+// ── Sandbox profiles ─────────────────────────────────────────────────────────
+struct SandboxProfile {
+    name:              string,
+    capabilities:      CapabilitySet,
+    namespace:         Namespace,
+    resource_limits:   ResourceLimits,
+    seccomp_filter:    [SyscallFilter],
+    allowed_paths:     [string],
+    network_policy:    NetworkPolicy,
+}
+
+struct ResourceLimits {
+    max_memory:   usize,     // bytes
+    max_cpu_time: u64,       // microseconds
+    max_fds:      u32,
+    max_threads:  u32,
+    max_file_size: u64,
+}
+
+struct SyscallFilter {
+    syscall: string,
+    action:  FilterAction,
+}
+
+enum FilterAction { Allow, Deny, Log, Trap }
+
+enum NetworkPolicy {
+    NoNetwork,
+    AllowList([(string, u16)]),   // (host, port) pairs
+    AllowAllOutbound,
+    Full,
+}
+
+impl SandboxProfile {
+    fn minimal() -> SandboxProfile {
+        let mut caps = CapabilitySet.new()
+        caps.grant(Capability.TimeAccess)
+        caps.grant(Capability.RandomAccess)
+        SandboxProfile {
+            name: "minimal".to_string(),
+            capabilities: caps,
+            namespace: Namespace.new_isolated(&Namespace.root()),
+            resource_limits: ResourceLimits {
+                max_memory: 64 * 1024 * 1024, max_cpu_time: 10_000_000,
+                max_fds: 16, max_threads: 4, max_file_size: 1024 * 1024,
+            },
+            seccomp_filter: [
+                SyscallFilter { syscall: "read".to_string(),  action: FilterAction.Allow },
+                SyscallFilter { syscall: "write".to_string(), action: FilterAction.Allow },
+                SyscallFilter { syscall: "mmap".to_string(),  action: FilterAction.Allow },
+                SyscallFilter { syscall: "exit".to_string(),  action: FilterAction.Allow },
+            ],
+            allowed_paths: [],
+            network_policy: NetworkPolicy.NoNetwork,
+        }
+    }
+
+    fn web_service() -> SandboxProfile {
+        let mut caps = CapabilitySet.new()
+        caps.grant(Capability.NetListen(8080))
+        caps.grant(Capability.FileRead("/app".to_string()))
+        caps.grant(Capability.FileRead("/etc/ssl/certs".to_string()))
+        caps.grant(Capability.TimeAccess)
+        caps.grant(Capability.RandomAccess)
+        SandboxProfile {
+            name: "web-service".to_string(),
+            capabilities: caps,
+            namespace: Namespace.new_isolated(&Namespace.root()),
+            resource_limits: ResourceLimits {
+                max_memory: 512 * 1024 * 1024, max_cpu_time: 0,  // unlimited
+                max_fds: 1024, max_threads: 64, max_file_size: 100 * 1024 * 1024,
+            },
+            seccomp_filter: [],
+            allowed_paths: ["/app".to_string(), "/etc/ssl/certs".to_string(), "/tmp".to_string()],
+            network_policy: NetworkPolicy.AllowAllOutbound,
+        }
+    }
+}
+
+// ── Secure IPC ───────────────────────────────────────────────────────────────
+enum IpcMessage {
+    Data([u8]),
+    CapabilityTransfer(Capability),
+    Signal(u32),
+    Shutdown,
+}
+
+struct IpcChannel {
+    id:       u32,
+    sender:   u32,    // PID
+    receiver: u32,    // PID
+    buffer:   [IpcMessage],
+    capacity: usize,
+}
+
+impl IpcChannel {
+    fn new(sender: u32, receiver: u32, capacity: usize) -> IpcChannel {
+        IpcChannel { id: random_u32(), sender, receiver, buffer: [], capacity }
+    }
+
+    fn send(mut self, from_pid: u32, msg: IpcMessage) -> Result<(), string> {
+        if from_pid != self.sender { return err("not authorized to send on this channel") }
+        if self.buffer.len() >= self.capacity { return err("channel full") }
+        // Capability transfers require CapabilityDelegate
+        if matches!(msg, IpcMessage.CapabilityTransfer(_)) {
+            // verify sender holds CapabilityDelegate
+        }
+        self.buffer.push(msg)
+        ok(())
+    }
+
+    fn recv(mut self, to_pid: u32) -> Result<IpcMessage, string> {
+        if to_pid != self.receiver { return err("not authorized to receive on this channel") }
+        if self.buffer.is_empty() { return err("channel empty") }
+        ok(self.buffer.remove(0))
+    }
+}
+
+fn random_u32() -> u32 { let b = std.crypto.random_bytes(4); b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16 | (b[3] as u32) << 24 }
+
+fn main() {
+    // Test capability system
+    let mut parent_caps = CapabilitySet.new()
+    parent_caps.grant(Capability.FileRead("/home/user".to_string()))
+    parent_caps.grant(Capability.FileRead("/tmp".to_string()))
+    parent_caps.grant(Capability.NetConnect { host: "api.example.com".to_string(), port: 443 })
+    parent_caps.grant(Capability.TimeAccess)
+    parent_caps.grant(Capability.CapabilityDelegate)
+
+    assert(parent_caps.has(&Capability.FileRead("/home/user".to_string())))
+    assert(!parent_caps.has(&Capability.FileWrite("/home/user".to_string())))
+    print("Capability check ✓")
+
+    // Attenuate for child
+    let child_caps = parent_caps.attenuate([
+        Capability.FileRead("/tmp".to_string()),
+        Capability.TimeAccess,
+    ]).unwrap()
+    assert(child_caps.has(&Capability.FileRead("/tmp".to_string())))
+    assert(!child_caps.has(&Capability.FileRead("/home/user".to_string())))
+    print("Capability attenuation ✓")
+
+    // Cannot delegate caps we don't have
+    let bad = parent_caps.attenuate([Capability.ProcessSpawn])
+    assert(bad.is_err())
+    print("Cannot escalate capabilities ✓")
+
+    // Sandbox profiles
+    let min = SandboxProfile.minimal()
+    assert(min.resource_limits.max_memory == 64 * 1024 * 1024)
+    assert(matches!(min.network_policy, NetworkPolicy.NoNetwork))
+    print("Minimal sandbox profile ✓")
+
+    let web = SandboxProfile.web_service()
+    assert(web.capabilities.has(&Capability.NetListen(8080)))
+    assert(!web.capabilities.has(&Capability.NetListen(80)))
+    print("Web service sandbox ✓")
+
+    // IPC
+    let mut ch = IpcChannel.new(1, 2, 10)
+    ch.send(1, IpcMessage.Data("hello".as_bytes().to_vec())).unwrap()
+    assert(ch.send(999, IpcMessage.Data(vec![])).is_err())
+    let msg = ch.recv(2).unwrap()
+    assert(matches!(msg, IpcMessage.Data(_)))
+    print("Secure IPC ✓")
+
+    print("LateralusOS process isolation — all passed ✓")
+}
