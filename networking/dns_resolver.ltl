@@ -1,0 +1,52 @@
+// dns_resolver.ltl — DNS lookup utilities
+// Run: lateralus run networking/dns_resolver.ltl
+
+use std.net.{dns, IpAddr}
+
+struct DnsResult {
+    hostname: string,
+    ips:      [IpAddr],
+    cname:    string?,
+    mx:       [(int, string)],   // (priority, exchange)
+    txt:      [string],
+}
+
+fn resolve_all(hostname: string) -> DnsResult {
+    let ips   = dns.lookup_host(hostname).unwrap_or([])
+    let cname = dns.lookup_cname(hostname).ok()
+    let mx    = dns.lookup_mx(hostname).unwrap_or([])
+    let txt   = dns.lookup_txt(hostname).unwrap_or([])
+    DnsResult { hostname, ips, cname, mx, txt }
+}
+
+fn print_result(r: DnsResult) {
+    print("Host: ${r.hostname}")
+    print("  A/AAAA: ${r.ips |> map(|i| i.to_string()) |> join(", ")}")
+    if let some(c) = r.cname { print("  CNAME:  ${c}") }
+    if !r.mx.is_empty() {
+        print("  MX:")
+        r.mx |> sort_by(|(p, _)| p)
+             |> each(|(prio, host)| print("    ${prio} ${host}"))
+    }
+    if !r.txt.is_empty() {
+        print("  TXT:")
+        r.txt |> each(t => print("    ${t}"))
+    }
+}
+
+fn reverse_lookup(ip: string) -> string {
+    dns.lookup_addr(ip.parse().expect("Invalid IP"))
+        .unwrap_or("(no PTR record)")
+}
+
+fn main() {
+    let hosts = ["example.com", "github.com", "google.com"]
+    hosts |> each(h => {
+        print_result(resolve_all(h))
+        print("")
+    })
+
+    print("Reverse lookup 8.8.8.8: ${reverse_lookup("8.8.8.8")}")
+}
+
+main()
