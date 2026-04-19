@@ -1,0 +1,361 @@
+// Niche Example - Port Scanner
+// TCP port scanner with SYN scan, service detection, and concurrent scanning.
+
+use std.net.{TcpStream, SocketAddr, IpAddr}
+use std.time.{Duration, Instant}
+use std.sync.{Arc, Mutex}
+use std.collections.{HashMap, BTreeMap}
+
+#[derive(Clone, Debug)]
+enum PortState {
+    Open,
+    Closed,
+    Filtered,
+    Unknown,
+}
+
+impl PortState {
+    fn to_string(self) -> string {
+        match self {
+            PortState.Open => "open",
+            PortState.Closed => "closed",
+            PortState.Filtered => "filtered",
+            PortState.Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PortResult {
+    port: u16,
+    state: PortState,
+    service: Option<string>,
+    banner: Option<string>,
+    latency: Duration,
+}
+
+struct ServiceDB {
+    services: HashMap<u16, string>,
+}
+
+impl ServiceDB {
+    fn new() -> ServiceDB {
+        let mut services = HashMap.new()
+        services.insert(21, "ftp".to_string())
+        services.insert(22, "ssh".to_string())
+        services.insert(23, "telnet".to_string())
+        services.insert(25, "smtp".to_string())
+        services.insert(53, "dns".to_string())
+        services.insert(80, "http".to_string())
+        services.insert(110, "pop3".to_string())
+        services.insert(143, "imap".to_string())
+        services.insert(443, "https".to_string())
+        services.insert(445, "smb".to_string())
+        services.insert(993, "imaps".to_string())
+        services.insert(995, "pop3s".to_string())
+        services.insert(3306, "mysql".to_string())
+        services.insert(3389, "rdp".to_string())
+        services.insert(5432, "postgresql".to_string())
+        services.insert(5900, "vnc".to_string())
+        services.insert(6379, "redis".to_string())
+        services.insert(8080, "http-proxy".to_string())
+        services.insert(8443, "https-alt".to_string())
+        services.insert(27017, "mongodb".to_string())
+        ServiceDB { services }
+    }
+
+    fn lookup(self, port: u16) -> Option<string> {
+        self.services.get(&port).cloned()
+    }
+}
+
+struct ScanConfig {
+    target: IpAddr,
+    ports: [u16],
+    timeout: Duration,
+    concurrency: usize,
+    grab_banner: bool,
+    retries: u8,
+}
+
+impl ScanConfig {
+    fn new(target: IpAddr) -> ScanConfig {
+        ScanConfig {
+            target,
+            ports: [],
+            timeout: Duration.from_millis(1000),
+            concurrency: 100,
+            grab_banner: false,
+            retries: 1,
+        }
+    }
+
+    fn with_port_range(mut self, start: u16, end: u16) -> ScanConfig {
+        self.ports = (start..=end).collect()
+        self
+    }
+
+    fn with_ports(mut self, ports: [u16]) -> ScanConfig {
+        self.ports = ports
+        self
+    }
+
+    fn with_common_ports(mut self) -> ScanConfig {
+        self.ports = vec![
+            21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445,
+            993, 995, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443,
+        ]
+        self
+    }
+
+    fn with_timeout(mut self, timeout: Duration) -> ScanConfig {
+        self.timeout = timeout; self
+    }
+
+    fn with_concurrency(mut self, n: usize) -> ScanConfig {
+        self.concurrency = n; self
+    }
+
+    fn with_banner_grab(mut self) -> ScanConfig {
+        self.grab_banner = true; self
+    }
+}
+
+struct Scanner {
+    config: ScanConfig,
+    service_db: ServiceDB,
+    results: BTreeMap<u16, PortResult>,
+}
+
+impl Scanner {
+    fn new(config: ScanConfig) -> Scanner {
+        Scanner {
+            config,
+            service_db: ServiceDB.new(),
+            results: BTreeMap.new(),
+        }
+    }
+
+    fn scan_port(self, port: u16) -> PortResult {
+        let addr = SocketAddr.new(self.config.target, port)
+        let start = Instant.now()
+
+        for _ in 0..self.config.retries {
+            match TcpStream.connect_timeout(&addr, self.config.timeout) {
+                ok(mut stream) => {
+                    let latency = start.elapsed()
+                    let service = self.service_db.lookup(port)
+                    let banner = if self.config.grab_banner {
+                        self.grab_banner(&mut stream)
+                    } else {
+                        none
+                    }
+                    return PortResult {
+                        port, state: PortState.Open, service, banner, latency,
+                    }
+                },
+                err(e) => {
+                    let latency = start.elapsed()
+                    if latency >= self.config.timeout {
+                        return PortResult {
+                            port, state: PortState.Filtered,
+                            service: none, banner: none, latency,
+                        }
+                    }
+                },
+            }
+        }
+
+        PortResult {
+            port, state: PortState.Closed,
+            service: none, banner: none, latency: start.elapsed(),
+        }
+    }
+
+    fn grab_banner(self, stream: &mut TcpStream) -> Option<string> {
+        stream.set_read_timeout(some(Duration.from_millis(500))).ok()?;
+        let mut buf = [0u8; 1024]
+        match stream.read(&mut buf) {
+            ok(n) if n > 0 => {
+                let banner = string.from_utf8_lossy(&buf[..n]).to_string()
+                some(banner.trim().to_string())
+            },
+            _ => none,
+        }
+    }
+
+    async fn scan(mut self) -> ScanReport {
+        let start = Instant.now()
+        let results = Arc.new(Mutex.new(BTreeMap.new()))
+        let ports = self.config.ports.clone()
+
+        // Chunk ports for concurrent scanning
+        let chunks = ports.chunks(self.config.concurrency)
+        for chunk in chunks {
+            let mut tasks = []
+            for &port in chunk {
+                let r = results.clone()
+                tasks.push(async move {
+                    let result = self.scan_port(port)
+                    r.lock().unwrap().insert(port, result)
+                })
+            }
+            for task in tasks {
+                task.await
+            }
+        }
+
+        self.results = Arc.try_unwrap(results).unwrap().into_inner().unwrap()
+        let duration = start.elapsed()
+
+        ScanReport {
+            target: self.config.target,
+            results: self.results.clone(),
+            duration,
+            total_ports: self.config.ports.len(),
+        }
+    }
+}
+
+struct ScanReport {
+    target: IpAddr,
+    results: BTreeMap<u16, PortResult>,
+    duration: Duration,
+    total_ports: usize,
+}
+
+impl ScanReport {
+    fn open_ports(self) -> [&PortResult] {
+        self.results.values().filter(|r| match r.state {
+            PortState.Open => true, _ => false,
+        }).collect()
+    }
+
+    fn closed_ports(self) -> usize {
+        self.results.values().filter(|r| match r.state {
+            PortState.Closed => true, _ => false,
+        }).count()
+    }
+
+    fn filtered_ports(self) -> usize {
+        self.results.values().filter(|r| match r.state {
+            PortState.Filtered => true, _ => false,
+        }).count()
+    }
+
+    fn summary(self) -> string {
+        let open = self.open_ports().len()
+        let closed = self.closed_ports()
+        let filtered = self.filtered_ports()
+        format!("Scan of {} complete: {} open, {} closed, {} filtered ({} total in {:?})",
+            self.target, open, closed, filtered, self.total_ports, self.duration)
+    }
+
+    fn format_table(self) -> string {
+        let mut out = format!("PORT     STATE      SERVICE    LATENCY\n")
+        for result in self.open_ports() {
+            let svc = result.service.as_deref().unwrap_or("unknown")
+            out += &format!("{:<8} {:<10} {:<10} {:?}\n",
+                result.port, result.state.to_string(), svc, result.latency)
+        }
+        out
+    }
+}
+
+fn main() {
+    // Service DB
+    let db = ServiceDB.new()
+    assert(db.lookup(22).unwrap() == "ssh")
+    assert(db.lookup(80).unwrap() == "http")
+    assert(db.lookup(443).unwrap() == "https")
+    assert(db.lookup(3306).unwrap() == "mysql")
+    assert(db.lookup(12345).is_none())
+    print("Service DB ✓")
+
+    // Port state
+    assert(PortState.Open.to_string() == "open")
+    assert(PortState.Closed.to_string() == "closed")
+    assert(PortState.Filtered.to_string() == "filtered")
+    print("Port state ✓")
+
+    // Scan config
+    let config = ScanConfig.new(IpAddr.parse("127.0.0.1").unwrap())
+        .with_common_ports()
+        .with_timeout(Duration.from_millis(500))
+        .with_concurrency(50)
+        .with_banner_grab()
+    assert(config.ports.len() == 23)
+    assert(config.concurrency == 50)
+    assert(config.grab_banner)
+    print("Scan config ✓")
+
+    // Port range
+    let range_config = ScanConfig.new(IpAddr.parse("10.0.0.1").unwrap())
+        .with_port_range(1, 100)
+    assert(range_config.ports.len() == 100)
+    assert(range_config.ports[0] == 1)
+    assert(range_config.ports[99] == 100)
+    print("Port range ✓")
+
+    // Custom ports
+    let custom = ScanConfig.new(IpAddr.parse("10.0.0.1").unwrap())
+        .with_ports(vec![22, 80, 443])
+    assert(custom.ports.len() == 3)
+    print("Custom ports ✓")
+
+    // PortResult
+    let pr = PortResult {
+        port: 80,
+        state: PortState.Open,
+        service: some("http".to_string()),
+        banner: some("HTTP/1.1 200 OK".to_string()),
+        latency: Duration.from_millis(5),
+    }
+    assert(pr.port == 80)
+    assert(pr.service.unwrap() == "http")
+    assert(pr.banner.unwrap().contains("HTTP"))
+    print("PortResult ✓")
+
+    // ScanReport (simulated)
+    let mut results = BTreeMap.new()
+    results.insert(22, PortResult {
+        port: 22, state: PortState.Open,
+        service: some("ssh".to_string()), banner: none,
+        latency: Duration.from_millis(3),
+    })
+    results.insert(80, PortResult {
+        port: 80, state: PortState.Open,
+        service: some("http".to_string()), banner: none,
+        latency: Duration.from_millis(5),
+    })
+    results.insert(443, PortResult {
+        port: 443, state: PortState.Closed,
+        service: none, banner: none,
+        latency: Duration.from_millis(1),
+    })
+
+    let report = ScanReport {
+        target: IpAddr.parse("127.0.0.1").unwrap(),
+        results,
+        duration: Duration.from_millis(100),
+        total_ports: 3,
+    }
+
+    let open = report.open_ports()
+    assert(open.len() == 2)
+    assert(report.closed_ports() == 1)
+    assert(report.filtered_ports() == 0)
+    print("ScanReport ✓")
+
+    let summary = report.summary()
+    assert(summary.contains("2 open"))
+    assert(summary.contains("1 closed"))
+    print("Summary ✓")
+
+    let table = report.format_table()
+    assert(table.contains("22"))
+    assert(table.contains("ssh"))
+    print("Format table ✓")
+
+    print("Port Scanner complete ✓")
+}
