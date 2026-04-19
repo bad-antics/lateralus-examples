@@ -1,0 +1,309 @@
+// Niche Example — Protocol Buffers Encoder/Decoder
+// Wire format: varint, length-delimited, fixed32/64, zigzag encoding.
+
+use std.collections.HashMap
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Wire Types
+// ═══════════════════════════════════════════════════════════════════════════════
+
+enum WireType {
+    Varint         = 0,
+    Fixed64        = 1,
+    LengthDelim    = 2,
+    Fixed32        = 5,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Encoding helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn encode_varint(mut value: u64, buf: &mut [u8]) {
+    loop {
+        let byte = (value & 0x7F) as u8
+        value >>= 7
+        if value == 0 { buf.push(byte); return }
+        buf.push(byte | 0x80)
+    }
+}
+
+fn decode_varint(buf: &[u8], pos: &mut usize) -> u64 {
+    let mut result: u64 = 0
+    let mut shift: u32 = 0
+    loop {
+        let byte = buf[*pos]
+        *pos += 1
+        result |= ((byte & 0x7F) as u64) << shift
+        if byte & 0x80 == 0 { return result }
+        shift += 7
+        if shift >= 64 { panic("varint too long") }
+    }
+}
+
+fn zigzag_encode(n: i64) -> u64 { ((n << 1) ^ (n >> 63)) as u64 }
+fn zigzag_decode(n: u64) -> i64 { (n >> 1) as i64 ^ -((n & 1) as i64) }
+
+fn encode_tag(field_number: u32, wire_type: WireType, buf: &mut [u8]) {
+    let tag = (field_number << 3) | (wire_type as u32)
+    encode_varint(tag as u64, buf)
+}
+
+fn decode_tag(buf: &[u8], pos: &mut usize) -> (u32, WireType) {
+    let tag = decode_varint(buf, pos) as u32
+    let field_number = tag >> 3
+    let wire_type = match tag & 0x07 {
+        0 => WireType.Varint, 1 => WireType.Fixed64,
+        2 => WireType.LengthDelim, 5 => WireType.Fixed32,
+        _ => panic("unknown wire type"),
+    }
+    (field_number, wire_type)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ProtoBuffer — generic message encoder/decoder
+// ═══════════════════════════════════════════════════════════════════════════════
+
+enum ProtoValue {
+    Varint(u64),
+    SignedVarint(i64),
+    Fixed32(u32),
+    Fixed64(u64),
+    Bytes([u8]),
+    String(string),
+    Message(ProtoMessage),
+    Repeated([ProtoValue]),
+}
+
+struct ProtoField {
+    number: u32,
+    value: ProtoValue,
+}
+
+struct ProtoMessage {
+    fields: HashMap<u32, ProtoValue>,
+}
+
+impl ProtoMessage {
+    fn new() -> ProtoMessage { ProtoMessage { fields: HashMap.new() } }
+
+    fn set_varint(mut self, field: u32, value: u64) {
+        self.fields.insert(field, ProtoValue.Varint(value))
+    }
+
+    fn set_sint(mut self, field: u32, value: i64) {
+        self.fields.insert(field, ProtoValue.SignedVarint(value))
+    }
+
+    fn set_string(mut self, field: u32, value: string) {
+        self.fields.insert(field, ProtoValue.String(value))
+    }
+
+    fn set_bytes(mut self, field: u32, value: [u8]) {
+        self.fields.insert(field, ProtoValue.Bytes(value))
+    }
+
+    fn set_message(mut self, field: u32, value: ProtoMessage) {
+        self.fields.insert(field, ProtoValue.Message(value))
+    }
+
+    fn set_fixed32(mut self, field: u32, value: u32) {
+        self.fields.insert(field, ProtoValue.Fixed32(value))
+    }
+
+    fn set_fixed64(mut self, field: u32, value: u64) {
+        self.fields.insert(field, ProtoValue.Fixed64(value))
+    }
+
+    fn get_varint(self, field: u32) -> Option<u64> {
+        match self.fields.get(&field) {
+            some(ProtoValue.Varint(v)) => some(*v),
+            _ => none,
+        }
+    }
+
+    fn get_sint(self, field: u32) -> Option<i64> {
+        match self.fields.get(&field) {
+            some(ProtoValue.SignedVarint(v)) => some(*v),
+            some(ProtoValue.Varint(v)) => some(zigzag_decode(*v)),
+            _ => none,
+        }
+    }
+
+    fn get_string(self, field: u32) -> Option<&string> {
+        match self.fields.get(&field) {
+            some(ProtoValue.String(s)) => some(s),
+            _ => none,
+        }
+    }
+
+    fn get_bytes(self, field: u32) -> Option<&[u8]> {
+        match self.fields.get(&field) {
+            some(ProtoValue.Bytes(b)) => some(b),
+            _ => none,
+        }
+    }
+
+    // ── Encode ───────────────────────────────────────────────────────────────
+    fn encode(self) -> [u8] {
+        let mut buf: [u8] = []
+        let mut sorted_fields: [(u32, &ProtoValue)] = self.fields.iter()
+            .map(|(&k, v)| (k, v)).collect()
+        sorted_fields.sort_by_key(|(k, _)| *k)
+
+        for (field_num, value) in sorted_fields {
+            Self.encode_field(field_num, value, &mut buf)
+        }
+        buf
+    }
+
+    fn encode_field(field_num: u32, value: &ProtoValue, buf: &mut [u8]) {
+        match value {
+            ProtoValue.Varint(v) => {
+                encode_tag(field_num, WireType.Varint, buf)
+                encode_varint(*v, buf)
+            }
+            ProtoValue.SignedVarint(v) => {
+                encode_tag(field_num, WireType.Varint, buf)
+                encode_varint(zigzag_encode(*v), buf)
+            }
+            ProtoValue.Fixed32(v) => {
+                encode_tag(field_num, WireType.Fixed32, buf)
+                buf.extend_from_slice(&v.to_le_bytes())
+            }
+            ProtoValue.Fixed64(v) => {
+                encode_tag(field_num, WireType.Fixed64, buf)
+                buf.extend_from_slice(&v.to_le_bytes())
+            }
+            ProtoValue.Bytes(data) => {
+                encode_tag(field_num, WireType.LengthDelim, buf)
+                encode_varint(data.len() as u64, buf)
+                buf.extend_from_slice(data)
+            }
+            ProtoValue.String(s) => {
+                encode_tag(field_num, WireType.LengthDelim, buf)
+                let bytes = s.as_bytes()
+                encode_varint(bytes.len() as u64, buf)
+                buf.extend_from_slice(bytes)
+            }
+            ProtoValue.Message(msg) => {
+                let inner = msg.encode()
+                encode_tag(field_num, WireType.LengthDelim, buf)
+                encode_varint(inner.len() as u64, buf)
+                buf.extend_from_slice(&inner)
+            }
+            _ => {}
+        }
+    }
+
+    // ── Decode ───────────────────────────────────────────────────────────────
+    fn decode(buf: &[u8]) -> ProtoMessage {
+        let mut msg = ProtoMessage.new()
+        let mut pos: usize = 0
+        while pos < buf.len() {
+            let (field_num, wire_type) = decode_tag(buf, &mut pos)
+            let value = match wire_type {
+                WireType.Varint => ProtoValue.Varint(decode_varint(buf, &mut pos)),
+                WireType.Fixed32 => {
+                    let v = u32.from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]])
+                    pos += 4
+                    ProtoValue.Fixed32(v)
+                }
+                WireType.Fixed64 => {
+                    let v = u64.from_le_bytes([
+                        buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
+                        buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+                    ])
+                    pos += 8
+                    ProtoValue.Fixed64(v)
+                }
+                WireType.LengthDelim => {
+                    let len = decode_varint(buf, &mut pos) as usize
+                    let data = buf[pos..pos+len].to_vec()
+                    pos += len
+                    ProtoValue.Bytes(data)
+                }
+            }
+            msg.fields.insert(field_num, value)
+        }
+        msg
+    }
+}
+
+fn main() {
+    // ── Varint encoding ──────────────────────────────────────────────────────
+    let mut buf: [u8] = []
+    encode_varint(150, &mut buf)
+    assert(buf == [0x96, 0x01])
+    let mut pos: usize = 0
+    assert(decode_varint(&buf, &mut pos) == 150)
+    print("Varint: 150 ✓")
+
+    buf.clear()
+    encode_varint(0, &mut buf)
+    assert(buf == [0x00])
+    print("Varint: 0 ✓")
+
+    buf.clear()
+    encode_varint(300, &mut buf)
+    pos = 0
+    assert(decode_varint(&buf, &mut pos) == 300)
+    print("Varint: 300 roundtrip ✓")
+
+    // ── Zigzag ───────────────────────────────────────────────────────────────
+    assert(zigzag_encode(0) == 0)
+    assert(zigzag_encode(-1) == 1)
+    assert(zigzag_encode(1) == 2)
+    assert(zigzag_encode(-2) == 3)
+    assert(zigzag_decode(0) == 0)
+    assert(zigzag_decode(1) == -1)
+    assert(zigzag_decode(2) == 1)
+    assert(zigzag_decode(3) == -2)
+    print("Zigzag encoding ✓")
+
+    // ── Message encode/decode ────────────────────────────────────────────────
+    let mut msg = ProtoMessage.new()
+    msg.set_varint(1, 42)
+    msg.set_string(2, "hello".to_string())
+    msg.set_varint(3, 9999)
+
+    let encoded = msg.encode()
+    print("Encoded: ${encoded.len()} bytes")
+
+    let decoded = ProtoMessage.decode(&encoded)
+    assert(decoded.get_varint(1) == some(42))
+    assert(decoded.get_varint(3) == some(9999))
+    print("Message roundtrip ✓")
+
+    // ── Nested message ───────────────────────────────────────────────────────
+    let mut inner = ProtoMessage.new()
+    inner.set_varint(1, 100)
+    inner.set_string(2, "nested".to_string())
+
+    let mut outer = ProtoMessage.new()
+    outer.set_varint(1, 1)
+    outer.set_message(2, inner)
+
+    let encoded_outer = outer.encode()
+    print("Nested message: ${encoded_outer.len()} bytes ✓")
+
+    // ── Fixed-width types ────────────────────────────────────────────────────
+    let mut msg2 = ProtoMessage.new()
+    msg2.set_fixed32(1, 0xDEADBEEF)
+    msg2.set_fixed64(2, 0xCAFEBABE_12345678)
+    let enc2 = msg2.encode()
+    let dec2 = ProtoMessage.decode(&enc2)
+    match dec2.fields.get(&1) {
+        some(ProtoValue.Fixed32(v)) => assert(*v == 0xDEADBEEF),
+        _ => panic("expected fixed32"),
+    }
+    print("Fixed32/64 ✓")
+
+    // ── Large varint ─────────────────────────────────────────────────────────
+    buf.clear()
+    encode_varint(u64.MAX, &mut buf)
+    pos = 0
+    assert(decode_varint(&buf, &mut pos) == u64.MAX)
+    print("Max u64 varint ✓")
+
+    print("Protocol Buffers complete ✓")
+}
