@@ -1,0 +1,397 @@
+// Niche Example — DNS Resolver
+// Builds and parses DNS packets (RFC 1035), supports A/AAAA/CNAME/MX records.
+
+use std.collections.HashMap
+use std.io.{Read, Write}
+
+// ── DNS Constants ────────────────────────────────────────────────────────────
+const DNS_PORT: u16 = 53
+const MAX_LABEL_LEN: usize = 63
+const MAX_NAME_LEN: usize = 255
+const MAX_UDP_SIZE: usize = 512
+
+enum DnsType { A = 1, NS = 2, CNAME = 5, SOA = 6, MX = 15, TXT = 16, AAAA = 28, SRV = 33 }
+enum DnsClass { IN = 1, CH = 3, HS = 4 }
+enum DnsOpcode { Query = 0, IQuery = 1, Status = 2 }
+enum DnsRcode { NoError = 0, FormErr = 1, ServFail = 2, NXDomain = 3, NotImpl = 4, Refused = 5 }
+
+// ── DNS Header ───────────────────────────────────────────────────────────────
+struct DnsHeader {
+    id: u16,
+    qr: bool,           // 0=query, 1=response
+    opcode: u8,
+    aa: bool,           // authoritative answer
+    tc: bool,           // truncated
+    rd: bool,           // recursion desired
+    ra: bool,           // recursion available
+    rcode: u8,
+    qdcount: u16,
+    ancount: u16,
+    nscount: u16,
+    arcount: u16,
+}
+
+impl DnsHeader {
+    fn new_query(id: u16) -> DnsHeader {
+        DnsHeader {
+            id, qr: false, opcode: 0, aa: false, tc: false,
+            rd: true, ra: false, rcode: 0,
+            qdcount: 1, ancount: 0, nscount: 0, arcount: 0,
+        }
+    }
+
+    fn encode(self) -> [u8] {
+        let mut buf: [u8] = []
+        buf.extend_from_slice(&self.id.to_be_bytes())
+        let flags: u16 = ((self.qr as u16) << 15)
+            | ((self.opcode as u16) << 11)
+            | ((self.aa as u16) << 10)
+            | ((self.tc as u16) << 9)
+            | ((self.rd as u16) << 8)
+            | ((self.ra as u16) << 7)
+            | (self.rcode as u16)
+        buf.extend_from_slice(&flags.to_be_bytes())
+        buf.extend_from_slice(&self.qdcount.to_be_bytes())
+        buf.extend_from_slice(&self.ancount.to_be_bytes())
+        buf.extend_from_slice(&self.nscount.to_be_bytes())
+        buf.extend_from_slice(&self.arcount.to_be_bytes())
+        buf
+    }
+
+    fn decode(data: &[u8], offset: &mut usize) -> Result<DnsHeader, string> {
+        if data.len() < *offset + 12 { return err("header too short".to_string()) }
+        let id = u16.from_be_bytes([data[*offset], data[*offset + 1]])
+        let flags = u16.from_be_bytes([data[*offset + 2], data[*offset + 3]])
+        let header = DnsHeader {
+            id,
+            qr: (flags >> 15) & 1 == 1,
+            opcode: ((flags >> 11) & 0xF) as u8,
+            aa: (flags >> 10) & 1 == 1,
+            tc: (flags >> 9) & 1 == 1,
+            rd: (flags >> 8) & 1 == 1,
+            ra: (flags >> 7) & 1 == 1,
+            rcode: (flags & 0xF) as u8,
+            qdcount: u16.from_be_bytes([data[*offset + 4], data[*offset + 5]]),
+            ancount: u16.from_be_bytes([data[*offset + 6], data[*offset + 7]]),
+            nscount: u16.from_be_bytes([data[*offset + 8], data[*offset + 9]]),
+            arcount: u16.from_be_bytes([data[*offset + 10], data[*offset + 11]]),
+        }
+        *offset += 12
+        ok(header)
+    }
+}
+
+// ── DNS Name encoding/decoding ───────────────────────────────────────────────
+fn encode_name(name: &str) -> [u8] {
+    let mut buf: [u8] = []
+    for label in name.split('.') {
+        assert(label.len() <= MAX_LABEL_LEN, "label too long")
+        buf.push(label.len() as u8)
+        buf.extend_from_slice(label.as_bytes())
+    }
+    buf.push(0)  // null terminator
+    buf
+}
+
+fn decode_name(data: &[u8], offset: &mut usize) -> Result<string, string> {
+    let mut name = string.new()
+    let mut jumped = false
+    let mut jump_offset = 0usize
+    let max_jumps = 5
+    let mut jumps = 0
+
+    loop {
+        if *offset >= data.len() { return err("unexpected end of data".to_string()) }
+        let len = data[*offset] as usize
+
+        if len & 0xC0 == 0xC0 {
+            // Pointer (compression)
+            if !jumped { jump_offset = *offset + 2 }
+            let ptr = ((len & 0x3F) << 8) | data[*offset + 1] as usize
+            *offset = ptr
+            jumped = true
+            jumps += 1
+            if jumps > max_jumps { return err("too many jumps".to_string()) }
+            continue
+        }
+
+        if len == 0 {
+            *offset += 1
+            break
+        }
+
+        *offset += 1
+        if *offset + len > data.len() { return err("label exceeds data".to_string()) }
+        if !name.is_empty() { name.push('.') }
+        name.push_str(&string.from_utf8_lossy(&data[*offset..*offset + len]))
+        *offset += len
+    }
+
+    if jumped { *offset = jump_offset }
+    ok(name)
+}
+
+// ── DNS Question ─────────────────────────────────────────────────────────────
+struct DnsQuestion {
+    name: string,
+    qtype: u16,
+    qclass: u16,
+}
+
+impl DnsQuestion {
+    fn new(name: &str, qtype: DnsType) -> DnsQuestion {
+        DnsQuestion { name: name.to_string(), qtype: qtype as u16, qclass: DnsClass.IN as u16 }
+    }
+
+    fn encode(self) -> [u8] {
+        let mut buf = encode_name(&self.name)
+        buf.extend_from_slice(&self.qtype.to_be_bytes())
+        buf.extend_from_slice(&self.qclass.to_be_bytes())
+        buf
+    }
+
+    fn decode(data: &[u8], offset: &mut usize) -> Result<DnsQuestion, string> {
+        let name = decode_name(data, offset)?
+        if data.len() < *offset + 4 { return err("question too short".to_string()) }
+        let qtype = u16.from_be_bytes([data[*offset], data[*offset + 1]])
+        let qclass = u16.from_be_bytes([data[*offset + 2], data[*offset + 3]])
+        *offset += 4
+        ok(DnsQuestion { name, qtype, qclass })
+    }
+}
+
+// ── DNS Record ───────────────────────────────────────────────────────────────
+enum DnsRecord {
+    A { name: string, ttl: u32, addr: [u8; 4] },
+    AAAA { name: string, ttl: u32, addr: [u8; 16] },
+    CNAME { name: string, ttl: u32, target: string },
+    MX { name: string, ttl: u32, priority: u16, exchange: string },
+    NS { name: string, ttl: u32, nsdname: string },
+    TXT { name: string, ttl: u32, text: string },
+    Unknown { name: string, ttl: u32, rtype: u16, rdata: [u8] },
+}
+
+impl DnsRecord {
+    fn decode(data: &[u8], offset: &mut usize) -> Result<DnsRecord, string> {
+        let name = decode_name(data, offset)?
+        if data.len() < *offset + 10 { return err("record too short".to_string()) }
+
+        let rtype = u16.from_be_bytes([data[*offset], data[*offset + 1]])
+        let _rclass = u16.from_be_bytes([data[*offset + 2], data[*offset + 3]])
+        let ttl = u32.from_be_bytes([data[*offset + 4], data[*offset + 5], data[*offset + 6], data[*offset + 7]])
+        let rdlen = u16.from_be_bytes([data[*offset + 8], data[*offset + 9]]) as usize
+        *offset += 10
+
+        let rdata_start = *offset
+        let record = match rtype {
+            1 => {  // A
+                if rdlen != 4 { return err("invalid A record".to_string()) }
+                let addr = [data[*offset], data[*offset+1], data[*offset+2], data[*offset+3]]
+                *offset += 4
+                DnsRecord.A { name, ttl, addr }
+            }
+            28 => {  // AAAA
+                if rdlen != 16 { return err("invalid AAAA record".to_string()) }
+                let mut addr = [0u8; 16]
+                addr.copy_from_slice(&data[*offset..*offset + 16])
+                *offset += 16
+                DnsRecord.AAAA { name, ttl, addr }
+            }
+            5 => {  // CNAME
+                let target = decode_name(data, offset)?
+                DnsRecord.CNAME { name, ttl, target }
+            }
+            15 => {  // MX
+                let priority = u16.from_be_bytes([data[*offset], data[*offset + 1]])
+                *offset += 2
+                let exchange = decode_name(data, offset)?
+                DnsRecord.MX { name, ttl, priority, exchange }
+            }
+            2 => {  // NS
+                let nsdname = decode_name(data, offset)?
+                DnsRecord.NS { name, ttl, nsdname }
+            }
+            16 => {  // TXT
+                let txt_len = data[*offset] as usize
+                *offset += 1
+                let text = string.from_utf8_lossy(&data[*offset..*offset + txt_len]).to_string()
+                *offset += txt_len
+                DnsRecord.TXT { name, ttl, text }
+            }
+            _ => {
+                let rdata = data[*offset..*offset + rdlen].to_vec()
+                *offset += rdlen
+                DnsRecord.Unknown { name, ttl, rtype, rdata }
+            }
+        }
+        // Ensure offset is at rdata_start + rdlen
+        *offset = rdata_start + rdlen
+        ok(record)
+    }
+
+    fn name(self) -> &str {
+        match self {
+            DnsRecord.A { ref name, .. } | DnsRecord.AAAA { ref name, .. }
+            | DnsRecord.CNAME { ref name, .. } | DnsRecord.MX { ref name, .. }
+            | DnsRecord.NS { ref name, .. } | DnsRecord.TXT { ref name, .. }
+            | DnsRecord.Unknown { ref name, .. } => name,
+        }
+    }
+
+    fn ttl(self) -> u32 {
+        match self {
+            DnsRecord.A { ttl, .. } | DnsRecord.AAAA { ttl, .. }
+            | DnsRecord.CNAME { ttl, .. } | DnsRecord.MX { ttl, .. }
+            | DnsRecord.NS { ttl, .. } | DnsRecord.TXT { ttl, .. }
+            | DnsRecord.Unknown { ttl, .. } => ttl,
+        }
+    }
+}
+
+// ── DNS Packet ───────────────────────────────────────────────────────────────
+struct DnsPacket {
+    header: DnsHeader,
+    questions: [DnsQuestion],
+    answers: [DnsRecord],
+    authorities: [DnsRecord],
+    additionals: [DnsRecord],
+}
+
+impl DnsPacket {
+    fn build_query(name: &str, qtype: DnsType) -> [u8] {
+        let id = 0xABCD_u16  // In real code, use random
+        let header = DnsHeader.new_query(id)
+        let question = DnsQuestion.new(name, qtype)
+        let mut buf = header.encode()
+        buf.extend(question.encode())
+        buf
+    }
+
+    fn parse(data: &[u8]) -> Result<DnsPacket, string> {
+        let mut offset = 0usize
+        let header = DnsHeader.decode(data, &mut offset)?
+
+        let mut questions: [DnsQuestion] = []
+        for _ in 0..header.qdcount {
+            questions.push(DnsQuestion.decode(data, &mut offset)?)
+        }
+
+        let mut answers: [DnsRecord] = []
+        for _ in 0..header.ancount {
+            answers.push(DnsRecord.decode(data, &mut offset)?)
+        }
+
+        let mut authorities: [DnsRecord] = []
+        for _ in 0..header.nscount {
+            authorities.push(DnsRecord.decode(data, &mut offset)?)
+        }
+
+        let mut additionals: [DnsRecord] = []
+        for _ in 0..header.arcount {
+            additionals.push(DnsRecord.decode(data, &mut offset)?)
+        }
+
+        ok(DnsPacket { header, questions, answers, authorities, additionals })
+    }
+
+    fn get_a_records(self) -> [[u8; 4]] {
+        self.answers.iter().filter_map(|r| match r {
+            DnsRecord.A { addr, .. } => some(*addr),
+            _ => none,
+        }).collect()
+    }
+
+    fn get_cname(self) -> Option<string> {
+        self.answers.iter().find_map(|r| match r {
+            DnsRecord.CNAME { target, .. } => some(target.clone()),
+            _ => none,
+        })
+    }
+}
+
+// ── DNS Cache ────────────────────────────────────────────────────────────────
+struct CacheEntry {
+    record: DnsRecord,
+    expires_at: u64,  // unix timestamp
+}
+
+struct DnsCache {
+    entries: HashMap<(string, u16), [CacheEntry]>,
+}
+
+impl DnsCache {
+    fn new() -> DnsCache { DnsCache { entries: HashMap.new() } }
+
+    fn insert(mut self, record: DnsRecord, now: u64) {
+        let key = (record.name().to_string(), match &record {
+            DnsRecord.A { .. } => 1, DnsRecord.AAAA { .. } => 28,
+            DnsRecord.CNAME { .. } => 5, DnsRecord.MX { .. } => 15,
+            _ => 0,
+        })
+        let entry = CacheEntry { expires_at: now + record.ttl() as u64, record }
+        self.entries.entry(key).or_insert_with(|| []).push(entry)
+    }
+
+    fn lookup(self, name: &str, qtype: u16, now: u64) -> Option<[&DnsRecord]> {
+        let key = (name.to_string(), qtype)
+        self.entries.get(&key).map(|entries| {
+            entries.iter().filter(|e| e.expires_at > now).map(|e| &e.record).collect()
+        })
+    }
+
+    fn evict_expired(mut self, now: u64) {
+        for (_, entries) in &mut self.entries {
+            entries.retain(|e| e.expires_at > now)
+        }
+        self.entries.retain(|_, v| !v.is_empty())
+    }
+
+    fn len(self) -> usize { self.entries.values().map(|v| v.len()).sum() }
+}
+
+fn main() {
+    // Name encoding
+    let encoded = encode_name("example.com")
+    assert(encoded == [7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0])
+    print("Name encoding ✓")
+
+    // Name decoding
+    let mut offset = 0usize
+    let name = decode_name(&encoded, &mut offset).unwrap()
+    assert(name == "example.com")
+    print("Name decoding ✓")
+
+    // Header encoding/decoding
+    let header = DnsHeader.new_query(0x1234)
+    let encoded_header = header.encode()
+    assert(encoded_header.len() == 12)
+    let mut offset = 0usize
+    let decoded = DnsHeader.decode(&encoded_header, &mut offset).unwrap()
+    assert(decoded.id == 0x1234)
+    assert(decoded.rd == true)
+    assert(decoded.qdcount == 1)
+    print("Header encode/decode ✓")
+
+    // Build query packet
+    let packet = DnsPacket.build_query("example.com", DnsType.A)
+    assert(packet.len() > 12)
+    print("Query packet: ${packet.len()} bytes ✓")
+
+    // Cache
+    let mut cache = DnsCache.new()
+    let record = DnsRecord.A { name: "example.com".to_string(), ttl: 300, addr: [93, 184, 216, 34] }
+    cache.insert(record, 1000)
+    let results = cache.lookup("example.com", 1, 1100).unwrap()
+    assert(results.len() == 1)
+    print("Cache hit ✓")
+
+    let results = cache.lookup("example.com", 1, 2000)
+    assert(results.unwrap().is_empty())
+    print("Cache expired ✓")
+
+    cache.evict_expired(2000)
+    assert(cache.len() == 0)
+    print("Cache eviction ✓")
+
+    print("DNS Resolver complete ✓")
+}
