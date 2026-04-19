@@ -1,0 +1,61 @@
+// graphql_server.ltl — Minimal GraphQL-style API
+// Run: lateralus run web-api/graphql_server.ltl
+
+use std.net.{HttpServer, Request, Response}
+use std.json
+
+struct User  { id: int, name: string, email: string }
+struct Post  { id: int, title: string, body: string, author_id: int }
+
+let users: [User] = [
+    User { id: 1, name: "Alice",   email: "alice@example.com" },
+    User { id: 2, name: "Bob",     email: "bob@example.com"   },
+]
+
+let posts: [Post] = [
+    Post { id: 1, title: "Hello Lateralus", body: "Pipeline-native is the way.", author_id: 1 },
+    Post { id: 2, title: "Functional Tips",  body: "Embrace the pipe operator.",  author_id: 2 },
+]
+
+fn resolve(query: string, variables: dict<string, json.Value>) -> json.Value {
+    match query.trim() {
+        q if q.starts_with("{ users") => {
+            let result = users |> map(u => json.object({
+                "id":    u.id,
+                "name":  u.name,
+                "email": u.email,
+                "posts": posts |> filter(p => p.author_id == u.id)
+                               |> map(p => json.object({"id": p.id, "title": p.title}))
+                               |> json.array(),
+            })) |> json.array()
+            json.object({"data": json.object({"users": result})})
+        },
+        q if q.starts_with("{ post") => {
+            let id = variables.get("id")?.as_int() ?? 0
+            match posts.find(p => p.id == id) {
+                none    => json.object({"errors": [{"message": "Not found"}]}),
+                some(p) => json.object({"data": json.object({
+                    "post": json.object({"id": p.id, "title": p.title, "body": p.body})
+                })}),
+            }
+        },
+        _ => json.object({"errors": [{"message": "Unknown query"}]}),
+    }
+}
+
+fn main() {
+    let server = HttpServer.bind("0.0.0.0:4000")
+    print("GraphQL-style API at http://localhost:4000/graphql")
+
+    server.post("/graphql", |req: Request| -> Response {
+        let body  = req.json()
+        let query = body["query"].as_string() ?? ""
+        let vars  = body["variables"].as_object() ?? {}
+        let result = resolve(query, vars)
+        Response.json(result)
+    })
+
+    server.run()
+}
+
+main()
