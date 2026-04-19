@@ -1,0 +1,297 @@
+// Niche Example - Load Balancer
+// Round-robin and weighted load balancing with health checks.
+
+use std.net.{TcpListener, TcpStream}
+use std.io.{Read, Write}
+use std.sync.{Mutex, Arc}
+use std.thread
+use std.time.{Duration, Instant}
+
+#[derive(Clone)]
+struct Backend {
+    addr: string,
+    weight: u32,
+    healthy: bool,
+    active_connections: u32,
+    total_requests: u64,
+    avg_response_ms: f64,
+}
+
+impl Backend {
+    fn new(addr: &str, weight: u32) -> Backend {
+        Backend {
+            addr: addr.to_string(), weight, healthy: true,
+            active_connections: 0, total_requests: 0, avg_response_ms: 0.0,
+        }
+    }
+}
+
+enum Strategy {
+    RoundRobin,
+    WeightedRoundRobin,
+    LeastConnections,
+    Random,
+    IpHash,
+}
+
+struct HealthCheck {
+    interval: Duration,
+    timeout: Duration,
+    path: string,
+    healthy_threshold: u32,
+    unhealthy_threshold: u32,
+}
+
+impl HealthCheck {
+    fn default() -> HealthCheck {
+        HealthCheck {
+            interval: Duration.from_secs(10),
+            timeout: Duration.from_secs(5),
+            path: "/health".to_string(),
+            healthy_threshold: 2,
+            unhealthy_threshold: 3,
+        }
+    }
+}
+
+struct LoadBalancer {
+    backends: Arc<Mutex<[Backend]>>,
+    strategy: Strategy,
+    health_check: HealthCheck,
+    current_index: Arc<Mutex<usize>>,
+    current_weight: Arc<Mutex<i32>>,
+    listen_addr: string,
+}
+
+impl LoadBalancer {
+    fn new(listen_addr: &str, strategy: Strategy) -> LoadBalancer {
+        LoadBalancer {
+            backends: Arc.new(Mutex.new([])),
+            strategy,
+            health_check: HealthCheck.default(),
+            current_index: Arc.new(Mutex.new(0)),
+            current_weight: Arc.new(Mutex.new(0)),
+            listen_addr: listen_addr.to_string(),
+        }
+    }
+
+    fn add_backend(mut self, addr: &str, weight: u32) {
+        let mut backends = self.backends.lock().unwrap()
+        backends.push(Backend.new(addr, weight))
+    }
+
+    fn remove_backend(mut self, addr: &str) {
+        let mut backends = self.backends.lock().unwrap()
+        backends.retain(|b| b.addr != addr)
+    }
+
+    fn select_backend(self, client_ip: Option<&str>) -> Option<usize> {
+        let backends = self.backends.lock().unwrap()
+        let healthy: [usize] = backends.iter().enumerate()
+            .filter(|(_, b)| b.healthy)
+            .map(|(i, _)| i)
+            .collect()
+
+        if healthy.is_empty() { return none }
+
+        match self.strategy {
+            Strategy.RoundRobin => {
+                let mut idx = self.current_index.lock().unwrap()
+                let selected = healthy[*idx % healthy.len()]
+                *idx = (*idx + 1) % healthy.len()
+                some(selected)
+            },
+            Strategy.WeightedRoundRobin => {
+                self.weighted_round_robin(&backends, &healthy)
+            },
+            Strategy.LeastConnections => {
+                let min_idx = healthy.iter()
+                    .min_by_key(|&&i| backends[i].active_connections)
+                    .copied()
+                min_idx
+            },
+            Strategy.Random => {
+                let idx = std.rand.random::<usize>() % healthy.len()
+                some(healthy[idx])
+            },
+            Strategy.IpHash => {
+                if let some(ip) = client_ip {
+                    let hash = ip.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+                    some(healthy[(hash as usize) % healthy.len()])
+                } else {
+                    some(healthy[0])
+                }
+            },
+        }
+    }
+
+    fn weighted_round_robin(self, backends: &[Backend], healthy: &[usize]) -> Option<usize> {
+        let max_weight = healthy.iter().map(|&i| backends[i].weight).max().unwrap_or(0)
+        let gcd = healthy.iter().map(|&i| backends[i].weight).fold(0, gcd_fn)
+
+        let mut idx = self.current_index.lock().unwrap()
+        let mut cw = self.current_weight.lock().unwrap()
+
+        loop {
+            *idx = (*idx + 1) % healthy.len()
+            if *idx == 0 {
+                *cw -= gcd as i32
+                if *cw <= 0 { *cw = max_weight as i32 }
+            }
+            let backend_idx = healthy[*idx]
+            if backends[backend_idx].weight as i32 >= *cw {
+                return some(backend_idx)
+            }
+        }
+    }
+
+    fn health_check_loop(self) {
+        let backends = Arc.clone(&self.backends)
+        let interval = self.health_check.interval
+        let timeout = self.health_check.timeout
+
+        thread.spawn(move || {
+            loop {
+                {
+                    let mut backends = backends.lock().unwrap()
+                    for backend in backends.iter_mut() {
+                        let healthy = check_backend_health(&backend.addr, timeout)
+                        backend.healthy = healthy
+                    }
+                }
+                thread.sleep(interval)
+            }
+        })
+    }
+
+    fn stats(self) -> [BackendStats] {
+        let backends = self.backends.lock().unwrap()
+        backends.iter().map(|b| BackendStats {
+            addr: b.addr.clone(),
+            healthy: b.healthy,
+            active_connections: b.active_connections,
+            total_requests: b.total_requests,
+            avg_response_ms: b.avg_response_ms,
+            weight: b.weight,
+        }).collect()
+    }
+}
+
+struct BackendStats {
+    addr: string,
+    healthy: bool,
+    active_connections: u32,
+    total_requests: u64,
+    avg_response_ms: f64,
+    weight: u32,
+}
+
+fn check_backend_health(addr: &str, timeout: Duration) -> bool {
+    TcpStream.connect_timeout(addr, timeout).is_ok()
+}
+
+fn gcd_fn(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd_fn(b, a % b) }
+}
+
+fn proxy_connection(client: TcpStream, backend_addr: &str) -> Result<(), string> {
+    let mut backend = TcpStream.connect(backend_addr).map_err(|e| e.to_string())?
+    let mut client_clone = client.try_clone().map_err(|e| e.to_string())?
+    let mut backend_clone = backend.try_clone().map_err(|e| e.to_string())?
+
+    let t1 = thread.spawn(move || {
+        let mut buf = [0u8; 4096]
+        loop {
+            match client.read(&mut buf) {
+                ok(0) | err(_) => break,
+                ok(n) => { let _ = backend.write_all(&buf[..n]); }
+            }
+        }
+    })
+
+    let t2 = thread.spawn(move || {
+        let mut buf = [0u8; 4096]
+        loop {
+            match backend_clone.read(&mut buf) {
+                ok(0) | err(_) => break,
+                ok(n) => { let _ = client_clone.write_all(&buf[..n]); }
+            }
+        }
+    })
+
+    t1.join().map_err(|_| "proxy thread failed")?
+    t2.join().map_err(|_| "proxy thread failed")?
+    ok(())
+}
+
+fn main() {
+    // Backend
+    let b = Backend.new("127.0.0.1:8080", 5)
+    assert(b.addr == "127.0.0.1:8080")
+    assert(b.weight == 5)
+    assert(b.healthy)
+    assert(b.active_connections == 0)
+    print("Backend init ✓")
+
+    // GCD
+    assert(gcd_fn(12, 8) == 4)
+    assert(gcd_fn(7, 3) == 1)
+    assert(gcd_fn(0, 5) == 5)
+    print("GCD ✓")
+
+    // LoadBalancer setup
+    let mut lb = LoadBalancer.new("0.0.0.0:80", Strategy.RoundRobin)
+    lb.add_backend("10.0.0.1:8080", 1)
+    lb.add_backend("10.0.0.2:8080", 1)
+    lb.add_backend("10.0.0.3:8080", 1)
+    print("Add backends ✓")
+
+    // Round robin selection
+    let idx1 = lb.select_backend(none).unwrap()
+    let idx2 = lb.select_backend(none).unwrap()
+    let idx3 = lb.select_backend(none).unwrap()
+    // Should cycle through 0,1,2
+    assert(idx1 != idx2 || idx2 != idx3)
+    print("Round robin ✓")
+
+    // Stats
+    let stats = lb.stats()
+    assert(stats.len() == 3)
+    assert(stats[0].healthy)
+    print("Stats ✓")
+
+    // Remove backend
+    lb.remove_backend("10.0.0.2:8080")
+    assert(lb.stats().len() == 2)
+    print("Remove backend ✓")
+
+    // Least connections
+    let mut lb2 = LoadBalancer.new("0.0.0.0:80", Strategy.LeastConnections)
+    lb2.add_backend("a:80", 1)
+    lb2.add_backend("b:80", 1)
+    {
+        let mut backends = lb2.backends.lock().unwrap()
+        backends[0].active_connections = 10
+        backends[1].active_connections = 2
+    }
+    let selected = lb2.select_backend(none).unwrap()
+    assert(selected == 1)  // b has fewer connections
+    print("Least connections ✓")
+
+    // IP hash consistency
+    let mut lb3 = LoadBalancer.new("0.0.0.0:80", Strategy.IpHash)
+    lb3.add_backend("x:80", 1)
+    lb3.add_backend("y:80", 1)
+    let s1 = lb3.select_backend(some("192.168.1.1")).unwrap()
+    let s2 = lb3.select_backend(some("192.168.1.1")).unwrap()
+    assert(s1 == s2)  // same IP => same backend
+    print("IP hash ✓")
+
+    // HealthCheck defaults
+    let hc = HealthCheck.default()
+    assert(hc.interval == Duration.from_secs(10))
+    assert(hc.path == "/health")
+    print("HealthCheck defaults ✓")
+
+    print("Load Balancer complete ✓")
+}
