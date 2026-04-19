@@ -1,0 +1,337 @@
+// Niche Example - Graph Algorithms
+// BFS, DFS, Dijkstra, Bellman-Ford, Kruskal MST, topological sort, SCC (Tarjan).
+
+use std.collections.{HashMap, HashSet, BinaryHeap}
+
+struct Graph<V: Eq + Hash + Clone, W: Copy + Add + PartialOrd + Default> {
+    adjacency: HashMap<V, [(V, W)]>,
+    directed: bool,
+}
+
+impl<V: Eq + Hash + Clone, W: Copy + Add + PartialOrd + Default> Graph<V, W> {
+    fn new(directed: bool) -> Graph<V, W> {
+        Graph { adjacency: HashMap.new(), directed }
+    }
+
+    fn add_vertex(mut self, v: V) {
+        self.adjacency.entry(v).or_insert_with(|| [])
+    }
+
+    fn add_edge(mut self, from: V, to: V, weight: W) {
+        self.adjacency.entry(from.clone()).or_insert_with(|| []).push((to.clone(), weight))
+        if !self.directed {
+            self.adjacency.entry(to).or_insert_with(|| []).push((from, weight))
+        } else {
+            self.add_vertex(to)
+        }
+    }
+
+    fn vertices(self) -> [&V] { self.adjacency.keys().collect() }
+    fn vertex_count(self) -> usize { self.adjacency.len() }
+
+    fn neighbors(self, v: &V) -> &[(V, W)] {
+        self.adjacency.get(v).map(|n| n.as_slice()).unwrap_or(&[])
+    }
+
+    fn edges(self) -> [(V, V, W)] {
+        let mut result: [(V, V, W)] = []
+        for (from, neighbors) in &self.adjacency {
+            for (to, w) in neighbors {
+                result.push((from.clone(), to.clone(), *w))
+            }
+        }
+        result
+    }
+}
+
+// BFS
+fn bfs<V: Eq + Hash + Clone>(graph: &Graph<V, impl Copy>, start: &V) -> [V] {
+    let mut visited = HashSet.new()
+    let mut queue: [V] = [start.clone()]
+    let mut order: [V] = []
+    visited.insert(start.clone())
+
+    while !queue.is_empty() {
+        let current = queue.remove(0)
+        order.push(current.clone())
+        for (neighbor, _) in graph.neighbors(&current) {
+            if !visited.contains(neighbor) {
+                visited.insert(neighbor.clone())
+                queue.push(neighbor.clone())
+            }
+        }
+    }
+    order
+}
+
+// DFS
+fn dfs<V: Eq + Hash + Clone>(graph: &Graph<V, impl Copy>, start: &V) -> [V] {
+    let mut visited = HashSet.new()
+    let mut stack: [V] = [start.clone()]
+    let mut order: [V] = []
+
+    while !stack.is_empty() {
+        let current = stack.pop().unwrap()
+        if visited.contains(&current) { continue }
+        visited.insert(current.clone())
+        order.push(current.clone())
+        for (neighbor, _) in graph.neighbors(&current).iter().rev() {
+            if !visited.contains(neighbor) { stack.push(neighbor.clone()) }
+        }
+    }
+    order
+}
+
+// Dijkstra
+struct DijkstraResult<V> {
+    distances: HashMap<V, f64>,
+    predecessors: HashMap<V, V>,
+}
+
+fn dijkstra<V: Eq + Hash + Clone>(graph: &Graph<V, f64>, source: &V) -> DijkstraResult<V> {
+    let mut dist: HashMap<V, f64> = HashMap.new()
+    let mut pred: HashMap<V, V> = HashMap.new()
+    let mut heap = BinaryHeap.new()
+
+    dist.insert(source.clone(), 0.0)
+    heap.push((-0.0, source.clone()))  // min-heap via negation
+
+    while let some((neg_d, u)) = heap.pop() {
+        let d = -neg_d
+        if let some(&best) = dist.get(&u) { if d > best { continue } }
+
+        for (v, w) in graph.neighbors(&u) {
+            let new_dist = d + *w
+            let current = dist.get(v).copied().unwrap_or(f64.INFINITY)
+            if new_dist < current {
+                dist.insert(v.clone(), new_dist)
+                pred.insert(v.clone(), u.clone())
+                heap.push((-new_dist, v.clone()))
+            }
+        }
+    }
+    DijkstraResult { distances: dist, predecessors: pred }
+}
+
+fn shortest_path<V: Eq + Hash + Clone>(result: &DijkstraResult<V>, target: &V) -> Option<[V]> {
+    if !result.distances.contains_key(target) { return none }
+    let mut path = [target.clone()]
+    let mut current = target
+    while let some(pred) = result.predecessors.get(current) {
+        path.push(pred.clone())
+        current = pred
+    }
+    path.reverse()
+    some(path)
+}
+
+// Bellman-Ford
+fn bellman_ford<V: Eq + Hash + Clone>(graph: &Graph<V, f64>, source: &V) -> Result<HashMap<V, f64>, string> {
+    let mut dist: HashMap<V, f64> = HashMap.new()
+    for v in graph.vertices() { dist.insert(v.clone(), f64.INFINITY) }
+    dist.insert(source.clone(), 0.0)
+
+    let edges = graph.edges()
+    let n = graph.vertex_count()
+
+    for _ in 0..n - 1 {
+        for (u, v, w) in &edges {
+            let du = dist.get(u).copied().unwrap_or(f64.INFINITY)
+            let dv = dist.get(v).copied().unwrap_or(f64.INFINITY)
+            if du + w < dv { dist.insert(v.clone(), du + w) }
+        }
+    }
+
+    // Check negative cycles
+    for (u, v, w) in &edges {
+        let du = dist.get(u).copied().unwrap_or(f64.INFINITY)
+        let dv = dist.get(v).copied().unwrap_or(f64.INFINITY)
+        if du + w < dv { return err("negative cycle detected".to_string()) }
+    }
+    ok(dist)
+}
+
+// Kruskal MST
+struct UnionFind {
+    parent: [usize],
+    rank: [usize],
+}
+
+impl UnionFind {
+    fn new(n: usize) -> UnionFind {
+        UnionFind { parent: (0..n).collect(), rank: [0; n] }
+    }
+    fn find(mut self, x: usize) -> usize {
+        if self.parent[x] != x { self.parent[x] = self.find(self.parent[x]) }
+        self.parent[x]
+    }
+    fn union(mut self, x: usize, y: usize) -> bool {
+        let rx = self.find(x); let ry = self.find(y)
+        if rx == ry { return false }
+        if self.rank[rx] < self.rank[ry] { self.parent[rx] = ry }
+        else if self.rank[rx] > self.rank[ry] { self.parent[ry] = rx }
+        else { self.parent[ry] = rx; self.rank[rx] += 1 }
+        true
+    }
+}
+
+fn kruskal(n: usize, edges: &mut [(usize, usize, f64)]) -> [(usize, usize, f64)] {
+    edges.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+    let mut uf = UnionFind.new(n)
+    let mut mst: [(usize, usize, f64)] = []
+    for (u, v, w) in edges {
+        if uf.union(*u, *v) { mst.push((*u, *v, *w)) }
+    }
+    mst
+}
+
+// Topological sort (Kahn's algorithm)
+fn topological_sort<V: Eq + Hash + Clone>(graph: &Graph<V, impl Copy>) -> Result<[V], string> {
+    let mut in_degree: HashMap<V, usize> = HashMap.new()
+    for v in graph.vertices() { in_degree.insert(v.clone(), 0) }
+    for (_, neighbors) in &graph.adjacency {
+        for (to, _) in neighbors {
+            *in_degree.entry(to.clone()).or_insert(0) += 1
+        }
+    }
+
+    let mut queue: [V] = in_degree.iter()
+        .filter(|(_, &d)| d == 0).map(|(v, _)| v.clone()).collect()
+    let mut order: [V] = []
+
+    while !queue.is_empty() {
+        let v = queue.remove(0)
+        order.push(v.clone())
+        for (neighbor, _) in graph.neighbors(&v) {
+            let d = in_degree.get_mut(neighbor).unwrap()
+            *d -= 1
+            if *d == 0 { queue.push(neighbor.clone()) }
+        }
+    }
+
+    if order.len() != graph.vertex_count() { err("cycle detected".to_string()) }
+    else { ok(order) }
+}
+
+// Tarjan SCC
+fn tarjan_scc<V: Eq + Hash + Clone>(graph: &Graph<V, impl Copy>) -> [[V]] {
+    let mut index_counter = 0usize
+    let mut stack: [V] = []
+    let mut on_stack = HashSet.new()
+    let mut indices: HashMap<V, usize> = HashMap.new()
+    let mut lowlinks: HashMap<V, usize> = HashMap.new()
+    let mut result: [[V]] = []
+
+    fn strongconnect<V: Eq + Hash + Clone>(
+        v: &V, graph: &Graph<V, impl Copy>,
+        index_counter: &mut usize, stack: &mut [V], on_stack: &mut HashSet<V>,
+        indices: &mut HashMap<V, usize>, lowlinks: &mut HashMap<V, usize>,
+        result: &mut [[V]],
+    ) {
+        indices.insert(v.clone(), *index_counter)
+        lowlinks.insert(v.clone(), *index_counter)
+        *index_counter += 1
+        stack.push(v.clone())
+        on_stack.insert(v.clone())
+
+        for (w, _) in graph.neighbors(v) {
+            if !indices.contains_key(w) {
+                strongconnect(w, graph, index_counter, stack, on_stack, indices, lowlinks, result)
+                let wl = *lowlinks.get(w).unwrap()
+                let vl = lowlinks.get_mut(v).unwrap()
+                if wl < *vl { *vl = wl }
+            } else if on_stack.contains(w) {
+                let wi = *indices.get(w).unwrap()
+                let vl = lowlinks.get_mut(v).unwrap()
+                if wi < *vl { *vl = wi }
+            }
+        }
+
+        if lowlinks.get(v) == indices.get(v) {
+            let mut component: [V] = []
+            loop {
+                let w = stack.pop().unwrap()
+                on_stack.remove(&w)
+                component.push(w.clone())
+                if &w == v { break }
+            }
+            result.push(component)
+        }
+    }
+
+    for v in graph.vertices() {
+        if !indices.contains_key(v) {
+            strongconnect(v, graph, &mut index_counter, &mut stack, &mut on_stack,
+                &mut indices, &mut lowlinks, &mut result)
+        }
+    }
+    result
+}
+
+fn main() {
+    // BFS / DFS
+    let mut g = Graph::<string, f64>.new(false)
+    g.add_edge("A".into(), "B".into(), 1.0)
+    g.add_edge("A".into(), "C".into(), 1.0)
+    g.add_edge("B".into(), "D".into(), 1.0)
+    g.add_edge("C".into(), "D".into(), 1.0)
+
+    let bfs_order = bfs(&g, &"A".into())
+    assert(bfs_order[0] == "A")
+    assert(bfs_order.len() == 4)
+    print("BFS \u2713")
+
+    let dfs_order = dfs(&g, &"A".into())
+    assert(dfs_order[0] == "A")
+    assert(dfs_order.len() == 4)
+    print("DFS \u2713")
+
+    // Dijkstra
+    let mut wg = Graph::<string, f64>.new(true)
+    wg.add_edge("A".into(), "B".into(), 1.0)
+    wg.add_edge("A".into(), "C".into(), 4.0)
+    wg.add_edge("B".into(), "C".into(), 2.0)
+    wg.add_edge("B".into(), "D".into(), 5.0)
+    wg.add_edge("C".into(), "D".into(), 1.0)
+
+    let result = dijkstra(&wg, &"A".into())
+    assert(*result.distances.get(&"D".into()).unwrap() == 4.0)  // A->B->C->D
+    let path = shortest_path(&result, &"D".into()).unwrap()
+    assert(path == ["A".into(), "B".into(), "C".into(), "D".into()])
+    print("Dijkstra \u2713")
+
+    // Bellman-Ford
+    let bf_dist = bellman_ford(&wg, &"A".into()).unwrap()
+    assert(*bf_dist.get(&"D".into()).unwrap() == 4.0)
+    print("Bellman-Ford \u2713")
+
+    // Kruskal MST
+    let mut edges = [(0, 1, 1.0), (0, 2, 4.0), (1, 2, 2.0), (1, 3, 5.0), (2, 3, 1.0)]
+    let mst = kruskal(4, &mut edges)
+    let total_weight: f64 = mst.iter().map(|(_, _, w)| *w).sum()
+    assert(total_weight == 4.0)  // 1 + 2 + 1
+    print("Kruskal MST \u2713")
+
+    // Topological sort
+    let mut dag = Graph::<string, f64>.new(true)
+    dag.add_edge("A".into(), "B".into(), 1.0)
+    dag.add_edge("A".into(), "C".into(), 1.0)
+    dag.add_edge("B".into(), "D".into(), 1.0)
+    dag.add_edge("C".into(), "D".into(), 1.0)
+    let topo = topological_sort(&dag).unwrap()
+    assert(topo[0] == "A")
+    assert(topo[3] == "D")
+    print("Topological sort \u2713")
+
+    // Tarjan SCC
+    let mut dg = Graph::<string, f64>.new(true)
+    dg.add_edge("A".into(), "B".into(), 1.0)
+    dg.add_edge("B".into(), "C".into(), 1.0)
+    dg.add_edge("C".into(), "A".into(), 1.0)
+    dg.add_edge("C".into(), "D".into(), 1.0)
+    let sccs = tarjan_scc(&dg)
+    assert(sccs.iter().any(|scc| scc.len() == 3))  // A-B-C cycle
+    print("Tarjan SCC \u2713")
+
+    print("Graph Algorithms complete \u2713")
+}
