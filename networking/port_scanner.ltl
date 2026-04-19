@@ -1,0 +1,43 @@
+// port_scanner.ltl — Concurrent TCP port scanner
+// Run: lateralus run networking/port_scanner.ltl <host> [start_port] [end_port]
+
+use std.net.TcpStream
+use std.async.{parallel_map, timeout}
+use std.time.Duration
+
+async fn probe(host: string, port: int) -> (int, bool) {
+    let result = TcpStream.connect("${host}:${port}")
+        |> timeout(Duration.ms(500))
+        |> await
+    (port, result.is_ok())
+}
+
+async fn scan(host: string, start: int, end_port: int) -> [int] {
+    let ports = range(start, end_port + 1) |> collect()
+
+    let results = parallel_map(ports, |p| probe(host.clone(), p)) |> await
+
+    results
+        |> filter(|(_, open)| open)
+        |> map(|(port, _)| port)
+        |> collect()
+}
+
+async fn main() {
+    let args       = env.args()
+    let host       = args.get(1) ?? "127.0.0.1"
+    let start      = args.get(2)?.parse_int() ?? 1
+    let end_port   = args.get(3)?.parse_int() ?? 1024
+
+    print("Scanning ${host} ports ${start}-${end_port}...")
+    let open = await scan(host, start, end_port)
+
+    if open.is_empty() {
+        print("No open ports found.")
+    } else {
+        print("Open ports:")
+        open |> each(p => print("  ${p}/tcp  open"))
+    }
+}
+
+main()
