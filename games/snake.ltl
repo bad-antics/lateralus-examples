@@ -1,0 +1,107 @@
+// snake.ltl — Terminal snake game
+// Run: lateralus run games/snake.ltl
+
+use std.terminal.{clear, cursor, hide_cursor, show_cursor, raw_mode}
+use std.io.{stdin, Key}
+use std.time.{sleep, Duration}
+use std.rand
+
+const WIDTH  = 40
+const HEIGHT = 20
+
+enum Dir { Up, Down, Left, Right }
+
+struct Point { x: int, y: int }
+
+impl Point {
+    fn eq(self, other: Point) -> bool { self.x == other.x && self.y == other.y }
+    fn next(self, dir: Dir) -> Point {
+        match dir {
+            Dir.Up    => Point { x: self.x,     y: self.y - 1 },
+            Dir.Down  => Point { x: self.x,     y: self.y + 1 },
+            Dir.Left  => Point { x: self.x - 1, y: self.y },
+            Dir.Right => Point { x: self.x + 1, y: self.y },
+        }
+    }
+    fn wrap(self) -> Point {
+        Point {
+            x: (self.x + WIDTH)  % WIDTH,
+            y: (self.y + HEIGHT) % HEIGHT,
+        }
+    }
+}
+
+fn random_food(snake: [Point]) -> Point {
+    loop {
+        let p = Point { x: rand.int(0, WIDTH), y: rand.int(0, HEIGHT) }
+        if !snake.any(|s| s.eq(p)) { return p }
+    }
+}
+
+fn draw(snake: [Point], food: Point, score: int) {
+    clear()
+    cursor(0, 0)
+    print("Score: ${score}  (q to quit)")
+
+    // border
+    print("+" + "-".repeat(WIDTH) + "+")
+    for y in range(0, HEIGHT) {
+        mut row = "|"
+        for x in range(0, WIDTH) {
+            let p = Point { x, y }
+            row += if snake[0].eq(p)             { "@" }
+                   else if snake.any(|s| s.eq(p)) { "o" }
+                   else if food.eq(p)             { "*" }
+                   else                           { " " }
+        }
+        print(row + "|")
+    }
+    print("+" + "-".repeat(WIDTH) + "+")
+}
+
+fn main() {
+    hide_cursor()
+    raw_mode(true)
+
+    mut snake = [Point { x: WIDTH / 2, y: HEIGHT / 2 }]
+    mut dir   = Dir.Right
+    mut food  = random_food(snake)
+    mut score = 0
+    mut running = true
+
+    while running {
+        // Non-blocking input
+        match stdin.try_read_key() {
+            some(Key.Char('w')) | some(Key.Up)    => dir = Dir.Up,
+            some(Key.Char('s')) | some(Key.Down)  => dir = Dir.Down,
+            some(Key.Char('a')) | some(Key.Left)  => dir = Dir.Left,
+            some(Key.Char('d')) | some(Key.Right) => dir = Dir.Right,
+            some(Key.Char('q'))                    => running = false,
+            _                                      => {},
+        }
+
+        let head = snake[0].next(dir).wrap()
+
+        if snake.any(|s| s.eq(head)) {
+            print("
+Game over! Score: ${score}")
+            break
+        }
+
+        snake.insert(0, head)
+        if head.eq(food) {
+            score += 10
+            food = random_food(snake)
+        } else {
+            snake.pop()
+        }
+
+        draw(snake, food, score)
+        sleep(Duration.ms(100))
+    }
+
+    raw_mode(false)
+    show_cursor()
+}
+
+main()
