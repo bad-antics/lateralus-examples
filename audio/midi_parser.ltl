@@ -1,0 +1,196 @@
+// midi_parser.ltl — Parse Standard MIDI File (SMF) format
+
+struct MidiFile {
+    format:   u16,
+    tracks:   int,
+    division: u16,    // ticks per quarter note
+    events:   [[MidiEvent]],
+}
+
+enum MidiEvent {
+    NoteOn  { channel: u8, note: u8, velocity: u8 },
+    NoteOff { channel: u8, note: u8, velocity: u8 },
+    ProgramChange { channel: u8, program: u8 },
+    ControlChange { channel: u8, controller: u8, value: u8 },
+    SysEx([u8]),
+    Tempo(u32),       // microseconds per beat
+    TimeSignature { num: u8, den: u8, clocks: u8, notes_32: u8 },
+    KeySignature { sharps: i8, minor: bool },
+    TrackName(string),
+    EndOfTrack,
+    Unknown { status: u8, data: [u8] },
+}
+
+struct MidiReader { data: [u8], pos: int }
+
+impl MidiReader {
+    fn new(data: [u8]) -> MidiReader { MidiReader { data, pos: 0 } }
+
+    fn read_u8(mut self) -> Result<u8, string> {
+        if self.pos >= self.data.len() { return err("unexpected EOF") }
+        let b = self.data[self.pos]
+        self.pos += 1
+        ok(b)
+    }
+
+    fn read_u16_be(mut self) -> Result<u16, string> {
+        let hi = self.read_u8()? as u16
+        let lo = self.read_u8()? as u16
+        ok((hi << 8) | lo)
+    }
+
+    fn read_u32_be(mut self) -> Result<u32, string> {
+        let a = self.read_u8()? as u32
+        let b = self.read_u8()? as u32
+        let c = self.read_u8()? as u32
+        let d = self.read_u8()? as u32
+        ok((a << 24) | (b << 16) | (c << 8) | d)
+    }
+
+    fn read_bytes(mut self, n: int) -> Result<[u8], string> {
+        if self.pos + n > self.data.len() { return err("not enough bytes") }
+        let out = self.data[self.pos..self.pos+n].to_vec()
+        self.pos += n
+        ok(out)
+    }
+
+    fn read_varlen(mut self) -> Result<u32, string> {
+        let mut val = 0u32
+        for _ in range(0, 4) {
+            let b = self.read_u8()?
+            val = (val << 7) | (b & 0x7f) as u32
+            if (b & 0x80) == 0 { return ok(val) }
+        }
+        err("variable-length int too long")
+    }
+
+    fn read_string(mut self, n: int) -> Result<string, string> {
+        self.read_bytes(n).map(|b| string.from_utf8_lossy(&b).to_string())
+    }
+
+    fn read_chunk_header(mut self) -> Result<(string, u32), string> {
+        let tag  = self.read_string(4)?
+        let size = self.read_u32_be()?
+        ok((tag, size))
+    }
+
+    fn parse_event(mut self, running_status: &mut u8) -> Result<(u32, MidiEvent), string> {
+        let delta = self.read_varlen()?
+        let first = self.read_u8()?
+
+        let status = if first & 0x80 != 0 { *running_status = first; first } else { *running_status }
+        let kind = (status & 0xf0) >> 4
+        let ch   = status & 0x0f
+        let data1 = if first & 0x80 != 0 { self.read_u8()? } else { first }
+
+        let event = match kind {
+            0x9 => {
+                let vel = self.read_u8()?
+                if vel == 0 { MidiEvent.NoteOff { channel: ch, note: data1, velocity: 0 } }
+                else { MidiEvent.NoteOn  { channel: ch, note: data1, velocity: vel } }
+            }
+            0x8 => MidiEvent.NoteOff { channel: ch, note: data1, velocity: self.read_u8()? },
+            0xb => MidiEvent.ControlChange { channel: ch, controller: data1, value: self.read_u8()? },
+            0xc => MidiEvent.ProgramChange { channel: ch, program: data1 },
+            0xf => {
+                if status == 0xff {   // meta-event
+                    let meta_type = data1
+                    let meta_len  = self.read_varlen()? as int
+                    let meta_data = self.read_bytes(meta_len)?
+                    match meta_type {
+                        0x51 => MidiEvent.Tempo((meta_data[0] as u32) << 16 | (meta_data[1] as u32) << 8 | meta_data[2] as u32),
+                        0x03 => MidiEvent.TrackName(string.from_utf8_lossy(&meta_data).to_string()),
+                        0x58 => MidiEvent.TimeSignature { num: meta_data[0], den: 1 << meta_data[1], clocks: meta_data[2], notes_32: meta_data[3] },
+                        0x59 => MidiEvent.KeySignature { sharps: meta_data[0] as i8, minor: meta_data[1] != 0 },
+                        0x2f => MidiEvent.EndOfTrack,
+                        _    => MidiEvent.Unknown { status, data: meta_data },
+                    }
+                } else if status == 0xf0 {
+                    let len = self.read_varlen()? as int
+                    MidiEvent.SysEx(self.read_bytes(len)?)
+                } else {
+                    MidiEvent.Unknown { status, data: [] }
+                }
+            }
+            _ => MidiEvent.Unknown { status, data: [data1] }
+        }
+        ok((delta, event))
+    }
+
+    fn parse_track(mut self) -> Result<[MidiEvent], string> {
+        let (tag, size) = self.read_chunk_header()?
+        if tag != "MTrk" { return err("expected MTrk, got ${tag}") }
+        let end = self.pos + size as int
+        let mut events = []
+        let mut running: u8 = 0
+        while self.pos < end {
+            let (_, event) = self.parse_event(&mut running)?
+            events.push(event)
+        }
+        ok(events)
+    }
+
+    fn parse(mut self) -> Result<MidiFile, string> {
+        let (tag, _) = self.read_chunk_header()?
+        if tag != "MThd" { return err("not a MIDI file") }
+        let format   = self.read_u16_be()?
+        let n_tracks = self.read_u16_be()?
+        let division = self.read_u16_be()?
+        let mut tracks = []
+        for _ in range(0, n_tracks as int) {
+            tracks.push(self.parse_track()?)
+        }
+        ok(MidiFile { format, tracks: n_tracks as int, division, events: tracks })
+    }
+}
+
+fn note_name(note: u8) -> string {
+    let names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+    let octave = (note / 12) as int - 1
+    "${names[(note % 12) as int]}${octave}"
+}
+
+fn print_summary(midi: MidiFile) {
+    print("MIDI format ${midi.format}, ${midi.tracks} track(s), division=${midi.division}")
+    for (i, track) in midi.events |> enumerate() {
+        let notes = track |> filter(|e| matches!(e, MidiEvent.NoteOn { velocity: v, .. } if v > 0)) |> collect()
+        let name  = track |> find_map(|e| match e { MidiEvent.TrackName(n) => some(n), _ => none }) ?? "<unnamed>"
+        print("  Track ${i}: "${name}" — ${notes.len()} note-on events")
+    }
+}
+
+fn main() {
+    // Build a minimal valid MIDI file in memory for testing
+    let header: [u8] = [
+        0x4d,0x54,0x68,0x64, 0x00,0x00,0x00,0x06, // MThd length=6
+        0x00,0x01,            // format 1
+        0x00,0x01,            // 1 track
+        0x01,0xe0,            // 480 ticks/beat
+    ]
+    let track_events: [u8] = [
+        0x00, 0xff, 0x03, 0x05, 0x50,0x69,0x61,0x6e,0x6f,  // delta=0 TrackName "Piano"
+        0x00, 0x90, 0x3c, 0x7f,  // delta=0 NoteOn ch0 C4 vel=127
+        0x78, 0x80, 0x3c, 0x00,  // delta=120 NoteOff ch0 C4
+        0x00, 0xff, 0x2f, 0x00,  // EndOfTrack
+    ]
+    let track_len = track_events.len() as u32
+    let track_header: [u8] = [
+        0x4d,0x54,0x72,0x6b,
+        (track_len >> 24) as u8, (track_len >> 16) as u8,
+        (track_len >>  8) as u8,  track_len as u8,
+    ]
+    let midi_data = [...header, ...track_header, ...track_events]
+
+    let midi = MidiReader.new(midi_data).parse().expect("parse error")
+    assert(midi.format == 1)
+    assert(midi.tracks == 1)
+    assert(midi.division == 480)
+    print_summary(midi.clone())
+
+    let notes: [MidiEvent] = midi.events[0] |> filter(|e| matches!(e, MidiEvent.NoteOn { .. })) |> collect()
+    assert(notes.len() == 1)
+    if let MidiEvent.NoteOn { note, .. } = notes[0] {
+        print("First note: ${note_name(note)} ✓")
+    }
+    print("MIDI parser — all assertions passed ✓")
+}
