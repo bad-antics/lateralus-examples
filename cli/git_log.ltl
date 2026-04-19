@@ -1,0 +1,71 @@
+// git_log.ltl — Pretty-print git log with pipeline transforms
+// Run: lateralus run cli/git_log.ltl
+
+use std.process.Command
+use std.time.DateTime
+
+struct Commit {
+    hash:    string,
+    author:  string,
+    date:    DateTime,
+    message: string,
+    files:   int,
+}
+
+fn parse_commits(raw: string) -> [Commit] {
+    raw.split("
+--commit--
+")
+        |> filter(s => !s.trim().is_empty())
+        |> filter_map(block => {
+            let lines = block.trim().lines() |> collect()
+            if lines.len() < 4 { return none }
+            let files = lines.last()?.parse_int().unwrap_or(0)
+            some(Commit {
+                hash:    lines[0].trim().to_string(),
+                author:  lines[1].trim().to_string(),
+                date:    DateTime.parse_rfc2822(lines[2].trim()).ok()?,
+                message: lines[3].trim().to_string(),
+                files,
+            })
+        })
+        |> collect()
+}
+
+fn format_commit(c: Commit, now: DateTime) -> string {
+    let age = now.diff(c.date)
+    let ago = match age.days() {
+        0 => "today",
+        1 => "yesterday",
+        d if d < 7  => "${d} days ago",
+        d if d < 30 => "${d / 7} weeks ago",
+        d           => "${d / 30} months ago",
+    }
+    let hash_short = c.hash[..7]
+    let files_label = if c.files == 1 { "1 file" } else { "${c.files} files" }
+    "\e[33m${hash_short}\e[0m  \e[2m${ago} · ${files_label}\e[0m
+  ${c.message}
+  \e[36m${c.author}\e[0m"
+}
+
+fn main() {
+    let output = Command.run("git", ["log", "--format=%H%n%an%n%aD%n%s%n--commit--", "--numstat"])
+        .expect("Not a git repo")
+        .stdout
+
+    let now     = DateTime.now()
+    let commits = parse_commits(output)
+
+    let limit = env.args().get(1)?.parse_int().unwrap_or(10)
+
+    print("\e[1mLast ${limit} commits\e[0m
+")
+    commits
+        |> take(limit)
+        |> each(c => print(format_commit(c, now)))
+
+    print("
+\e[2m${commits.len()} total commits\e[0m")
+}
+
+main()
