@@ -1,0 +1,25 @@
+// Project Euler #3 — Largest prime factor of 600_851_475_143
+// Run: lateralus run challenges/euler_003.ltl
+
+fn largest_prime_factor(mut n: int) -> int {
+    mut factor = 2
+    mut largest = 1
+    while factor * factor <= n {
+        while n % factor == 0 {
+            largest = factor
+            n /= factor
+        }
+        factor += 1
+    }
+    if n > 1 { n } else { largest }
+}
+
+fn main() {
+    let n = 600_851_475_143
+    let result = largest_prime_factor(n)
+    print("Largest prime factor of ${n}: ${result}")
+    assert_eq(result, 6857)
+    print("✓ Correct!")
+}
+
+main()
