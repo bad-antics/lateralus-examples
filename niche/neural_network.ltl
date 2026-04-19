@@ -1,0 +1,301 @@
+// Niche Example — Neural Network from Scratch
+// Dense feedforward network with backpropagation, SGD, and ReLU/softmax.
+
+use std.math.{exp, sqrt, ln}
+
+// ── Tensor (2D matrix) ──────────────────────────────────────────────────────
+struct Matrix {
+    data: [f64],
+    rows: usize,
+    cols: usize,
+}
+
+impl Matrix {
+    fn zeros(rows: usize, cols: usize) -> Matrix {
+        Matrix { data: vec![0.0; rows * cols], rows, cols }
+    }
+
+    fn random(rows: usize, cols: usize, scale: f64) -> Matrix {
+        // Xavier initialization
+        let mut data = vec![0.0; rows * cols]
+        let mut seed: u64 = 42
+        for i in 0..data.len() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1)
+            let u = (seed >> 33) as f64 / (1u64 << 31) as f64
+            data[i] = (u * 2.0 - 1.0) * scale
+        }
+        Matrix { data, rows, cols }
+    }
+
+    fn get(self, r: usize, c: usize) -> f64 { self.data[r * self.cols + c] }
+    fn set(mut self, r: usize, c: usize, v: f64) { self.data[r * self.cols + c] = v }
+
+    fn matmul(self, other: &Matrix) -> Matrix {
+        assert(self.cols == other.rows, "dimension mismatch")
+        let mut result = Matrix.zeros(self.rows, other.cols)
+        for i in 0..self.rows {
+            for k in 0..self.cols {
+                let a = self.get(i, k)
+                for j in 0..other.cols {
+                    let old = result.get(i, j)
+                    result.set(i, j, old + a * other.get(k, j))
+                }
+            }
+        }
+        result
+    }
+
+    fn transpose(self) -> Matrix {
+        let mut result = Matrix.zeros(self.cols, self.rows)
+        for i in 0..self.rows {
+            for j in 0..self.cols { result.set(j, i, self.get(i, j)) }
+        }
+        result
+    }
+
+    fn add(self, other: &Matrix) -> Matrix {
+        assert(self.rows == other.rows && self.cols == other.cols)
+        let data: [f64] = self.data.iter().zip(&other.data).map(|(a, b)| a + b).collect()
+        Matrix { data, rows: self.rows, cols: self.cols }
+    }
+
+    fn sub(self, other: &Matrix) -> Matrix {
+        let data: [f64] = self.data.iter().zip(&other.data).map(|(a, b)| a - b).collect()
+        Matrix { data, rows: self.rows, cols: self.cols }
+    }
+
+    fn scale(self, s: f64) -> Matrix {
+        let data: [f64] = self.data.iter().map(|x| x * s).collect()
+        Matrix { data, rows: self.rows, cols: self.cols }
+    }
+
+    fn hadamard(self, other: &Matrix) -> Matrix {
+        let data: [f64] = self.data.iter().zip(&other.data).map(|(a, b)| a * b).collect()
+        Matrix { data, rows: self.rows, cols: self.cols }
+    }
+
+    fn add_bias(self, bias: &Matrix) -> Matrix {
+        // Broadcast bias (1, cols) across all rows
+        assert(bias.rows == 1 && bias.cols == self.cols)
+        let mut result = self.clone()
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                let old = result.get(i, j)
+                result.set(i, j, old + bias.get(0, j))
+            }
+        }
+        result
+    }
+
+    fn sum_rows(self) -> Matrix {
+        let mut result = Matrix.zeros(1, self.cols)
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                let old = result.get(0, j)
+                result.set(0, j, old + self.get(i, j))
+            }
+        }
+        result
+    }
+
+    fn apply(self, f: fn(f64) -> f64) -> Matrix {
+        let data: [f64] = self.data.iter().map(|x| f(*x)).collect()
+        Matrix { data, rows: self.rows, cols: self.cols }
+    }
+}
+
+// ── Activation functions ─────────────────────────────────────────────────────
+fn relu(x: f64) -> f64 { if x > 0.0 { x } else { 0.0 } }
+fn relu_derivative(x: f64) -> f64 { if x > 0.0 { 1.0 } else { 0.0 } }
+
+fn softmax(m: &Matrix) -> Matrix {
+    let mut result = Matrix.zeros(m.rows, m.cols)
+    for i in 0..m.rows {
+        let max_val = (0..m.cols).map(|j| m.get(i, j)).fold(f64.NEG_INFINITY, f64.max)
+        let mut sum = 0.0
+        for j in 0..m.cols {
+            let e = exp(m.get(i, j) - max_val)
+            result.set(i, j, e)
+            sum += e
+        }
+        for j in 0..m.cols { result.set(i, j, result.get(i, j) / sum) }
+    }
+    result
+}
+
+fn cross_entropy_loss(predictions: &Matrix, targets: &Matrix) -> f64 {
+    let mut loss = 0.0
+    for i in 0..predictions.rows {
+        for j in 0..predictions.cols {
+            let p = predictions.get(i, j).max(1e-15)
+            loss -= targets.get(i, j) * ln(p)
+        }
+    }
+    loss / predictions.rows as f64
+}
+
+// ── Dense layer ──────────────────────────────────────────────────────────────
+enum Activation { ReLU, Softmax, None }
+
+struct DenseLayer {
+    weights: Matrix,
+    bias: Matrix,
+    activation: Activation,
+    // Cache for backprop
+    input_cache: Option<Matrix>,
+    z_cache: Option<Matrix>,
+}
+
+impl DenseLayer {
+    fn new(input_size: usize, output_size: usize, activation: Activation) -> DenseLayer {
+        let scale = sqrt(2.0 / input_size as f64)  // He initialization for ReLU
+        DenseLayer {
+            weights: Matrix.random(input_size, output_size, scale),
+            bias: Matrix.zeros(1, output_size),
+            activation,
+            input_cache: none,
+            z_cache: none,
+        }
+    }
+
+    fn forward(mut self, input: &Matrix) -> Matrix {
+        self.input_cache = some(input.clone())
+        let z = input.matmul(&self.weights).add_bias(&self.bias)
+        self.z_cache = some(z.clone())
+        match self.activation {
+            Activation.ReLU    => z.apply(relu),
+            Activation.Softmax => softmax(&z),
+            Activation.None    => z,
+        }
+    }
+
+    fn backward(mut self, grad_output: &Matrix, learning_rate: f64) -> Matrix {
+        let input = self.input_cache.as_ref().unwrap()
+        let z = self.z_cache.as_ref().unwrap()
+
+        let grad_z = match self.activation {
+            Activation.ReLU => grad_output.hadamard(&z.apply(relu_derivative)),
+            _ => grad_output.clone(),
+        }
+
+        // Gradients
+        let grad_weights = input.transpose().matmul(&grad_z)
+        let grad_bias = grad_z.sum_rows()
+        let grad_input = grad_z.matmul(&self.weights.transpose())
+
+        // SGD update
+        self.weights = self.weights.sub(&grad_weights.scale(learning_rate))
+        self.bias = self.bias.sub(&grad_bias.scale(learning_rate))
+
+        grad_input
+    }
+}
+
+// ── Network ──────────────────────────────────────────────────────────────────
+struct Network {
+    layers: [DenseLayer],
+}
+
+impl Network {
+    fn new(layer_sizes: &[usize]) -> Network {
+        let mut layers: [DenseLayer] = []
+        for i in 0..layer_sizes.len() - 1 {
+            let activation = if i == layer_sizes.len() - 2 { Activation.Softmax }
+                             else { Activation.ReLU }
+            layers.push(DenseLayer.new(layer_sizes[i], layer_sizes[i+1], activation))
+        }
+        Network { layers }
+    }
+
+    fn forward(mut self, input: &Matrix) -> Matrix {
+        let mut x = input.clone()
+        for layer in &mut self.layers { x = layer.forward(&x) }
+        x
+    }
+
+    fn backward(mut self, grad: &Matrix, learning_rate: f64) {
+        let mut g = grad.clone()
+        for layer in self.layers.iter_mut().rev() { g = layer.backward(&g, learning_rate) }
+    }
+
+    fn train_step(mut self, input: &Matrix, target: &Matrix, lr: f64) -> f64 {
+        let output = self.forward(input)
+        let loss = cross_entropy_loss(&output, target)
+        // Softmax + cross-entropy gradient simplifies to (prediction - target)
+        let grad = output.sub(target)
+        self.backward(&grad, lr)
+        loss
+    }
+
+    fn predict(mut self, input: &Matrix) -> usize {
+        let output = self.forward(input)
+        let mut max_idx = 0
+        let mut max_val = output.get(0, 0)
+        for j in 1..output.cols {
+            if output.get(0, j) > max_val { max_val = output.get(0, j); max_idx = j }
+        }
+        max_idx
+    }
+}
+
+fn main() {
+    // Matrix operations
+    let a = Matrix.random(2, 3, 1.0)
+    let b = Matrix.random(3, 2, 1.0)
+    let c = a.matmul(&b)
+    assert(c.rows == 2 && c.cols == 2)
+    print("Matrix multiply: (2×3) × (3×2) = (2×2) ✓")
+
+    let t = a.transpose()
+    assert(t.rows == 3 && t.cols == 2)
+    print("Transpose ✓")
+
+    // ReLU
+    assert(relu(3.0) == 3.0)
+    assert(relu(-1.0) == 0.0)
+    print("ReLU ✓")
+
+    // Softmax
+    let logits = Matrix { data: [1.0, 2.0, 3.0], rows: 1, cols: 3 }
+    let probs = softmax(&logits)
+    let sum: f64 = probs.data.iter().sum()
+    assert((sum - 1.0).abs() < 1e-6, "softmax sums to 1")
+    assert(probs.get(0, 2) > probs.get(0, 1))  // highest logit → highest prob
+    print("Softmax ✓")
+
+    // Network creation
+    let mut net = Network.new(&[4, 8, 3])  // 4 inputs, 8 hidden, 3 outputs
+    assert(net.layers.len() == 2)
+    print("Network: 4 → 8 → 3 ✓")
+
+    // Forward pass
+    let input = Matrix.random(1, 4, 1.0)
+    let output = net.forward(&input)
+    assert(output.rows == 1 && output.cols == 3)
+    let out_sum: f64 = output.data.iter().sum()
+    assert((out_sum - 1.0).abs() < 1e-6, "output is valid probability distribution")
+    print("Forward pass ✓")
+
+    // Training step
+    let target = Matrix { data: [0.0, 1.0, 0.0], rows: 1, cols: 3 }  // class 1
+    let loss1 = net.train_step(&input, &target, 0.01)
+    let loss2 = net.train_step(&input, &target, 0.01)
+    print("Loss: ${loss1:.4} → ${loss2:.4}")
+    // Loss should generally decrease (may not always on single step)
+    print("Training step ✓")
+
+    // Multiple training iterations
+    let mut last_loss = f64.MAX
+    for epoch in 0..50 {
+        let loss = net.train_step(&input, &target, 0.01)
+        last_loss = loss
+    }
+    print("After 50 epochs: loss = ${last_loss:.4}")
+    assert(last_loss < loss1, "loss decreased after training")
+    print("Training convergence ✓")
+
+    // Prediction
+    let pred = net.predict(&input)
+    print("Predicted class: ${pred}")
+    print("Neural Network complete ✓")
+}
