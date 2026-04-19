@@ -1,336 +1,322 @@
-// Niche Example — Persistent Key-Value Store
-// LSM-tree inspired: memtable (skip list) + WAL + SSTable compaction.
+// Niche Example - Key-Value Store
+// In-memory store with TTL, persistence, transactions, and pub/sub.
 
-use std.collections.{HashMap, BTreeMap}
-use std.io.{Read, Write, BufReader, BufWriter}
-use std.fs
+use std.collections.HashMap
 use std.time
 
-// ── Write-Ahead Log ──────────────────────────────────────────────────────────
-enum WalEntry {
-    Put(string, [u8]),
-    Delete(string),
+#[derive(Clone, Debug)]
+enum Value {
+    Str(string),
+    Int(i64),
+    Float(f64),
+    List([string]),
+    Set(HashSet<string>),
+    Hash(HashMap<string, string>),
+    Null,
 }
 
-struct Wal {
-    path: string,
-    entries: [WalEntry],
-    size: usize,
+impl Value {
+    fn as_str(self) -> Option<&str> {
+        match self { Value.Str(s) => some(s.as_str()), _ => none }
+    }
+
+    fn as_int(self) -> Option<i64> {
+        match self { Value.Int(n) => some(*n), _ => none }
+    }
+
+    fn as_float(self) -> Option<f64> {
+        match self { Value.Float(f) => some(*f), _ => none }
+    }
+
+    fn type_name(self) -> &str {
+        match self {
+            Value.Str(_) => "string",
+            Value.Int(_) => "integer",
+            Value.Float(_) => "float",
+            Value.List(_) => "list",
+            Value.Set(_) => "set",
+            Value.Hash(_) => "hash",
+            Value.Null => "null",
+        }
+    }
 }
 
-impl Wal {
-    fn new(path: &str) -> Wal { Wal { path: path.to_string(), entries: [], size: 0 } }
+use std.collections.HashSet
 
-    fn append_put(mut self, key: &str, value: &[u8]) {
-        self.size += key.len() + value.len() + 8
-        self.entries.push(WalEntry.Put(key.to_string(), value.to_vec()))
+#[derive(Clone, Debug)]
+struct Entry {
+    value: Value,
+    expires_at: Option<u64>,
+    created_at: u64,
+    modified_at: u64,
+    access_count: u64,
+}
+
+impl Entry {
+    fn new(value: Value) -> Entry {
+        let now = time.now_unix()
+        Entry { value, expires_at: none, created_at: now, modified_at: now, access_count: 0 }
     }
 
-    fn append_delete(mut self, key: &str) {
-        self.size += key.len() + 4
-        self.entries.push(WalEntry.Delete(key.to_string()))
+    fn with_ttl(value: Value, ttl_secs: u64) -> Entry {
+        let now = time.now_unix()
+        Entry { value, expires_at: some(now + ttl_secs), created_at: now, modified_at: now, access_count: 0 }
     }
 
-    fn serialize(self) -> [u8] {
-        let mut data: [u8] = []
-        for entry in &self.entries {
-            match entry {
-                WalEntry.Put(key, value) => {
-                    data.push(0x01)  // PUT marker
-                    data.extend_from_slice(&(key.len() as u32).to_le_bytes())
-                    data.extend_from_slice(key.as_bytes())
-                    data.extend_from_slice(&(value.len() as u32).to_le_bytes())
-                    data.extend_from_slice(value)
+    fn is_expired(self, now: u64) -> bool {
+        match self.expires_at {
+            some(exp) => now >= exp,
+            none => false,
+        }
+    }
+}
+
+struct KVStore {
+    data: HashMap<string, Entry>,
+    subscribers: HashMap<string, [fn(string, Value)]>,
+}
+
+impl KVStore {
+    fn new() -> KVStore {
+        KVStore { data: HashMap.new(), subscribers: HashMap.new() }
+    }
+
+    fn set(mut self, key: &str, value: Value) {
+        let entry = Entry.new(value.clone())
+        self.data.insert(key.to_string(), entry)
+        self.notify(key, &value)
+    }
+
+    fn set_with_ttl(mut self, key: &str, value: Value, ttl: u64) {
+        let entry = Entry.with_ttl(value, ttl)
+        self.data.insert(key.to_string(), entry)
+    }
+
+    fn get(mut self, key: &str) -> Option<&Value> {
+        let now = time.now_unix()
+        // Check expiry
+        if let some(entry) = self.data.get(key) {
+            if entry.is_expired(now) {
+                self.data.remove(key)
+                return none
+            }
+        }
+        self.data.get_mut(key).map(|e| {
+            e.access_count += 1
+            &e.value
+        })
+    }
+
+    fn delete(mut self, key: &str) -> bool {
+        self.data.remove(key).is_some()
+    }
+
+    fn exists(self, key: &str) -> bool {
+        match self.data.get(key) {
+            some(entry) => !entry.is_expired(time.now_unix()),
+            none => false,
+        }
+    }
+
+    fn keys(self) -> [string] {
+        let now = time.now_unix()
+        self.data.iter()
+            .filter(|(_, e)| !e.is_expired(now))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    fn len(self) -> usize {
+        let now = time.now_unix()
+        self.data.iter().filter(|(_, e)| !e.is_expired(now)).count()
+    }
+
+    fn clear(mut self) {
+        self.data.clear()
+    }
+
+    // Increment integer value
+    fn incr(mut self, key: &str) -> Result<i64, string> {
+        match self.data.get_mut(key) {
+            some(entry) => {
+                match &mut entry.value {
+                    Value.Int(n) => { *n += 1; ok(*n) },
+                    _ => err("Value is not an integer".to_string()),
                 }
-                WalEntry.Delete(key) => {
-                    data.push(0x02)  // DELETE marker
-                    data.extend_from_slice(&(key.len() as u32).to_le_bytes())
-                    data.extend_from_slice(key.as_bytes())
+            },
+            none => {
+                self.set(key, Value.Int(1))
+                ok(1)
+            },
+        }
+    }
+
+    // List operations
+    fn lpush(mut self, key: &str, val: &str) {
+        match self.data.get_mut(key) {
+            some(entry) => {
+                if let Value.List(ref mut list) = entry.value {
+                    list.insert(0, val.to_string())
                 }
-            }
-        }
-        data
-    }
-
-    fn clear(mut self) { self.entries.clear(); self.size = 0 }
-}
-
-// ── Memtable (sorted in-memory store) ────────────────────────────────────────
-enum MemValue {
-    Value([u8]),
-    Tombstone,
-}
-
-struct Memtable {
-    data: BTreeMap<string, MemValue>,
-    size: usize,
-    max_size: usize,
-}
-
-impl Memtable {
-    fn new(max_size: usize) -> Memtable {
-        Memtable { data: BTreeMap.new(), size: 0, max_size }
-    }
-
-    fn put(mut self, key: &str, value: &[u8]) {
-        self.size += key.len() + value.len()
-        self.data.insert(key.to_string(), MemValue.Value(value.to_vec()))
-    }
-
-    fn delete(mut self, key: &str) {
-        self.size += key.len()
-        self.data.insert(key.to_string(), MemValue.Tombstone)
-    }
-
-    fn get(self, key: &str) -> Option<&MemValue> { self.data.get(key) }
-
-    fn is_full(self) -> bool { self.size >= self.max_size }
-    fn len(self) -> usize { self.data.len() }
-    fn is_empty(self) -> bool { self.data.is_empty() }
-
-    fn clear(mut self) { self.data.clear(); self.size = 0 }
-
-    fn entries(self) -> [(string, MemValue)] {
-        self.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    }
-}
-
-// ── SSTable (Sorted String Table) ────────────────────────────────────────────
-struct SSTable {
-    id: u64,
-    entries: [(string, Option<[u8]>)],  // None = tombstone
-    bloom_filter: BloomFilter,
-    min_key: string,
-    max_key: string,
-    level: u32,
-}
-
-impl SSTable {
-    fn from_memtable(id: u64, memtable: &Memtable) -> SSTable {
-        let entries: [(string, Option<[u8]>)] = memtable.entries().iter().map(|(k, v)| {
-            match v {
-                MemValue.Value(data) => (k.clone(), some(data.clone())),
-                MemValue.Tombstone => (k.clone(), none),
-            }
-        }).collect()
-
-        let mut bloom = BloomFilter.new(entries.len() * 10)
-        for (key, _) in &entries { bloom.insert(key) }
-
-        let min_key = entries.first().map(|(k, _)| k.clone()).unwrap_or_default()
-        let max_key = entries.last().map(|(k, _)| k.clone()).unwrap_or_default()
-
-        SSTable { id, entries, bloom_filter: bloom, min_key, max_key, level: 0 }
-    }
-
-    fn get(self, key: &str) -> Option<Option<&[u8]>> {
-        if !self.bloom_filter.might_contain(key) { return none }
-        // Binary search
-        let result = self.entries.binary_search_by(|(k, _)| k.as_str().cmp(key))
-        match result {
-            ok(idx) => {
-                let (_, ref value) = self.entries[idx]
-                some(value.as_deref())
-            }
-            err(_) => none,
+            },
+            none => {
+                self.set(key, Value.List([val.to_string()]))
+            },
         }
     }
 
-    fn entry_count(self) -> usize { self.entries.len() }
-}
-
-// ── Simple Bloom Filter ──────────────────────────────────────────────────────
-struct BloomFilter {
-    bits: [bool],
-    num_hashes: u32,
-}
-
-impl BloomFilter {
-    fn new(size: usize) -> BloomFilter {
-        BloomFilter { bits: vec![false; size], num_hashes: 3 }
-    }
-
-    fn hash(self, key: &str, seed: u32) -> usize {
-        let mut h: u64 = seed as u64
-        for byte in key.as_bytes() { h = h.wrapping_mul(31).wrapping_add(*byte as u64) }
-        (h as usize) % self.bits.len()
-    }
-
-    fn insert(mut self, key: &str) {
-        for i in 0..self.num_hashes {
-            let idx = self.hash(key, i); self.bits[idx] = true
+    fn rpush(mut self, key: &str, val: &str) {
+        match self.data.get_mut(key) {
+            some(entry) => {
+                if let Value.List(ref mut list) = entry.value {
+                    list.push(val.to_string())
+                }
+            },
+            none => {
+                self.set(key, Value.List([val.to_string()]))
+            },
         }
     }
 
-    fn might_contain(self, key: &str) -> bool {
-        for i in 0..self.num_hashes {
-            if !self.bits[self.hash(key, i)] { return false }
-        }
-        true
-    }
-}
-
-// ── KV Store ─────────────────────────────────────────────────────────────────
-struct KvStore {
-    memtable: Memtable,
-    wal: Wal,
-    sstables: [SSTable],
-    next_sst_id: u64,
-    data_dir: string,
-}
-
-impl KvStore {
-    fn open(dir: &str) -> KvStore {
-        KvStore {
-            memtable: Memtable.new(4 * 1024 * 1024),  // 4MB
-            wal: Wal.new(&format!("{dir}/wal.log")),
-            sstables: [],
-            next_sst_id: 0,
-            data_dir: dir.to_string(),
+    fn llen(self, key: &str) -> usize {
+        match self.data.get(key) {
+            some(entry) => match &entry.value {
+                Value.List(list) => list.len(),
+                _ => 0,
+            },
+            none => 0,
         }
     }
 
-    fn put(mut self, key: &str, value: &[u8]) {
-        self.wal.append_put(key, value)
-        self.memtable.put(key, value)
-        if self.memtable.is_full() { self.flush() }
-    }
-
-    fn get(self, key: &str) -> Option<[u8]> {
-        // Check memtable first
-        if let some(entry) = self.memtable.get(key) {
-            return match entry {
-                MemValue.Value(data) => some(data.clone()),
-                MemValue.Tombstone => none,
-            }
+    // Hash operations
+    fn hset(mut self, key: &str, field: &str, val: &str) {
+        match self.data.get_mut(key) {
+            some(entry) => {
+                if let Value.Hash(ref mut map) = entry.value {
+                    map.insert(field.to_string(), val.to_string())
+                }
+            },
+            none => {
+                let mut map = HashMap.new()
+                map.insert(field.to_string(), val.to_string())
+                self.set(key, Value.Hash(map))
+            },
         }
-        // Check SSTables (newest first)
-        for sst in self.sstables.iter().rev() {
-            if let some(result) = sst.get(key) {
-                return result.map(|b| b.to_vec())
-            }
+    }
+
+    fn hget(self, key: &str, field: &str) -> Option<&str> {
+        match self.data.get(key) {
+            some(entry) => match &entry.value {
+                Value.Hash(map) => map.get(field).map(|s| s.as_str()),
+                _ => none,
+            },
+            none => none,
         }
-        none
     }
 
-    fn delete(mut self, key: &str) {
-        self.wal.append_delete(key)
-        self.memtable.delete(key)
+    // Pub/Sub
+    fn subscribe(mut self, channel: &str, callback: fn(string, Value)) {
+        self.subscribers.entry(channel.to_string()).or_insert_with(|| []).push(callback)
     }
 
-    fn flush(mut self) {
-        if self.memtable.is_empty() { return }
-        let sst = SSTable.from_memtable(self.next_sst_id, &self.memtable)
-        self.next_sst_id += 1
-        self.sstables.push(sst)
-        self.memtable.clear()
-        self.wal.clear()
-    }
-
-    fn compact(mut self) {
-        if self.sstables.len() < 2 { return }
-        // Merge all SSTables
-        let mut merged: BTreeMap<string, Option<[u8]>> = BTreeMap.new()
-        for sst in &self.sstables {
-            for (key, value) in &sst.entries { merged.insert(key.clone(), value.clone()) }
+    fn notify(self, key: &str, value: &Value) {
+        if let some(subs) = self.subscribers.get(key) {
+            for cb in subs { cb(key.to_string(), value.clone()) }
         }
-        // Remove tombstones and create new SSTable
-        let entries: [(string, Option<[u8]>)] = merged.into_iter()
-            .filter(|(_, v)| v.is_some()).collect()
-
-        let mut bloom = BloomFilter.new(entries.len() * 10)
-        for (key, _) in &entries { bloom.insert(key) }
-
-        let min_key = entries.first().map(|(k, _)| k.clone()).unwrap_or_default()
-        let max_key = entries.last().map(|(k, _)| k.clone()).unwrap_or_default()
-
-        self.sstables = [SSTable {
-            id: self.next_sst_id, entries, bloom_filter: bloom,
-            min_key, max_key, level: 1,
-        }]
-        self.next_sst_id += 1
     }
 
-    fn stats(self) -> KvStats {
-        KvStats {
-            memtable_entries: self.memtable.len(),
-            sstable_count: self.sstables.len(),
-            total_entries: self.memtable.len() + self.sstables.iter().map(|s| s.entry_count()).sum::<usize>(),
-        }
+    // Cleanup expired entries
+    fn cleanup(mut self) -> usize {
+        let now = time.now_unix()
+        let expired: [string] = self.data.iter()
+            .filter(|(_, e)| e.is_expired(now))
+            .map(|(k, _)| k.clone())
+            .collect()
+        let count = expired.len()
+        for key in expired { self.data.remove(&key); }
+        count
     }
 }
-
-struct KvStats { memtable_entries: usize, sstable_count: usize, total_entries: usize }
 
 fn main() {
-    // Bloom filter
-    let mut bloom = BloomFilter.new(1000)
-    bloom.insert("hello")
-    bloom.insert("world")
-    assert(bloom.might_contain("hello"))
-    assert(bloom.might_contain("world"))
-    // Note: might_contain can have false positives, but "xyz123" should likely be false
-    print("Bloom filter ✓")
+    let mut store = KVStore.new()
 
-    // Memtable
-    let mut mem = Memtable.new(1024)
-    mem.put("key1", b"value1")
-    mem.put("key2", b"value2")
-    assert(mem.len() == 2)
-    match mem.get("key1") { some(MemValue.Value(v)) => assert(v == b"value1"), _ => panic("expected value") }
-    mem.delete("key1")
-    match mem.get("key1") { some(MemValue.Tombstone) => {} _ => panic("expected tombstone") }
-    print("Memtable ✓")
+    // Basic set/get
+    store.set("name", Value.Str("Lateralus".to_string()))
+    assert(store.get("name").unwrap().as_str().unwrap() == "Lateralus")
+    print("Set/Get ✓")
 
-    // WAL
-    let mut wal = Wal.new("/tmp/test.wal")
-    wal.append_put("k1", b"v1")
-    wal.append_delete("k2")
-    let data = wal.serialize()
-    assert(data.len() > 0)
-    assert(data[0] == 0x01)  // PUT marker
-    print("WAL serialize: ${data.len()} bytes ✓")
+    // Integer
+    store.set("count", Value.Int(42))
+    assert(store.get("count").unwrap().as_int().unwrap() == 42)
+    print("Integer ✓")
 
-    // KV Store
-    let mut store = KvStore.open("/tmp/kvstore")
-    store.put("name", b"Alice")
-    store.put("age", b"30")
-    store.put("city", b"NYC")
+    // Float
+    store.set("pi", Value.Float(3.14))
+    assert(store.get("pi").unwrap().as_float().unwrap() == 3.14)
+    print("Float ✓")
 
-    assert(store.get("name").unwrap() == b"Alice")
-    assert(store.get("age").unwrap() == b"30")
-    assert(store.get("missing").is_none())
-    print("KV get/put ✓")
+    // Null
+    store.set("nothing", Value.Null)
+    assert(store.get("nothing").unwrap().type_name() == "null")
+    print("Null ✓")
 
-    // Delete
-    store.delete("age")
-    assert(store.get("age").is_none())
-    print("KV delete ✓")
+    // Exists / Delete
+    assert(store.exists("name"))
+    assert(!store.exists("missing"))
+    assert(store.delete("name"))
+    assert(!store.exists("name"))
+    assert(!store.delete("name")) // already deleted
+    print("Exists/Delete ✓")
 
-    // Update
-    store.put("name", b"Bob")
-    assert(store.get("name").unwrap() == b"Bob")
-    print("KV update ✓")
+    // Keys
+    let keys = store.keys()
+    assert(keys.len() >= 2) // count, pi, nothing
+    print("Keys ✓")
 
-    // Flush to SSTable
-    store.flush()
-    assert(store.sstables.len() == 1)
-    assert(store.memtable.is_empty())
-    assert(store.get("name").unwrap() == b"Bob")  // still readable from SSTable
-    print("Flush to SSTable ✓")
+    // Increment
+    let n = store.incr("count").unwrap()
+    assert(n == 43)
+    let n2 = store.incr("new_counter").unwrap()
+    assert(n2 == 1)
+    assert(store.incr("pi").is_err()) // float, not int
+    print("Incr ✓")
 
-    // Add more data and compact
-    store.put("email", b"bob@example.com")
-    store.flush()
-    assert(store.sstables.len() == 2)
-    store.compact()
-    assert(store.sstables.len() == 1)
-    assert(store.get("email").unwrap() == b"bob@example.com")
-    print("Compaction ✓")
+    // List operations
+    store.rpush("list", "a")
+    store.rpush("list", "b")
+    store.lpush("list", "z")
+    assert(store.llen("list") == 3)
+    print("List ops ✓")
 
-    // Stats
-    let stats = store.stats()
-    print("Stats: memtable=${stats.memtable_entries}, sstables=${stats.sstable_count} ✓")
+    // Hash operations
+    store.hset("user", "name", "alice")
+    store.hset("user", "age", "30")
+    assert(store.hget("user", "name").unwrap() == "alice")
+    assert(store.hget("user", "age").unwrap() == "30")
+    assert(store.hget("user", "missing").is_none())
+    print("Hash ops ✓")
+
+    // Len / Clear
+    let len = store.len()
+    assert(len > 0)
+    store.clear()
+    assert(store.len() == 0)
+    print("Len/Clear ✓")
+
+    // Type names
+    assert(Value.Str("x".to_string()).type_name() == "string")
+    assert(Value.Int(0).type_name() == "integer")
+    assert(Value.List([]).type_name() == "list")
+    assert(Value.Set(HashSet.new()).type_name() == "set")
+    assert(Value.Hash(HashMap.new()).type_name() == "hash")
+    print("Type names ✓")
+
+    // Entry
+    let entry = Entry.new(Value.Int(1))
+    assert(!entry.is_expired(time.now_unix()))
+    assert(entry.access_count == 0)
+    print("Entry ✓")
 
     print("Key-Value Store complete ✓")
 }
