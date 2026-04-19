@@ -1,0 +1,48 @@
+// pipeline_stages.ltl — Multi-stage concurrent pipeline
+// Run: lateralus run concurrency/pipeline_stages.ltl
+
+use std.async.{spawn, channel}
+
+// Stage 1 — generate numbers
+async fn generate(tx: Sender<int>, count: int) {
+    for i in range(0, count) { await tx.send(i) }
+    tx.close()
+}
+
+// Stage 2 — filter evens
+async fn filter_even(rx: Receiver<int>, tx: Sender<int>) {
+    while let some(n) = await rx.recv() {
+        if n % 2 == 0 { await tx.send(n) }
+    }
+    tx.close()
+}
+
+// Stage 3 — square
+async fn square(rx: Receiver<int>, tx: Sender<int>) {
+    while let some(n) = await rx.recv() { await tx.send(n * n) }
+    tx.close()
+}
+
+// Stage 4 — collect
+async fn collect_all(rx: Receiver<int>) -> [int] {
+    mut results = []
+    while let some(n) = await rx.recv() { results.push(n) }
+    results
+}
+
+async fn main() {
+    let (tx1, rx1) = channel()
+    let (tx2, rx2) = channel()
+    let (tx3, rx3) = channel()
+
+    spawn(generate(tx1, 20))
+    spawn(filter_even(rx1, tx2))
+    spawn(square(rx2, tx3))
+
+    let results = await collect_all(rx3)
+    print("Pipeline result: ${results}")
+    // Expected: squares of 0,2,4,6,...,18
+    assert_eq(results.len(), 10)
+}
+
+main()
