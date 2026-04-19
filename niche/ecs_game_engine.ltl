@@ -1,0 +1,344 @@
+// Niche Example — ECS Game Engine with Rendering Pipeline
+// Complete entity-component-system with spatial indexing and render graph.
+
+use std.collections.{HashMap, HashSet}
+use std.any.TypeId
+use std.math.{sqrt, sin, cos, PI}
+
+type EntityId = u64
+type ComponentMask = u64
+
+// ── Spatial types ────────────────────────────────────────────────────────────
+struct Vec2 { x: f32, y: f32 }
+
+impl Vec2 {
+    fn zero() -> Vec2 { Vec2 { x: 0.0, y: 0.0 } }
+    fn new(x: f32, y: f32) -> Vec2 { Vec2 { x, y } }
+    fn add(self, other: Vec2) -> Vec2 { Vec2 { x: self.x + other.x, y: self.y + other.y } }
+    fn sub(self, other: Vec2) -> Vec2 { Vec2 { x: self.x - other.x, y: self.y - other.y } }
+    fn scale(self, s: f32) -> Vec2 { Vec2 { x: self.x * s, y: self.y * s } }
+    fn length(self) -> f32 { sqrt(self.x * self.x + self.y * self.y) }
+    fn normalized(self) -> Vec2 { let l = self.length(); if l > 0.0 { self.scale(1.0/l) } else { Vec2.zero() } }
+    fn dot(self, other: Vec2) -> f32 { self.x * other.x + self.y * other.y }
+    fn distance(self, other: Vec2) -> f32 { self.sub(other).length() }
+}
+
+struct AABB { min: Vec2, max: Vec2 }
+
+impl AABB {
+    fn new(min: Vec2, max: Vec2) -> AABB { AABB { min, max } }
+    fn contains(self, point: Vec2) -> bool {
+        point.x >= self.min.x && point.x <= self.max.x &&
+        point.y >= self.min.y && point.y <= self.max.y
+    }
+    fn intersects(self, other: &AABB) -> bool {
+        self.min.x <= other.max.x && self.max.x >= other.min.x &&
+        self.min.y <= other.max.y && self.max.y >= other.min.y
+    }
+    fn center(self) -> Vec2 {
+        Vec2 { x: (self.min.x + self.max.x) / 2.0, y: (self.min.y + self.max.y) / 2.0 }
+    }
+}
+
+// ── Spatial hash grid ────────────────────────────────────────────────────────
+struct SpatialGrid {
+    cell_size: f32,
+    cells: HashMap<(i32, i32), [EntityId]>,
+}
+
+impl SpatialGrid {
+    fn new(cell_size: f32) -> SpatialGrid {
+        SpatialGrid { cell_size, cells: HashMap.new() }
+    }
+
+    fn cell_key(self, pos: Vec2) -> (i32, i32) {
+        ((pos.x / self.cell_size).floor() as i32, (pos.y / self.cell_size).floor() as i32)
+    }
+
+    fn insert(mut self, entity: EntityId, pos: Vec2) {
+        let key = self.cell_key(pos)
+        self.cells.entry(key).or_insert([]).push(entity)
+    }
+
+    fn remove(mut self, entity: EntityId, pos: Vec2) {
+        let key = self.cell_key(pos)
+        if let some(entities) = self.cells.get_mut(&key) {
+            entities.retain(|&e| e != entity)
+        }
+    }
+
+    fn query_radius(self, center: Vec2, radius: f32) -> [EntityId] {
+        let mut results: [EntityId] = []
+        let min_cell = self.cell_key(Vec2.new(center.x - radius, center.y - radius))
+        let max_cell = self.cell_key(Vec2.new(center.x + radius, center.y + radius))
+        for cx in min_cell.0..=max_cell.0 {
+            for cy in min_cell.1..=max_cell.1 {
+                if let some(entities) = self.cells.get(&(cx, cy)) {
+                    results.extend(entities)
+                }
+            }
+        }
+        results
+    }
+
+    fn query_aabb(self, aabb: &AABB) -> [EntityId] {
+        let mut results: [EntityId] = []
+        let min_cell = self.cell_key(aabb.min)
+        let max_cell = self.cell_key(aabb.max)
+        for cx in min_cell.0..=max_cell.0 {
+            for cy in min_cell.1..=max_cell.1 {
+                if let some(entities) = self.cells.get(&(cx, cy)) {
+                    results.extend(entities)
+                }
+            }
+        }
+        results
+    }
+
+    fn clear(mut self) { self.cells.clear() }
+}
+
+// ── Components ───────────────────────────────────────────────────────────────
+struct Transform { position: Vec2, rotation: f32, scale: Vec2 }
+struct RigidBody { velocity: Vec2, acceleration: Vec2, mass: f32, drag: f32 }
+struct Collider { shape: ColliderShape, is_trigger: bool }
+enum ColliderShape { Circle(f32), Rectangle(f32, f32) }
+struct Sprite { texture_id: u32, layer: i32, color: Color, flip_x: bool, flip_y: bool }
+struct Color { r: u8, g: u8, b: u8, a: u8 }
+struct Animator { frames: [u32], current: usize, speed: f32, elapsed: f32, looping: bool }
+struct Health { current: f32, max: f32 }
+struct Tag { name: string }
+struct ParticleEmitter {
+    rate: f32, lifetime: f32, speed_range: (f32, f32),
+    color_start: Color, color_end: Color, size_range: (f32, f32),
+    accumulated: f32,
+}
+struct Camera { zoom: f32, viewport: Vec2 }
+
+// ── System trait ─────────────────────────────────────────────────────────────
+trait System {
+    fn update(mut self, world: &mut World, dt: f32)
+    fn name(self) -> &str
+    fn priority(self) -> i32 { 0 }
+}
+
+// ── World ────────────────────────────────────────────────────────────────────
+struct World {
+    next_entity: EntityId,
+    alive: HashSet<EntityId>,
+    transforms: HashMap<EntityId, Transform>,
+    rigid_bodies: HashMap<EntityId, RigidBody>,
+    colliders: HashMap<EntityId, Collider>,
+    sprites: HashMap<EntityId, Sprite>,
+    animators: HashMap<EntityId, Animator>,
+    healths: HashMap<EntityId, Health>,
+    tags: HashMap<EntityId, Tag>,
+    emitters: HashMap<EntityId, ParticleEmitter>,
+    cameras: HashMap<EntityId, Camera>,
+    spatial_grid: SpatialGrid,
+    events: [GameEvent],
+}
+
+enum GameEvent {
+    Collision { a: EntityId, b: EntityId },
+    EntityDestroyed(EntityId),
+    EntitySpawned(EntityId),
+    DamageDealt { target: EntityId, amount: f32 },
+}
+
+impl World {
+    fn new() -> World {
+        World {
+            next_entity: 1, alive: HashSet.new(),
+            transforms: HashMap.new(), rigid_bodies: HashMap.new(),
+            colliders: HashMap.new(), sprites: HashMap.new(),
+            animators: HashMap.new(), healths: HashMap.new(),
+            tags: HashMap.new(), emitters: HashMap.new(),
+            cameras: HashMap.new(),
+            spatial_grid: SpatialGrid.new(64.0),
+            events: [],
+        }
+    }
+
+    fn spawn(mut self) -> EntityId {
+        let id = self.next_entity; self.next_entity += 1
+        self.alive.insert(id)
+        self.events.push(GameEvent.EntitySpawned(id))
+        id
+    }
+
+    fn despawn(mut self, id: EntityId) {
+        self.alive.remove(&id)
+        self.transforms.remove(&id)
+        self.rigid_bodies.remove(&id)
+        self.colliders.remove(&id)
+        self.sprites.remove(&id)
+        self.animators.remove(&id)
+        self.healths.remove(&id)
+        self.tags.remove(&id)
+        self.emitters.remove(&id)
+        self.cameras.remove(&id)
+        self.events.push(GameEvent.EntityDestroyed(id))
+    }
+
+    fn entity_count(self) -> usize { self.alive.len() }
+}
+
+// ── Physics system ───────────────────────────────────────────────────────────
+struct PhysicsSystem;
+
+impl System for PhysicsSystem {
+    fn name(self) -> &str { "Physics" }
+    fn priority(self) -> i32 { -10 }
+
+    fn update(mut self, world: &mut World, dt: f32) {
+        let entities: [EntityId] = world.rigid_bodies.keys().cloned().collect()
+        for id in entities {
+            if let (some(rb), some(tf)) = (world.rigid_bodies.get_mut(&id), world.transforms.get_mut(&id)) {
+                rb.velocity = rb.velocity.add(rb.acceleration.scale(dt))
+                rb.velocity = rb.velocity.scale(1.0 - rb.drag * dt)
+                tf.position = tf.position.add(rb.velocity.scale(dt))
+            }
+        }
+    }
+}
+
+// ── Animation system ─────────────────────────────────────────────────────────
+struct AnimationSystem;
+
+impl System for AnimationSystem {
+    fn name(self) -> &str { "Animation" }
+    fn update(mut self, world: &mut World, dt: f32) {
+        for (id, anim) in &mut world.animators {
+            anim.elapsed += dt
+            if anim.elapsed >= 1.0 / anim.speed {
+                anim.elapsed = 0.0
+                anim.current += 1
+                if anim.current >= anim.frames.len() {
+                    if anim.looping { anim.current = 0 } else { anim.current = anim.frames.len() - 1 }
+                }
+            }
+            // Update sprite texture
+            if let some(sprite) = world.sprites.get_mut(id) {
+                sprite.texture_id = anim.frames[anim.current]
+            }
+        }
+    }
+}
+
+// ── Render system ────────────────────────────────────────────────────────────
+struct RenderCommand { entity: EntityId, texture: u32, position: Vec2, layer: i32, color: Color }
+
+struct RenderSystem { commands: [RenderCommand] }
+
+impl RenderSystem {
+    fn new() -> RenderSystem { RenderSystem { commands: [] } }
+}
+
+impl System for RenderSystem {
+    fn name(self) -> &str { "Render" }
+    fn priority(self) -> i32 { 100 }
+
+    fn update(mut self, world: &mut World, _dt: f32) {
+        self.commands.clear()
+        for (&id, sprite) in &world.sprites {
+            if let some(tf) = world.transforms.get(&id) {
+                self.commands.push(RenderCommand {
+                    entity: id, texture: sprite.texture_id,
+                    position: tf.position, layer: sprite.layer,
+                    color: sprite.color,
+                })
+            }
+        }
+        // Sort by layer for correct draw order
+        self.commands.sort_by_key(|c| c.layer)
+    }
+}
+
+fn main() {
+    let mut world = World.new()
+
+    // Spawn player
+    let player = world.spawn()
+    world.transforms.insert(player, Transform {
+        position: Vec2.new(100.0, 100.0), rotation: 0.0, scale: Vec2.new(1.0, 1.0),
+    })
+    world.rigid_bodies.insert(player, RigidBody {
+        velocity: Vec2.new(50.0, 0.0), acceleration: Vec2.zero(), mass: 1.0, drag: 0.5,
+    })
+    world.sprites.insert(player, Sprite {
+        texture_id: 1, layer: 10, color: Color { r: 255, g: 255, b: 255, a: 255 },
+        flip_x: false, flip_y: false,
+    })
+    world.healths.insert(player, Health { current: 100.0, max: 100.0 })
+    world.tags.insert(player, Tag { name: "Player".to_string() })
+
+    // Spawn enemies
+    for i in 0..5 {
+        let enemy = world.spawn()
+        world.transforms.insert(enemy, Transform {
+            position: Vec2.new(200.0 + i as f32 * 80.0, 300.0),
+            rotation: 0.0, scale: Vec2.new(1.0, 1.0),
+        })
+        world.rigid_bodies.insert(enemy, RigidBody {
+            velocity: Vec2.new(-20.0, 0.0), acceleration: Vec2.zero(), mass: 1.0, drag: 0.3,
+        })
+        world.tags.insert(enemy, Tag { name: format!("Enemy_{i}") })
+    }
+
+    assert(world.entity_count() == 6)
+    print("Spawned ${world.entity_count()} entities ✓")
+
+    // Run physics
+    let mut physics = PhysicsSystem
+    physics.update(&mut world, 0.016)
+    let pos = &world.transforms[&player].position
+    assert(pos.x > 100.0, "player should have moved")
+    print("Physics: player at (${pos.x:.1}, ${pos.y:.1}) ✓")
+
+    // Spatial grid
+    let mut grid = SpatialGrid.new(64.0)
+    grid.insert(1, Vec2.new(10.0, 10.0))
+    grid.insert(2, Vec2.new(20.0, 15.0))
+    grid.insert(3, Vec2.new(500.0, 500.0))
+    let nearby = grid.query_radius(Vec2.new(15.0, 12.0), 50.0)
+    assert(nearby.contains(&1) && nearby.contains(&2))
+    assert(!nearby.contains(&3))
+    print("Spatial grid query ✓")
+
+    // Vec2 math
+    let v1 = Vec2.new(3.0, 4.0)
+    assert((v1.length() - 5.0).abs() < 0.01)
+    let n = v1.normalized()
+    assert((n.length() - 1.0).abs() < 0.01)
+    print("Vec2 math ✓")
+
+    // AABB
+    let aabb1 = AABB.new(Vec2.new(0.0, 0.0), Vec2.new(10.0, 10.0))
+    let aabb2 = AABB.new(Vec2.new(5.0, 5.0), Vec2.new(15.0, 15.0))
+    let aabb3 = AABB.new(Vec2.new(20.0, 20.0), Vec2.new(30.0, 30.0))
+    assert(aabb1.intersects(&aabb2))
+    assert(!aabb1.intersects(&aabb3))
+    assert(aabb1.contains(Vec2.new(5.0, 5.0)))
+    assert(!aabb1.contains(Vec2.new(15.0, 15.0)))
+    print("AABB ✓")
+
+    // Render system
+    let mut render = RenderSystem.new()
+    render.update(&mut world, 0.016)
+    assert(render.commands.len() >= 1)
+    print("Render: ${render.commands.len()} draw commands ✓")
+
+    // Despawn
+    world.despawn(player)
+    assert(world.entity_count() == 5)
+    print("Despawn ✓")
+
+    // Events
+    assert(world.events.len() > 0)
+    let spawn_events = world.events.iter().filter(|e| matches!(e, GameEvent.EntitySpawned(_))).count()
+    assert(spawn_events == 6)
+    print("Events: ${world.events.len()} total ✓")
+
+    print("ECS Game Engine complete ✓")
+}
