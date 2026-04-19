@@ -1,0 +1,367 @@
+// Niche Example - Redis Client
+// RESP protocol client with commands, pipelining, and pub/sub.
+
+use std.net.TcpStream
+use std.io.{Read, Write, BufReader, BufRead}
+use std.collections.HashMap
+use std.time.Duration
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RedisValue {
+    SimpleString(string),
+    Error(string),
+    Integer(i64),
+    BulkString(Option<string>),   // None = null
+    Array(Option<[RedisValue]>),  // None = null
+}
+
+impl RedisValue {
+    pub fn as_str(self) -> Option<&str> {
+        match self {
+            RedisValue.SimpleString(ref s) => some(s.as_str()),
+            RedisValue.BulkString(some(ref s)) => some(s.as_str()),
+            _ => none,
+        }
+    }
+
+    pub fn as_i64(self) -> Option<i64> {
+        match self {
+            RedisValue.Integer(n) => some(n),
+            _ => none,
+        }
+    }
+
+    pub fn as_array(self) -> Option<&[RedisValue]> {
+        match self {
+            RedisValue.Array(some(ref arr)) => some(arr),
+            _ => none,
+        }
+    }
+
+    pub fn is_null(self) -> bool {
+        match self {
+            RedisValue.BulkString(none) | RedisValue.Array(none) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_error(self) -> bool {
+        match self { RedisValue.Error(_) => true, _ => false }
+    }
+
+    pub fn to_string(self) -> string {
+        match self {
+            RedisValue.SimpleString(s) | RedisValue.BulkString(some(s)) => s,
+            RedisValue.Error(e) => format!("ERR: {}", e),
+            RedisValue.Integer(n) => n.to_string(),
+            RedisValue.BulkString(none) => "(nil)".to_string(),
+            RedisValue.Array(none) => "(nil)".to_string(),
+            RedisValue.Array(some(arr)) => {
+                arr.iter().enumerate()
+                    .map(|(i, v)| format!("{}) {}", i + 1, v.to_string()))
+                    .collect::<[string]>().join("\n")
+            },
+        }
+    }
+}
+
+/// Encode a command as RESP protocol
+fn encode_command(args: &[&str]) -> string {
+    let mut buf = format!("*{}\r\n", args.len())
+    for arg in args {
+        buf.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg))
+    }
+    buf
+}
+
+/// Parse a RESP value from buffered reader
+fn parse_resp(reader: &mut BufReader<&TcpStream>) -> Result<RedisValue, string> {
+    let mut line = string.new()
+    reader.read_line(&mut line).map_err(|e| e.to_string())?
+    let line = line.trim_end_matches("\r\n").trim_end_matches('\n')
+    if line.is_empty() { return err("empty response".to_string()) }
+
+    match line.as_bytes()[0] {
+        b'+' => ok(RedisValue.SimpleString(line[1..].to_string())),
+        b'-' => ok(RedisValue.Error(line[1..].to_string())),
+        b':' => {
+            let n = line[1..].parse::<i64>().map_err(|e| e.to_string())?
+            ok(RedisValue.Integer(n))
+        },
+        b'$' => {
+            let len = line[1..].parse::<i64>().map_err(|e| e.to_string())?
+            if len < 0 { return ok(RedisValue.BulkString(none)) }
+            let mut buf = vec![0u8; len as usize + 2]  // +2 for \r\n
+            reader.read_exact(&mut buf).map_err(|e| e.to_string())?
+            let s = string.from_utf8(buf[..len as usize].to_vec()).map_err(|e| e.to_string())?
+            ok(RedisValue.BulkString(some(s)))
+        },
+        b'*' => {
+            let count = line[1..].parse::<i64>().map_err(|e| e.to_string())?
+            if count < 0 { return ok(RedisValue.Array(none)) }
+            let mut arr: [RedisValue] = []
+            for _ in 0..count { arr.push(parse_resp(reader)?) }
+            ok(RedisValue.Array(some(arr)))
+        },
+        _ => err(format!("unknown RESP type: {}", line)),
+    }
+}
+
+struct RedisClient {
+    addr: string,
+    stream: Option<TcpStream>,
+    db: usize,
+    password: Option<string>,
+}
+
+impl RedisClient {
+    fn new(host: &str, port: u16) -> RedisClient {
+        RedisClient {
+            addr: format!("{}:{}", host, port),
+            stream: none, db: 0, password: none,
+        }
+    }
+
+    fn connect(mut self) -> Result<(), string> {
+        let stream = TcpStream.connect(&self.addr).map_err(|e| e.to_string())?
+        stream.set_read_timeout(some(Duration.from_secs(5))).ok()
+        self.stream = some(stream)
+        if let some(ref pw) = self.password {
+            self.command(&["AUTH", pw])?;
+        }
+        if self.db != 0 {
+            self.command(&["SELECT", &self.db.to_string()])?;
+        }
+        ok(())
+    }
+
+    fn command(mut self, args: &[&str]) -> Result<RedisValue, string> {
+        let stream = self.stream.as_ref().ok_or("not connected")?
+        let encoded = encode_command(args)
+        stream.write_all(encoded.as_bytes()).map_err(|e| e.to_string())?
+        stream.flush().map_err(|e| e.to_string())?
+        let mut reader = BufReader.new(stream)
+        parse_resp(&mut reader)
+    }
+
+    // String commands
+    fn get(mut self, key: &str) -> Result<RedisValue, string> {
+        self.command(&["GET", key])
+    }
+
+    fn set(mut self, key: &str, value: &str) -> Result<RedisValue, string> {
+        self.command(&["SET", key, value])
+    }
+
+    fn set_ex(mut self, key: &str, value: &str, seconds: u64) -> Result<RedisValue, string> {
+        self.command(&["SETEX", key, &seconds.to_string(), value])
+    }
+
+    fn del(mut self, keys: &[&str]) -> Result<RedisValue, string> {
+        let mut args = vec!["DEL"]
+        args.extend_from_slice(keys)
+        self.command(&args)
+    }
+
+    fn exists(mut self, key: &str) -> Result<bool, string> {
+        self.command(&["EXISTS", key]).map(|v| v.as_i64() == some(1))
+    }
+
+    fn incr(mut self, key: &str) -> Result<i64, string> {
+        self.command(&["INCR", key]).and_then(|v| v.as_i64().ok_or("not integer".to_string()))
+    }
+
+    fn decr(mut self, key: &str) -> Result<i64, string> {
+        self.command(&["DECR", key]).and_then(|v| v.as_i64().ok_or("not integer".to_string()))
+    }
+
+    // Hash commands
+    fn hset(mut self, key: &str, field: &str, value: &str) -> Result<RedisValue, string> {
+        self.command(&["HSET", key, field, value])
+    }
+
+    fn hget(mut self, key: &str, field: &str) -> Result<RedisValue, string> {
+        self.command(&["HGET", key, field])
+    }
+
+    fn hgetall(mut self, key: &str) -> Result<HashMap<string, string>, string> {
+        let resp = self.command(&["HGETALL", key])?
+        let arr = resp.as_array().ok_or("expected array")?
+        let mut map = HashMap.new()
+        let mut i = 0
+        while i + 1 < arr.len() {
+            if let (some(k), some(v)) = (arr[i].as_str(), arr[i+1].as_str()) {
+                map.insert(k.to_string(), v.to_string())
+            }
+            i += 2
+        }
+        ok(map)
+    }
+
+    // List commands
+    fn lpush(mut self, key: &str, values: &[&str]) -> Result<i64, string> {
+        let mut args = vec!["LPUSH", key]
+        args.extend_from_slice(values)
+        self.command(&args).and_then(|v| v.as_i64().ok_or("not integer".to_string()))
+    }
+
+    fn rpush(mut self, key: &str, values: &[&str]) -> Result<i64, string> {
+        let mut args = vec!["RPUSH", key]
+        args.extend_from_slice(values)
+        self.command(&args).and_then(|v| v.as_i64().ok_or("not integer".to_string()))
+    }
+
+    fn lrange(mut self, key: &str, start: i64, stop: i64) -> Result<[string], string> {
+        let resp = self.command(&["LRANGE", key, &start.to_string(), &stop.to_string()])?
+        let arr = resp.as_array().ok_or("expected array")?
+        ok(arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+    }
+
+    // Set commands
+    fn sadd(mut self, key: &str, members: &[&str]) -> Result<i64, string> {
+        let mut args = vec!["SADD", key]
+        args.extend_from_slice(members)
+        self.command(&args).and_then(|v| v.as_i64().ok_or("not integer".to_string()))
+    }
+
+    fn smembers(mut self, key: &str) -> Result<[string], string> {
+        let resp = self.command(&["SMEMBERS", key])?
+        let arr = resp.as_array().ok_or("expected array")?
+        ok(arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+    }
+
+    // Pub/Sub
+    fn publish(mut self, channel: &str, message: &str) -> Result<i64, string> {
+        self.command(&["PUBLISH", channel, message])
+            .and_then(|v| v.as_i64().ok_or("not integer".to_string()))
+    }
+
+    // Utility
+    fn ping(mut self) -> Result<string, string> {
+        self.command(&["PING"]).map(|v| v.to_string())
+    }
+
+    fn info(mut self) -> Result<string, string> {
+        self.command(&["INFO"]).map(|v| v.to_string())
+    }
+
+    fn flushdb(mut self) -> Result<(), string> {
+        self.command(&["FLUSHDB"])?; ok(())
+    }
+
+    fn close(mut self) {
+        if let some(ref mut stream) = self.stream {
+            let _ = stream.write_all(b"QUIT\r\n")
+        }
+        self.stream = none
+    }
+}
+
+/// Pipeline for batching commands.
+struct Pipeline {
+    commands: [string],
+    count: usize,
+}
+
+impl Pipeline {
+    fn new() -> Pipeline { Pipeline { commands: [], count: 0 } }
+
+    fn add(mut self, args: &[&str]) -> &mut Pipeline {
+        self.commands.push(encode_command(args))
+        self.count += 1
+        self
+    }
+
+    fn execute(self, client: &mut RedisClient) -> Result<[RedisValue], string> {
+        let stream = client.stream.as_ref().ok_or("not connected")?
+        let batch: string = self.commands.join("")
+        stream.write_all(batch.as_bytes()).map_err(|e| e.to_string())?
+        stream.flush().map_err(|e| e.to_string())?
+        let mut reader = BufReader.new(stream)
+        let mut results: [RedisValue] = []
+        for _ in 0..self.count {
+            results.push(parse_resp(&mut reader)?)
+        }
+        ok(results)
+    }
+}
+
+fn main() {
+    // RedisValue
+    let sv = RedisValue.SimpleString("OK".to_string())
+    assert(sv.as_str() == some("OK"))
+    assert(!sv.is_null())
+    assert(!sv.is_error())
+    print("SimpleString ✓")
+
+    let iv = RedisValue.Integer(42)
+    assert(iv.as_i64() == some(42))
+    assert(iv.to_string() == "42")
+    print("Integer ✓")
+
+    let bv = RedisValue.BulkString(some("hello".to_string()))
+    assert(bv.as_str() == some("hello"))
+    print("BulkString ✓")
+
+    let null_v = RedisValue.BulkString(none)
+    assert(null_v.is_null())
+    assert(null_v.to_string() == "(nil)")
+    print("Null BulkString ✓")
+
+    let err_v = RedisValue.Error("WRONGTYPE".to_string())
+    assert(err_v.is_error())
+    print("Error ✓")
+
+    let arr = RedisValue.Array(some(vec![
+        RedisValue.BulkString(some("a".to_string())),
+        RedisValue.BulkString(some("b".to_string())),
+    ]))
+    assert(arr.as_array().unwrap().len() == 2)
+    print("Array ✓")
+
+    let null_arr = RedisValue.Array(none)
+    assert(null_arr.is_null())
+    print("Null Array ✓")
+
+    // Encode command
+    let encoded = encode_command(&["SET", "key", "value"])
+    assert(encoded.starts_with("*3\r\n"))
+    assert(encoded.contains("$3\r\nSET\r\n"))
+    assert(encoded.contains("$3\r\nkey\r\n"))
+    assert(encoded.contains("$5\r\nvalue\r\n"))
+    print("Encode command ✓")
+
+    let get_enc = encode_command(&["GET", "mykey"])
+    assert(get_enc.starts_with("*2\r\n"))
+    print("Encode GET ✓")
+
+    // Client creation
+    let client = RedisClient.new("localhost", 6379)
+    assert(client.addr == "localhost:6379")
+    assert(client.db == 0)
+    assert(client.stream.is_none())
+    print("RedisClient new ✓")
+
+    // Pipeline
+    let mut pipe = Pipeline.new()
+    pipe.add(&["SET", "k1", "v1"])
+    pipe.add(&["SET", "k2", "v2"])
+    pipe.add(&["GET", "k1"])
+    assert(pipe.count == 3)
+    assert(pipe.commands.len() == 3)
+    print("Pipeline ✓")
+
+    // PartialEq
+    assert(RedisValue.Integer(1) == RedisValue.Integer(1))
+    assert(RedisValue.Integer(1) != RedisValue.Integer(2))
+    assert(RedisValue.SimpleString("OK".to_string()) == RedisValue.SimpleString("OK".to_string()))
+    print("PartialEq ✓")
+
+    // to_string for array
+    let display = arr.to_string()
+    assert(display.contains("1)"))
+    assert(display.contains("a"))
+    print("Array to_string ✓")
+
+    print("Redis Client complete ✓")
+}
