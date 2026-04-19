@@ -1,0 +1,51 @@
+// linked_list.ltl — Linked list implementation in Lateralus
+// Run: lateralus run algorithms/linked_list.ltl
+
+enum Node<T> {
+    Nil,
+    Cons(T, Box<Node<T>>),
+}
+
+impl Node<T> {
+    fn new() -> Node<T> { Node.Nil }
+
+    fn prepend(self, val: T) -> Node<T> {
+        Node.Cons(val, Box.new(self))
+    }
+
+    fn len(self) -> int {
+        match self {
+            Node.Nil       => 0,
+            Node.Cons(_, tail) => 1 + tail.len(),
+        }
+    }
+
+    fn to_list(self) -> [T] {
+        match self {
+            Node.Nil            => [],
+            Node.Cons(h, tail)  => [h, ...tail.to_list()],
+        }
+    }
+
+    fn map<U>(self, f: fn(T) -> U) -> Node<U> {
+        match self {
+            Node.Nil            => Node.Nil,
+            Node.Cons(h, tail)  => Node.Cons(f(h), Box.new(tail.map(f))),
+        }
+    }
+}
+
+fn main() {
+    let list = Node.new()
+        |> prepend(3)
+        |> prepend(2)
+        |> prepend(1)
+
+    print("Length: ${list.len()}")
+    print("Items:  ${list.to_list()}")
+
+    let doubled = list.map(x => x * 2)
+    print("Doubled: ${doubled.to_list()}")
+}
+
+main()
