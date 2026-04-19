@@ -1,0 +1,58 @@
+// linear_regression.ltl — Ordinary least-squares linear regression
+use std.math.{sqrt, abs}
+
+struct LinearRegression {
+    slope:     float,
+    intercept: float,
+}
+
+impl LinearRegression {
+    fn fit(x: [float], y: [float]) -> LinearRegression {
+        let n    = x.len() as float
+        let sx   = x |> sum()
+        let sy   = y |> sum()
+        let sxy  = x.iter() |> zip(y.iter()) |> map(|(xi, yi)| xi * yi) |> sum()
+        let sx2  = x |> map(|xi| xi * xi) |> sum()
+        let slope     = (n * sxy - sx * sy) / (n * sx2 - sx * sx)
+        let intercept = (sy - slope * sx) / n
+        LinearRegression { slope, intercept }
+    }
+
+    fn predict(self, x: float) -> float { self.slope * x + self.intercept }
+
+    fn r_squared(self, x: [float], y: [float]) -> float {
+        let y_mean = y |> sum() / y.len() as float
+        let ss_tot = y |> map(|yi| (yi - y_mean) * (yi - y_mean)) |> sum()
+        let ss_res = x.iter() |> zip(y.iter()) |> map(|(xi, yi)| {
+            let diff = yi - self.predict(xi)
+            diff * diff
+        }) |> sum()
+        1.0 - ss_res / ss_tot
+    }
+
+    fn rmse(self, x: [float], y: [float]) -> float {
+        let mse = x.iter() |> zip(y.iter()) |> map(|(xi, yi)| {
+            let d = yi - self.predict(xi)
+            d * d
+        }) |> sum() / x.len() as float
+        sqrt(mse)
+    }
+}
+
+fn main() {
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let y = [2.1, 3.9, 6.1, 7.9, 10.1]   // roughly y = 2x
+
+    let model = LinearRegression.fit(x, y)
+    print("slope     = ${model.slope:.4}")
+    print("intercept = ${model.intercept:.4}")
+
+    let r2   = model.r_squared(x, y)
+    let rmse = model.rmse(x, y)
+    print("R²   = ${r2:.4}")
+    print("RMSE = ${rmse:.4}")
+
+    assert(abs(model.slope - 2.0) < 0.1)
+    assert(r2 > 0.99)
+    print("linear_regression — assertions passed ✓")
+}
