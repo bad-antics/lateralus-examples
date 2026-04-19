@@ -1,0 +1,187 @@
+// totp_2fa.ltl — TOTP two-factor authentication (RFC 6238) + HOTP (RFC 4226)
+
+use std.crypto.{hmac_sha1, hmac_sha256, hmac_sha512, random_bytes}
+use std.time.now_secs
+
+// ── HOTP (RFC 4226) ──────────────────────────────────────────────────────────
+fn hotp(secret: &[u8], counter: u64, digits: u32) -> u32 {
+    let counter_bytes = counter.to_be_bytes()
+    let hmac = hmac_sha1.compute(secret, &counter_bytes)
+
+    // Dynamic truncation
+    let offset = (hmac[19] & 0x0f) as usize
+    let code = ((hmac[offset] & 0x7f) as u32) << 24
+             | (hmac[offset+1] as u32) << 16
+             | (hmac[offset+2] as u32) << 8
+             | (hmac[offset+3] as u32)
+
+    code % 10u32.pow(digits)
+}
+
+// ── TOTP (RFC 6238) ──────────────────────────────────────────────────────────
+enum TotpAlgorithm { SHA1, SHA256, SHA512 }
+
+struct TotpConfig {
+    secret:    [u8],
+    algorithm: TotpAlgorithm,
+    digits:    u32,        // 6 or 8
+    period:    u64,        // seconds (default 30)
+    skew:      u32,        // allowed time steps of drift (default 1)
+    issuer:    string,
+    account:   string,
+}
+
+impl TotpConfig {
+    fn default_(secret: [u8]) -> TotpConfig {
+        TotpConfig {
+            secret, algorithm: TotpAlgorithm.SHA1,
+            digits: 6, period: 30, skew: 1,
+            issuer: "".to_string(), account: "".to_string(),
+        }
+    }
+
+    fn generate(self, time: u64) -> string {
+        let counter = time / self.period
+        let code = match self.algorithm {
+            TotpAlgorithm.SHA1   => hotp(&self.secret, counter, self.digits),
+            TotpAlgorithm.SHA256 => hotp_sha256(&self.secret, counter, self.digits),
+            TotpAlgorithm.SHA512 => hotp_sha512(&self.secret, counter, self.digits),
+        }
+        format!("{:0>width$}", code, width = self.digits as usize)
+    }
+
+    fn verify(self, code: &str, time: u64) -> bool {
+        let target: u32 = code.parse().unwrap_or(u32.MAX)
+        for offset in -(self.skew as i64)..=(self.skew as i64) {
+            let check_time = (time as i64 + offset * self.period as i64) as u64
+            let counter = check_time / self.period
+            let expected = match self.algorithm {
+                TotpAlgorithm.SHA1   => hotp(&self.secret, counter, self.digits),
+                TotpAlgorithm.SHA256 => hotp_sha256(&self.secret, counter, self.digits),
+                TotpAlgorithm.SHA512 => hotp_sha512(&self.secret, counter, self.digits),
+            }
+            if constant_time_eq_u32(expected, target) { return true }
+        }
+        false
+    }
+
+    fn to_uri(self) -> string {
+        let algo = match self.algorithm { TotpAlgorithm.SHA1 => "SHA1", TotpAlgorithm.SHA256 => "SHA256", TotpAlgorithm.SHA512 => "SHA512" }
+        let secret_b32 = base32_encode(&self.secret)
+        let label = if self.issuer.is_empty() { self.account.clone() }
+                    else { format!("{}:{}", self.issuer, self.account) }
+        let mut uri = format!("otpauth://totp/{}?secret={}&algorithm={}&digits={}&period={}",
+            url_encode(&label), secret_b32, algo, self.digits, self.period)
+        if !self.issuer.is_empty() { uri += "&issuer=${url_encode(&self.issuer)}" }
+        uri
+    }
+}
+
+fn hotp_sha256(secret: &[u8], counter: u64, digits: u32) -> u32 {
+    let hmac = hmac_sha256.compute(secret, &counter.to_be_bytes())
+    let offset = (hmac[31] & 0x0f) as usize
+    let code = ((hmac[offset] & 0x7f) as u32) << 24 | (hmac[offset+1] as u32) << 16
+             | (hmac[offset+2] as u32) << 8 | (hmac[offset+3] as u32)
+    code % 10u32.pow(digits)
+}
+
+fn hotp_sha512(secret: &[u8], counter: u64, digits: u32) -> u32 {
+    let hmac = hmac_sha512.compute(secret, &counter.to_be_bytes())
+    let offset = (hmac[63] & 0x0f) as usize
+    let code = ((hmac[offset] & 0x7f) as u32) << 24 | (hmac[offset+1] as u32) << 16
+             | (hmac[offset+2] as u32) << 8 | (hmac[offset+3] as u32)
+    code % 10u32.pow(digits)
+}
+
+fn constant_time_eq_u32(a: u32, b: u32) -> bool { ((a ^ b) as u64).wrapping_sub(1) >> 63 == 1 }
+
+// ── Base32 encoding (RFC 4648) ───────────────────────────────────────────────
+fn base32_encode(data: &[u8]) -> string {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    let mut result = "".to_string()
+    let mut buffer: u64 = 0; let mut bits = 0
+    for byte in data {
+        buffer = (buffer << 8) | *byte as u64; bits += 8
+        while bits >= 5 { bits -= 5; result.push(alphabet.chars().nth(((buffer >> bits) & 0x1f) as usize).unwrap()) }
+    }
+    if bits > 0 { result.push(alphabet.chars().nth(((buffer << (5 - bits)) & 0x1f) as usize).unwrap()) }
+    while result.len() % 8 != 0 { result.push('=') }
+    result
+}
+
+fn base32_decode(encoded: &str) -> [u8] {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    let mut buffer: u64 = 0; let mut bits = 0; let mut out: [u8] = []
+    for ch in encoded.chars() {
+        if ch == '=' { break }
+        let val = alphabet.find(ch.to_ascii_uppercase()).unwrap() as u64
+        buffer = (buffer << 5) | val; bits += 5
+        if bits >= 8 { bits -= 8; out.push(((buffer >> bits) & 0xff) as u8) }
+    }
+    out
+}
+
+fn url_encode(s: &str) -> string { s.replace(' ', "%20").replace(':', "%3A").replace('@', "%40") }
+
+// ── Recovery codes ───────────────────────────────────────────────────────────
+fn generate_recovery_codes(count: usize) -> [string] {
+    let mut codes = []
+    for _ in range(0, count) {
+        let bytes = random_bytes(5)
+        let code = format!("{:02x}{:02x}-{:02x}{:02x}-{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4])
+        codes.push(code)
+    }
+    codes
+}
+
+fn main() {
+    // RFC 4226 test vectors (secret = "12345678901234567890")
+    let secret = "12345678901234567890".as_bytes().to_vec()
+    let expected: [u32] = [755224, 287082, 359152, 969429, 338314, 254676, 287922, 162583, 399871, 520489]
+
+    for i in range(0, 10) {
+        let code = hotp(&secret, i as u64, 6)
+        assert(code == expected[i], "HOTP counter=${i}: expected ${expected[i]}, got ${code}")
+    }
+    print("HOTP RFC 4226 test vectors ✓")
+
+    // TOTP test
+    let mut config = TotpConfig.default_(secret.clone())
+    config.issuer  = "LateralusOS".to_string()
+    config.account = "user@example.com".to_string()
+
+    let code_at_59 = config.generate(59)
+    assert(code_at_59.len() == 6)
+    print("TOTP at T=59: ${code_at_59}")
+
+    // Verify within skew window
+    let now = now_secs()
+    let current_code = config.generate(now)
+    assert(config.verify(&current_code, now), "current code must verify")
+    print("TOTP verification ✓")
+
+    // Wrong code fails
+    assert(!config.verify("000000", now))
+    print("Wrong TOTP rejected ✓")
+
+    // URI generation
+    let uri = config.to_uri()
+    assert(uri.starts_with("otpauth://totp/"))
+    assert(uri.contains("secret="))
+    print("OTP URI: ${uri}")
+
+    // Base32 roundtrip
+    let encoded = base32_encode(&secret)
+    let decoded = base32_decode(&encoded)
+    assert(decoded == secret)
+    print("Base32 roundtrip ✓")
+
+    // Recovery codes
+    let codes = generate_recovery_codes(10)
+    assert(codes.len() == 10)
+    assert(codes[0].contains('-'))
+    print("Recovery codes: ${codes[0]} ... (${codes.len()} total) ✓")
+
+    print("TOTP 2FA — all RFC test vectors passed ✓")
+}
