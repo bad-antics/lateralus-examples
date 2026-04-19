@@ -1,0 +1,304 @@
+// Niche Example - File Manager
+// Terminal file browser with navigation, operations, and search.
+
+use std.fs.{read_dir, metadata, create_dir, remove_file, remove_dir_all, rename, copy}
+use std.io.{Read, Write}
+use std.time.SystemTime
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+struct FileEntry {
+    name: string,
+    path: string,
+    size: u64,
+    is_dir: bool,
+    is_symlink: bool,
+    modified: Option<SystemTime>,
+    permissions: u32,
+}
+
+impl FileEntry {
+    fn from_path(path: &str) -> Result<FileEntry, string> {
+        let meta = metadata(path).map_err(|e| e.to_string())?
+        let name = path.rsplit('/').next().unwrap_or(path).to_string()
+        ok(FileEntry {
+            name, path: path.to_string(),
+            size: meta.len(), is_dir: meta.is_dir(),
+            is_symlink: meta.is_symlink(),
+            modified: meta.modified().ok(),
+            permissions: meta.permissions().mode(),
+        })
+    }
+
+    fn display_size(self) -> string {
+        if self.is_dir { return "<DIR>".to_string() }
+        if self.size < 1024 { format!("{}B", self.size) }
+        else if self.size < 1024 * 1024 { format!("{:.1}K", self.size as f64 / 1024.0) }
+        else if self.size < 1024 * 1024 * 1024 { format!("{:.1}M", self.size as f64 / (1024.0 * 1024.0)) }
+        else { format!("{:.1}G", self.size as f64 / (1024.0 * 1024.0 * 1024.0)) }
+    }
+
+    fn extension(self) -> Option<string> {
+        if self.is_dir { return none }
+        self.name.rsplit('.').next().map(|s| s.to_string())
+    }
+
+    fn is_hidden(self) -> bool { self.name.starts_with('.') }
+
+    fn permissions_string(self) -> string {
+        let p = self.permissions
+        let mut s = string.new()
+        s.push(if self.is_dir { 'd' } else if self.is_symlink { 'l' } else { '-' })
+        s.push(if p & 0o400 != 0 { 'r' } else { '-' })
+        s.push(if p & 0o200 != 0 { 'w' } else { '-' })
+        s.push(if p & 0o100 != 0 { 'x' } else { '-' })
+        s.push(if p & 0o040 != 0 { 'r' } else { '-' })
+        s.push(if p & 0o020 != 0 { 'w' } else { '-' })
+        s.push(if p & 0o010 != 0 { 'x' } else { '-' })
+        s.push(if p & 0o004 != 0 { 'r' } else { '-' })
+        s.push(if p & 0o002 != 0 { 'w' } else { '-' })
+        s.push(if p & 0o001 != 0 { 'x' } else { '-' })
+        s
+    }
+}
+
+enum SortBy { Name, Size, Modified, Extension }
+enum SortOrder { Ascending, Descending }
+
+struct DirectoryListing {
+    path: string,
+    entries: [FileEntry],
+    sort_by: SortBy,
+    sort_order: SortOrder,
+    show_hidden: bool,
+}
+
+impl DirectoryListing {
+    fn new(path: &str) -> Result<DirectoryListing, string> {
+        let mut listing = DirectoryListing {
+            path: path.to_string(), entries: [],
+            sort_by: SortBy.Name, sort_order: SortOrder.Ascending,
+            show_hidden: false,
+        }
+        listing.refresh()?
+        ok(listing)
+    }
+
+    fn refresh(mut self) -> Result<(), string> {
+        self.entries.clear()
+        let dir = read_dir(&self.path).map_err(|e| e.to_string())?
+        for entry in dir {
+            let entry = entry.map_err(|e| e.to_string())?
+            let path = format!("{}/{}", self.path, entry.file_name())
+            if let ok(fe) = FileEntry.from_path(&path) {
+                if self.show_hidden || !fe.is_hidden() {
+                    self.entries.push(fe)
+                }
+            }
+        }
+        self.sort()
+        ok(())
+    }
+
+    fn sort(mut self) {
+        self.entries.sort_by(|a, b| {
+            // Directories first
+            if a.is_dir && !b.is_dir { return std.cmp.Ordering.Less }
+            if !a.is_dir && b.is_dir { return std.cmp.Ordering.Greater }
+            let cmp = match self.sort_by {
+                SortBy.Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortBy.Size => a.size.cmp(&b.size),
+                SortBy.Modified => a.modified.cmp(&b.modified),
+                SortBy.Extension => a.extension().cmp(&b.extension()),
+            }
+            match self.sort_order {
+                SortOrder.Ascending => cmp,
+                SortOrder.Descending => cmp.reverse(),
+            }
+        })
+    }
+
+    fn total_size(self) -> u64 {
+        self.entries.iter().map(|e| e.size).sum()
+    }
+
+    fn file_count(self) -> usize {
+        self.entries.iter().filter(|e| !e.is_dir).count()
+    }
+
+    fn dir_count(self) -> usize {
+        self.entries.iter().filter(|e| e.is_dir).count()
+    }
+}
+
+struct FileManager {
+    current_path: string,
+    listing: DirectoryListing,
+    cursor: usize,
+    selected: [string],
+    clipboard: Option<ClipboardOp>,
+    history: [string],
+    bookmarks: HashMap<string, string>,
+}
+
+enum ClipboardOp { Copy([string]), Cut([string]) }
+
+impl FileManager {
+    fn new(path: &str) -> Result<FileManager, string> {
+        let listing = DirectoryListing.new(path)?
+        ok(FileManager {
+            current_path: path.to_string(), listing,
+            cursor: 0, selected: [], clipboard: none,
+            history: vec![path.to_string()],
+            bookmarks: HashMap.new(),
+        })
+    }
+
+    fn navigate(mut self, path: &str) -> Result<(), string> {
+        self.listing = DirectoryListing.new(path)?
+        self.current_path = path.to_string()
+        self.cursor = 0
+        self.selected.clear()
+        self.history.push(path.to_string())
+        ok(())
+    }
+
+    fn go_up(mut self) -> Result<(), string> {
+        let parent = self.current_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/")
+        self.navigate(parent)
+    }
+
+    fn go_back(mut self) -> Result<(), string> {
+        if self.history.len() > 1 {
+            self.history.pop()
+            let prev = self.history.last().unwrap().clone()
+            self.navigate(&prev)
+        } else { ok(()) }
+    }
+
+    fn toggle_select(mut self) {
+        if let some(entry) = self.listing.entries.get(self.cursor) {
+            let path = entry.path.clone()
+            if self.selected.contains(&path) {
+                self.selected.retain(|p| p != &path)
+            } else {
+                self.selected.push(path)
+            }
+        }
+    }
+
+    fn delete_selected(mut self) -> Result<usize, string> {
+        let mut count = 0
+        for path in &self.selected {
+            let entry = FileEntry.from_path(path).map_err(|e| e.to_string())?
+            if entry.is_dir {
+                remove_dir_all(path).map_err(|e| e.to_string())?
+            } else {
+                remove_file(path).map_err(|e| e.to_string())?
+            }
+            count += 1
+        }
+        self.selected.clear()
+        self.listing.refresh()?
+        ok(count)
+    }
+
+    fn copy_selected(mut self) {
+        self.clipboard = some(ClipboardOp.Copy(self.selected.clone()))
+    }
+
+    fn cut_selected(mut self) {
+        self.clipboard = some(ClipboardOp.Cut(self.selected.clone()))
+    }
+
+    fn paste(mut self) -> Result<usize, string> {
+        let op = self.clipboard.take().ok_or("nothing in clipboard")?
+        let mut count = 0
+        match op {
+            ClipboardOp.Copy(paths) => {
+                for src in &paths {
+                    let name = src.rsplit('/').next().unwrap_or(src)
+                    let dest = format!("{}/{}", self.current_path, name)
+                    copy(src, &dest).map_err(|e| e.to_string())?
+                    count += 1
+                }
+            },
+            ClipboardOp.Cut(paths) => {
+                for src in &paths {
+                    let name = src.rsplit('/').next().unwrap_or(src)
+                    let dest = format!("{}/{}", self.current_path, name)
+                    rename(src, &dest).map_err(|e| e.to_string())?
+                    count += 1
+                }
+            },
+        }
+        self.selected.clear()
+        self.listing.refresh()?
+        ok(count)
+    }
+
+    fn search(self, query: &str) -> [&FileEntry] {
+        let q = query.to_lowercase()
+        self.listing.entries.iter().filter(|e| e.name.to_lowercase().contains(&q)).collect()
+    }
+
+    fn add_bookmark(mut self, name: &str) {
+        self.bookmarks.insert(name.to_string(), self.current_path.clone())
+    }
+}
+
+fn main() {
+    // FileEntry display size
+    let file = FileEntry {
+        name: "test.txt".to_string(), path: "/tmp/test.txt".to_string(),
+        size: 1536, is_dir: false, is_symlink: false, modified: none, permissions: 0o644,
+    }
+    assert(file.display_size() == "1.5K")
+    print("Display size KB ✓")
+
+    let big = FileEntry { name: "big".to_string(), path: "/big".to_string(),
+        size: 2_500_000_000, is_dir: false, is_symlink: false, modified: none, permissions: 0o755 }
+    assert(big.display_size().contains("G"))
+    print("Display size GB ✓")
+
+    let dir = FileEntry { name: "src".to_string(), path: "/src".to_string(),
+        size: 4096, is_dir: true, is_symlink: false, modified: none, permissions: 0o755 }
+    assert(dir.display_size() == "<DIR>")
+    print("Display size dir ✓")
+
+    // Extension
+    assert(file.extension() == some("txt".to_string()))
+    assert(dir.extension().is_none())
+    print("Extension ✓")
+
+    // Hidden
+    let hidden = FileEntry { name: ".gitignore".to_string(), path: "/.gitignore".to_string(),
+        size: 100, is_dir: false, is_symlink: false, modified: none, permissions: 0o644 }
+    assert(hidden.is_hidden())
+    assert(!file.is_hidden())
+    print("Hidden ✓")
+
+    // Permissions string
+    let perms = file.permissions_string()
+    assert(perms.len() == 10)
+    assert(perms.starts_with('-'))
+    print("Permissions ✓")
+
+    let dir_perms = dir.permissions_string()
+    assert(dir_perms.starts_with('d'))
+    print("Dir permissions ✓")
+
+    // Small file size
+    let tiny = FileEntry { name: "t".to_string(), path: "/t".to_string(),
+        size: 42, is_dir: false, is_symlink: false, modified: none, permissions: 0o644 }
+    assert(tiny.display_size() == "42B")
+    print("Display size bytes ✓")
+
+    // MB size
+    let medium = FileEntry { name: "m".to_string(), path: "/m".to_string(),
+        size: 5_242_880, is_dir: false, is_symlink: false, modified: none, permissions: 0o644 }
+    assert(medium.display_size().contains("M"))
+    print("Display size MB ✓")
+
+    print("File Manager complete ✓")
+}
