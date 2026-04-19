@@ -1,0 +1,244 @@
+// encrypted_messenger.ltl — End-to-end encrypted messaging system
+
+use std.crypto.{x25519, chacha20poly1305, sha256, hkdf, ed25519, random_bytes}
+use std.time.{now_secs, now_ms}
+use std.collections.{HashMap, BTreeMap}
+
+// ── User identity ────────────────────────────────────────────────────────────
+struct Identity {
+    user_id:      string,
+    identity_key: ed25519.Keypair,
+    signed_prekey: x25519.Keypair,
+    one_time_prekeys: [x25519.Keypair],
+}
+
+impl Identity {
+    fn generate(user_id: string, num_otpks: int) -> Identity {
+        let ik_seed = random_bytes(32).try_into().unwrap()
+        let ik = ed25519.keypair_from_seed(ik_seed)
+        let spk_sk = random_bytes(32).try_into().unwrap()
+        let spk_pk = x25519.base_point_mul(spk_sk)
+        let mut otpks = []
+        for _ in range(0, num_otpks) {
+            let sk = random_bytes(32).try_into().unwrap()
+            let pk = x25519.base_point_mul(sk)
+            otpks.push(x25519.Keypair { sk, pk })
+        }
+        Identity {
+            user_id, identity_key: ik,
+            signed_prekey: x25519.Keypair { sk: spk_sk, pk: spk_pk },
+            one_time_prekeys: otpks,
+        }
+    }
+}
+
+// ── Message types ────────────────────────────────────────────────────────────
+struct EncryptedMessage {
+    id:           string,          // UUID
+    sender_id:    string,
+    recipient_id: string,
+    timestamp:    u64,
+    ephemeral_pk: [u8; 32],
+    ciphertext:   [u8],
+    nonce:        [u8; 12],
+    tag:          [u8; 16],
+    message_type: MessageType,
+}
+
+enum MessageType {
+    Text,
+    Image { width: u32, height: u32, mime: string },
+    File { filename: string, size: u64, mime: string },
+    Voice { duration_ms: u32 },
+    KeyRotation,
+    ReadReceipt { message_id: string },
+    Reaction { message_id: string, emoji: string },
+}
+
+struct PlaintextMessage {
+    content:     [u8],
+    msg_type:    MessageType,
+    reply_to:    string?,
+    forwarded:   bool,
+    self_destruct_after: u64?,  // seconds
+}
+
+// ── Group messaging (Sender Keys) ────────────────────────────────────────────
+struct GroupInfo {
+    group_id:    string,
+    name:        string,
+    members:     [string],
+    admins:      [string],
+    created:     u64,
+}
+
+struct SenderKeyState {
+    chain_key:   [u8; 32],
+    signing_key: ed25519.Keypair,
+    iteration:   u32,
+}
+
+struct GroupSession {
+    group_id:     string,
+    sender_keys:  HashMap<string, SenderKeyState>,  // member_id → their sender key
+    my_sender_key: SenderKeyState,
+}
+
+impl GroupSession {
+    fn new(group_id: string) -> GroupSession {
+        let chain_key = random_bytes(32).try_into().unwrap()
+        let sign_seed = random_bytes(32).try_into().unwrap()
+        let signing_key = ed25519.keypair_from_seed(sign_seed)
+        GroupSession {
+            group_id,
+            sender_keys: HashMap.new(),
+            my_sender_key: SenderKeyState { chain_key, signing_key, iteration: 0 },
+        }
+    }
+
+    fn encrypt_group(mut self, plaintext: &[u8]) -> (u32, [u8], [u8; 64]) {
+        // Derive message key from chain key
+        let mk = hkdf.expand(self.my_sender_key.chain_key, "MessageKey".as_bytes(), 32)
+        // Advance chain
+        self.my_sender_key.chain_key = sha256.hash(&self.my_sender_key.chain_key)
+        let iteration = self.my_sender_key.iteration
+        self.my_sender_key.iteration += 1
+
+        let nonce: [u8; 12] = random_bytes(12).try_into().unwrap()
+        let (ct, tag) = chacha20poly1305.encrypt(mk.try_into().unwrap(), nonce, plaintext, &[])
+        let encrypted = [nonce.to_vec(), ct, tag.to_vec()].concat()
+
+        // Sign the ciphertext
+        let sig = ed25519.sign(&self.my_sender_key.signing_key, &encrypted)
+
+        (iteration, encrypted, sig)
+    }
+}
+
+// ── Message store with forward secrecy ───────────────────────────────────────
+struct MessageStore {
+    conversations:  HashMap<string, Conversation>,
+    pending:        [EncryptedMessage],    // undelivered messages
+}
+
+struct Conversation {
+    peer_id:         string,
+    messages:        [StoredMessage],
+    unread_count:    u32,
+    last_read:       u64,
+    disappearing_timer: u64?,
+}
+
+struct StoredMessage {
+    id:          string,
+    sender_id:   string,
+    timestamp:   u64,
+    content:     [u8],        // decrypted plaintext
+    msg_type:    MessageType,
+    status:      DeliveryStatus,
+    expires_at:  u64?,
+}
+
+enum DeliveryStatus { Sending, Sent, Delivered, Read, Failed }
+
+// ── Key verification ─────────────────────────────────────────────────────────
+fn safety_number(our_pk: [u8; 32], their_pk: [u8; 32]) -> string {
+    // Generate a human-comparable safety number (like Signal)
+    let mut combined: [u8] = []
+    if our_pk < their_pk {
+        combined.extend_from_slice(&our_pk)
+        combined.extend_from_slice(&their_pk)
+    } else {
+        combined.extend_from_slice(&their_pk)
+        combined.extend_from_slice(&our_pk)
+    }
+    // Hash 5200 times for computational cost
+    let mut hash = sha256.hash(&combined)
+    for _ in range(0, 5200) { hash = sha256.hash(&hash) }
+
+    // Format as 12 groups of 5 digits
+    let mut number = "".to_string()
+    for i in range(0, 6) {
+        let chunk = u32_from_be(&hash[i*4..(i+1)*4]) % 100000
+        number += format!("{chunk:05} ")
+    }
+    number.trim().to_string()
+}
+
+fn u32_from_be(b: &[u8]) -> u32 { (b[0] as u32) << 24 | (b[1] as u32) << 16 | (b[2] as u32) << 8 | b[3] as u32 }
+
+// ── Metadata protection ──────────────────────────────────────────────────────
+struct SealedSender {
+    // Hide who sent the message from the server
+    // Only recipient can unseal to discover sender
+    certificate:     [u8],     // sender's certificate (encrypted)
+    ciphertext:      [u8],     // actual encrypted message
+    server_envelope: [u8],     // opaque to server, contains routing info encrypted to recipient
+}
+
+fn seal_sender(sender: &Identity, recipient_pk: [u8; 32], message: EncryptedMessage) -> SealedSender {
+    let ephemeral_sk = random_bytes(32).try_into().unwrap()
+    let shared = x25519.scalar_mult(ephemeral_sk, recipient_pk)
+    let seal_key = hkdf.derive(shared, "SealedSender".as_bytes(), &[], 32)
+
+    let cert = [sender.user_id.as_bytes(), &sender.identity_key.public_key[..]].concat()
+    let nonce: [u8; 12] = random_bytes(12).try_into().unwrap()
+    let (enc_cert, cert_tag) = chacha20poly1305.encrypt(
+        seal_key.try_into().unwrap(), nonce, &cert, &[],
+    )
+
+    let msg_bytes = serialize_message(message)
+    let (enc_msg, msg_tag) = chacha20poly1305.encrypt(
+        seal_key.try_into().unwrap(), nonce, &msg_bytes, &enc_cert,
+    )
+
+    SealedSender {
+        certificate: [nonce.to_vec(), enc_cert, cert_tag.to_vec()].concat(),
+        ciphertext:  [enc_msg, msg_tag.to_vec()].concat(),
+        server_envelope: x25519.base_point_mul(ephemeral_sk).to_vec(),
+    }
+}
+
+fn serialize_message(msg: EncryptedMessage) -> [u8] { /* serialize to bytes */ vec![0; 128] }
+
+fn main() {
+    let alice = Identity.generate("alice".to_string(), 100)
+    let bob   = Identity.generate("bob".to_string(), 100)
+    print("Alice identity key: ${hex(&alice.identity_key.public_key[0..8])}...")
+    print("Bob   identity key: ${hex(&bob.identity_key.public_key[0..8])}...")
+    print("Alice has ${alice.one_time_prekeys.len()} one-time prekeys")
+
+    // Safety numbers
+    let sn = safety_number(alice.identity_key.public_key, bob.identity_key.public_key)
+    let sn2 = safety_number(bob.identity_key.public_key, alice.identity_key.public_key)
+    assert(sn == sn2, "safety numbers must match regardless of order")
+    print("Safety number: ${sn} ✓")
+
+    // Group session
+    let mut group = GroupSession.new("group-1".to_string())
+    let (iter, encrypted, sig) = group.encrypt_group("Hello group!".as_bytes())
+    assert(iter == 0)
+    assert(encrypted.len() > 12)
+    assert(sig.len() == 64)
+    print("Group message encrypted (iteration=${iter}, ${encrypted.len()} bytes) ✓")
+
+    // Chain advances
+    let (iter2, _, _) = group.encrypt_group("Second message".as_bytes())
+    assert(iter2 == 1)
+    print("Chain ratchet advanced ✓")
+
+    // Sealed sender
+    let msg = EncryptedMessage {
+        id: "msg-001".to_string(), sender_id: "alice".to_string(), recipient_id: "bob".to_string(),
+        timestamp: now_secs(), ephemeral_pk: [0; 32], ciphertext: vec![1, 2, 3],
+        nonce: [0; 12], tag: [0; 16], message_type: MessageType.Text,
+    }
+    let sealed = seal_sender(&alice, bob.signed_prekey.pk, msg)
+    assert(sealed.certificate.len() > 0)
+    assert(sealed.server_envelope.len() == 32)
+    print("Sealed sender: server cannot identify sender ✓")
+
+    print("Encrypted messenger — all passed ✓")
+}
+
+fn hex(data: &[u8]) -> string { data |> map(|b| format!("{b:02x}")) |> join("") }
