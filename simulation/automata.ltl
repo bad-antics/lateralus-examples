@@ -1,0 +1,111 @@
+// automata.ltl — 1D elementary cellular automata (Wolfram rules) + 2D automata
+use std.fs.File
+
+// ── Wolfram 1D Automaton ───────────────────────────────────────────────────────
+fn wolfram_rule(n: u8) -> [bool] {
+    range(0, 8) |> map(|i| (n >> i) & 1 == 1) |> collect()
+}
+
+fn step_1d(cells: [bool], rule: [bool]) -> [bool] {
+    let n = cells.len()
+    range(0, n) |> map(|i| {
+        let l = cells[(i + n - 1) % n]
+        let c = cells[i]
+        let r = cells[(i + 1)     % n]
+        let idx = (l as int * 4) + (c as int * 2) + (r as int)
+        rule[idx]
+    }) |> collect()
+}
+
+fn render_1d_svg(rule_num: u8, width: int, generations: int) -> string {
+    let rule  = wolfram_rule(rule_num)
+    let mut cells = [false; width]
+    cells[width / 2] = true
+    let cell_px = 4
+    let w = width * cell_px
+    let h = generations * cell_px
+    let mut rects = ""
+    for gen in range(0, generations) {
+        for (x, on) in cells.iter().enumerate() {
+            if *on {
+                rects += "<rect x='${x * cell_px}' y='${gen * cell_px}' width='${cell_px}' height='${cell_px}'/>
+"
+            }
+        }
+        cells = step_1d(cells, rule)
+    }
+    "<svg xmlns='http://www.w3.org/2000/svg' width='${w}' height='${h}' style='background:#fff'>
+<g fill='#111'>${rects}</g></svg>"
+}
+
+// ── Brian's Brain (2-state + dying) ──────────────────────────────────────────
+enum BrainCell { Off, On, Dying }
+
+struct BrainGrid { cells: [[BrainCell]], w: int, h: int }
+
+impl BrainGrid {
+    fn new(w: int, h: int) -> BrainGrid {
+        BrainGrid {
+            cells: range(0, h) |> map(|_| range(0, w) |> map(|_|
+                if std.random.rand_float() < 0.3 { BrainCell.On } else { BrainCell.Off }
+            ) |> collect()) |> collect(),
+            w, h,
+        }
+    }
+
+    fn on_neighbours(self, x: int, y: int) -> int {
+        [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+            |> filter(|(dx,dy)| {
+                let nx = ((x+dx) % self.w + self.w) % self.w
+                let ny = ((y+dy) % self.h + self.h) % self.h
+                matches!(self.cells[ny][nx], BrainCell.On)
+            }) |> count()
+    }
+
+    fn step(self) -> BrainGrid {
+        let cells = range(0, self.h) |> map(|y| {
+            range(0, self.w) |> map(|x| {
+                match self.cells[y][x] {
+                    BrainCell.On    => BrainCell.Dying,
+                    BrainCell.Dying => BrainCell.Off,
+                    BrainCell.Off   => {
+                        if self.on_neighbours(x, y) == 2 { BrainCell.On } else { BrainCell.Off }
+                    },
+                }
+            }) |> collect()
+        }) |> collect()
+        BrainGrid { cells, w: self.w, h: self.h }
+    }
+
+    fn render_ansi(self) -> string {
+        self.cells |> map(|row| {
+            row |> map(|c| match c {
+                BrainCell.On    => "[96m█[0m",
+                BrainCell.Dying => "[34m▒[0m",
+                BrainCell.Off   => " ",
+            }) |> join("")
+        }) |> join("
+")
+    }
+}
+
+fn main() {
+    // Rule 110 (Turing-complete!)
+    let svg = render_1d_svg(110, 128, 80)
+    File.create("/tmp/rule110.svg").write_all(svg.as_bytes())
+    print("Rule 110 automaton → /tmp/rule110.svg ✓")
+
+    // Rule 30 (used in early Mathematica PRNG)
+    let svg30 = render_1d_svg(30, 128, 80)
+    File.create("/tmp/rule30.svg").write_all(svg30.as_bytes())
+    print("Rule 30 automaton  → /tmp/rule30.svg ✓")
+
+    // Brian's Brain
+    let mut grid = BrainGrid.new(60, 30)
+    for _ in range(0, 5) { grid = grid.step() }
+    print("
+Brian's Brain (after 5 steps):")
+    print(grid.render_ansi())
+    print("
+simulation/automata — complete ✓")
+}
