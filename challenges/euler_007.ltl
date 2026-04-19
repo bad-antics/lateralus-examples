@@ -1,0 +1,29 @@
+// Project Euler #7 — 10001st prime number
+// Run: lateralus run challenges/euler_007.ltl
+
+fn is_prime(n: int) -> bool {
+    if n < 2 { return false }
+    if n == 2 { return true }
+    if n % 2 == 0 { return false }
+    let limit = n |> float() |> sqrt() |> int()
+    !range(3, limit + 1, 2) |> any(i => n % i == 0)
+}
+
+fn nth_prime(n: int) -> int {
+    mut count = 0
+    mut candidate = 1
+    while count < n {
+        candidate += 1
+        if is_prime(candidate) { count += 1 }
+    }
+    candidate
+}
+
+fn main() {
+    let result = nth_prime(10001)
+    print("10001st prime: ${result}")
+    assert_eq(result, 104743)
+    print("✓ Correct!")
+}
+
+main()
