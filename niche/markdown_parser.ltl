@@ -1,0 +1,425 @@
+// Niche Example — Markdown Parser
+// Converts Markdown text to HTML with inline and block elements.
+
+use std.collections.HashMap
+
+// ── AST ──────────────────────────────────────────────────────────────────────
+enum Block {
+    Heading(u8, [Inline]),           // level 1-6
+    Paragraph([Inline]),
+    CodeBlock(Option<string>, string), // language, code
+    BlockQuote([Block]),
+    UnorderedList([[Inline]]),
+    OrderedList([[Inline]]),
+    HorizontalRule,
+    Table(TableData),
+}
+
+struct TableData {
+    headers: [[Inline]],
+    alignments: [Alignment],
+    rows: [[[Inline]]],
+}
+
+enum Alignment { Left, Center, Right, None }
+
+enum Inline {
+    Text(string),
+    Bold([Inline]),
+    Italic([Inline]),
+    Code(string),
+    Link(string, string, [Inline]),   // url, title, text
+    Image(string, string, string),    // url, title, alt
+    LineBreak,
+    Strikethrough([Inline]),
+}
+
+// ── Block Parser ─────────────────────────────────────────────────────────────
+struct MarkdownParser {
+    lines: [string],
+    pos: usize,
+}
+
+impl MarkdownParser {
+    fn new(input: &str) -> MarkdownParser {
+        MarkdownParser {
+            lines: input.lines().map(|l| l.to_string()).collect(),
+            pos: 0,
+        }
+    }
+
+    fn peek(self) -> Option<&string> { self.lines.get(self.pos) }
+    fn advance(mut self) -> Option<&string> {
+        let line = self.lines.get(self.pos); self.pos += 1; line
+    }
+    fn is_done(self) -> bool { self.pos >= self.lines.len() }
+
+    fn parse(mut self) -> [Block] {
+        let mut blocks: [Block] = []
+        while !self.is_done() {
+            if let some(block) = self.parse_block() { blocks.push(block) }
+        }
+        blocks
+    }
+
+    fn parse_block(mut self) -> Option<Block> {
+        let line = self.peek()?.clone()
+        let trimmed = line.trim()
+
+        if trimmed.is_empty() { self.advance(); return none }
+
+        // Heading
+        if trimmed.starts_with('#') {
+            let level = trimmed.chars().take_while(|&c| c == '#').count() as u8
+            if level <= 6 && trimmed.len() > level as usize {
+                self.advance()
+                let text = trimmed[level as usize..].trim()
+                return some(Block.Heading(level, parse_inlines(text)))
+            }
+        }
+
+        // Horizontal rule
+        if trimmed.len() >= 3 && (trimmed.chars().all(|c| c == '-' || c == ' ')
+            || trimmed.chars().all(|c| c == '*' || c == ' ')
+            || trimmed.chars().all(|c| c == '_' || c == ' '))
+            && trimmed.chars().filter(|&c| c != ' ').count() >= 3 {
+            self.advance()
+            return some(Block.HorizontalRule)
+        }
+
+        // Code block
+        if trimmed.starts_with("```") {
+            let lang = trimmed[3..].trim()
+            let language = if lang.is_empty() { none } else { some(lang.to_string()) }
+            self.advance()
+            let mut code = string.new()
+            while let some(line) = self.peek() {
+                if line.trim().starts_with("```") { self.advance(); break }
+                if !code.is_empty() { code.push('\n') }
+                code.push_str(line)
+                self.advance()
+            }
+            return some(Block.CodeBlock(language, code))
+        }
+
+        // Block quote
+        if trimmed.starts_with('>') {
+            let mut quote_lines: [string] = []
+            while let some(line) = self.peek() {
+                if line.trim().starts_with('>') {
+                    let content = line.trim().trim_start_matches('>').trim_start()
+                    quote_lines.push(content.to_string())
+                    self.advance()
+                } else { break }
+            }
+            let inner_text = quote_lines.join("\n")
+            let inner_blocks = MarkdownParser.new(&inner_text).parse()
+            return some(Block.BlockQuote(inner_blocks))
+        }
+
+        // Unordered list
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+            let mut items: [[Inline]] = []
+            while let some(line) = self.peek() {
+                let t = line.trim()
+                if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
+                    items.push(parse_inlines(&t[2..]))
+                    self.advance()
+                } else { break }
+            }
+            return some(Block.UnorderedList(items))
+        }
+
+        // Ordered list
+        if trimmed.len() > 2 && trimmed[0..1].chars().all(|c| c.is_ascii_digit()) && trimmed.contains(". ") {
+            let mut items: [[Inline]] = []
+            while let some(line) = self.peek() {
+                let t = line.trim()
+                if let some(dot_pos) = t.find(". ") {
+                    if t[..dot_pos].chars().all(|c| c.is_ascii_digit()) {
+                        items.push(parse_inlines(&t[dot_pos+2..]))
+                        self.advance()
+                    } else { break }
+                } else { break }
+            }
+            return some(Block.OrderedList(items))
+        }
+
+        // Table
+        if trimmed.contains('|') && self.pos + 1 < self.lines.len() {
+            let next = self.lines[self.pos + 1].trim().to_string()
+            if next.contains("---") && next.contains('|') {
+                return self.parse_table()
+            }
+        }
+
+        // Paragraph (collect consecutive non-empty lines)
+        let mut text = string.new()
+        while let some(line) = self.peek() {
+            let t = line.trim()
+            if t.is_empty() { break }
+            if t.starts_with('#') || t.starts_with("```") || t.starts_with('>') { break }
+            if !text.is_empty() { text.push(' ') }
+            text.push_str(t)
+            self.advance()
+        }
+        some(Block.Paragraph(parse_inlines(&text)))
+    }
+
+    fn parse_table(mut self) -> Option<Block> {
+        let header_line = self.advance()?.clone()
+        let sep_line = self.advance()?.clone()
+
+        let headers: [[Inline]] = header_line.split('|')
+            .map(|s| s.trim()).filter(|s| !s.is_empty())
+            .map(|s| parse_inlines(s)).collect()
+
+        let alignments: [Alignment] = sep_line.split('|')
+            .map(|s| s.trim()).filter(|s| !s.is_empty())
+            .map(|s| {
+                let starts = s.starts_with(':')
+                let ends = s.ends_with(':')
+                if starts && ends { Alignment.Center }
+                else if ends { Alignment.Right }
+                else if starts { Alignment.Left }
+                else { Alignment.None }
+            }).collect()
+
+        let mut rows: [[[Inline]]] = []
+        while let some(line) = self.peek() {
+            if !line.contains('|') || line.trim().is_empty() { break }
+            let row: [[Inline]] = line.split('|')
+                .map(|s| s.trim()).filter(|s| !s.is_empty())
+                .map(|s| parse_inlines(s)).collect()
+            rows.push(row)
+            self.advance()
+        }
+
+        some(Block.Table(TableData { headers, alignments, rows }))
+    }
+}
+
+// ── Inline Parser ────────────────────────────────────────────────────────────
+fn parse_inlines(text: &str) -> [Inline] {
+    let mut result: [Inline] = []
+    let chars: [char] = text.chars().collect()
+    let mut i = 0
+    let mut current = string.new()
+
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                current.push(chars[i + 1]); i += 2
+            }
+            '*' | '_' if i + 1 < chars.len() && chars[i + 1] == chars[i] => {
+                if !current.is_empty() { result.push(Inline.Text(current.clone())); current.clear() }
+                let delim = chars[i]
+                i += 2
+                let mut inner = string.new()
+                while i + 1 < chars.len() && !(chars[i] == delim && chars[i + 1] == delim) {
+                    inner.push(chars[i]); i += 1
+                }
+                if i + 1 < chars.len() { i += 2 }
+                result.push(Inline.Bold(parse_inlines(&inner)))
+            }
+            '*' | '_' => {
+                if !current.is_empty() { result.push(Inline.Text(current.clone())); current.clear() }
+                let delim = chars[i]; i += 1
+                let mut inner = string.new()
+                while i < chars.len() && chars[i] != delim { inner.push(chars[i]); i += 1 }
+                if i < chars.len() { i += 1 }
+                result.push(Inline.Italic(parse_inlines(&inner)))
+            }
+            '`' => {
+                if !current.is_empty() { result.push(Inline.Text(current.clone())); current.clear() }
+                i += 1
+                let mut code = string.new()
+                while i < chars.len() && chars[i] != '`' { code.push(chars[i]); i += 1 }
+                if i < chars.len() { i += 1 }
+                result.push(Inline.Code(code))
+            }
+            '[' => {
+                if !current.is_empty() { result.push(Inline.Text(current.clone())); current.clear() }
+                i += 1
+                let mut link_text = string.new()
+                while i < chars.len() && chars[i] != ']' { link_text.push(chars[i]); i += 1 }
+                if i < chars.len() { i += 1 }
+                if i < chars.len() && chars[i] == '(' {
+                    i += 1
+                    let mut url = string.new()
+                    while i < chars.len() && chars[i] != ')' { url.push(chars[i]); i += 1 }
+                    if i < chars.len() { i += 1 }
+                    result.push(Inline.Link(url, string.new(), parse_inlines(&link_text)))
+                } else {
+                    current.push('['); current.push_str(&link_text); current.push(']')
+                }
+            }
+            '!' if i + 1 < chars.len() && chars[i + 1] == '[' => {
+                if !current.is_empty() { result.push(Inline.Text(current.clone())); current.clear() }
+                i += 2
+                let mut alt = string.new()
+                while i < chars.len() && chars[i] != ']' { alt.push(chars[i]); i += 1 }
+                if i < chars.len() { i += 1 }
+                if i < chars.len() && chars[i] == '(' {
+                    i += 1
+                    let mut url = string.new()
+                    while i < chars.len() && chars[i] != ')' { url.push(chars[i]); i += 1 }
+                    if i < chars.len() { i += 1 }
+                    result.push(Inline.Image(url, string.new(), alt))
+                }
+            }
+            '~' if i + 1 < chars.len() && chars[i + 1] == '~' => {
+                if !current.is_empty() { result.push(Inline.Text(current.clone())); current.clear() }
+                i += 2
+                let mut inner = string.new()
+                while i + 1 < chars.len() && !(chars[i] == '~' && chars[i + 1] == '~') {
+                    inner.push(chars[i]); i += 1
+                }
+                if i + 1 < chars.len() { i += 2 }
+                result.push(Inline.Strikethrough(parse_inlines(&inner)))
+            }
+            c => { current.push(c); i += 1 }
+        }
+    }
+    if !current.is_empty() { result.push(Inline.Text(current)) }
+    result
+}
+
+// ── HTML Renderer ────────────────────────────────────────────────────────────
+fn render_html(blocks: &[Block]) -> string {
+    let mut html = string.new()
+    for block in blocks {
+        match block {
+            Block.Heading(level, inlines) => {
+                html += &format!("<h{level}>{}</h{level}>\n", render_inlines(inlines))
+            }
+            Block.Paragraph(inlines) => {
+                html += &format!("<p>{}</p>\n", render_inlines(inlines))
+            }
+            Block.CodeBlock(lang, code) => {
+                let class = if let some(l) = lang { format!(r#" class="language-{l}""#) } else { string.new() }
+                html += &format!("<pre><code{class}>{}</code></pre>\n", escape_html(code))
+            }
+            Block.BlockQuote(inner) => {
+                html += &format!("<blockquote>\n{}</blockquote>\n", render_html(inner))
+            }
+            Block.UnorderedList(items) => {
+                html += "<ul>\n"
+                for item in items { html += &format!("<li>{}</li>\n", render_inlines(item)) }
+                html += "</ul>\n"
+            }
+            Block.OrderedList(items) => {
+                html += "<ol>\n"
+                for item in items { html += &format!("<li>{}</li>\n", render_inlines(item)) }
+                html += "</ol>\n"
+            }
+            Block.HorizontalRule => html += "<hr>\n",
+            Block.Table(data) => {
+                html += "<table>\n<thead>\n<tr>\n"
+                for header in &data.headers { html += &format!("<th>{}</th>", render_inlines(header)) }
+                html += "\n</tr>\n</thead>\n<tbody>\n"
+                for row in &data.rows {
+                    html += "<tr>\n"
+                    for cell in row { html += &format!("<td>{}</td>", render_inlines(cell)) }
+                    html += "\n</tr>\n"
+                }
+                html += "</tbody>\n</table>\n"
+            }
+        }
+    }
+    html
+}
+
+fn render_inlines(inlines: &[Inline]) -> string {
+    let mut s = string.new()
+    for inline in inlines {
+        match inline {
+            Inline.Text(t) => s += &escape_html(t),
+            Inline.Bold(inner) => s += &format!("<strong>{}</strong>", render_inlines(inner)),
+            Inline.Italic(inner) => s += &format!("<em>{}</em>", render_inlines(inner)),
+            Inline.Code(code) => s += &format!("<code>{}</code>", escape_html(code)),
+            Inline.Link(url, _, text) => s += &format!(r#"<a href="{url}">{}</a>"#, render_inlines(text)),
+            Inline.Image(url, _, alt) => s += &format!(r#"<img src="{url}" alt="{alt}">"#),
+            Inline.LineBreak => s += "<br>",
+            Inline.Strikethrough(inner) => s += &format!("<del>{}</del>", render_inlines(inner)),
+        }
+    }
+    s
+}
+
+fn escape_html(s: &str) -> string {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+pub fn parse(input: &str) -> [Block] { MarkdownParser.new(input).parse() }
+pub fn to_html(input: &str) -> string { render_html(&parse(input)) }
+
+fn main() {
+    // Headings
+    let blocks = parse("# Hello\n## World")
+    assert(blocks.len() == 2)
+    match &blocks[0] { Block.Heading(1, _) => {} _ => panic("expected h1") }
+    match &blocks[1] { Block.Heading(2, _) => {} _ => panic("expected h2") }
+    print("Headings ✓")
+
+    // Bold and italic
+    let html = to_html("**bold** and *italic*")
+    assert(html.contains("<strong>bold</strong>"))
+    assert(html.contains("<em>italic</em>"))
+    print("Bold/italic ✓")
+
+    // Code
+    let html = to_html("Use `code` here")
+    assert(html.contains("<code>code</code>"))
+    print("Inline code ✓")
+
+    // Code block
+    let html = to_html("```rust\nfn main() {}\n```")
+    assert(html.contains(r#"class="language-rust""#))
+    assert(html.contains("fn main()"))
+    print("Code block ✓")
+
+    // Links
+    let html = to_html("[click](https://example.com)")
+    assert(html.contains(r#"href="https://example.com""#))
+    print("Links ✓")
+
+    // Lists
+    let html = to_html("- item1\n- item2\n- item3")
+    assert(html.contains("<ul>"))
+    assert(html.contains("<li>item1</li>"))
+    print("Unordered list ✓")
+
+    let html = to_html("1. first\n2. second")
+    assert(html.contains("<ol>"))
+    print("Ordered list ✓")
+
+    // Block quote
+    let html = to_html("> quoted text")
+    assert(html.contains("<blockquote>"))
+    print("Block quote ✓")
+
+    // HR
+    let html = to_html("---")
+    assert(html.contains("<hr>"))
+    print("Horizontal rule ✓")
+
+    // HTML escaping
+    let html = to_html("<script>alert('xss')</script>")
+    assert(!html.contains("<script>"))
+    assert(html.contains("&lt;script&gt;"))
+    print("HTML escaping ✓")
+
+    // Strikethrough
+    let html = to_html("~~deleted~~")
+    assert(html.contains("<del>deleted</del>"))
+    print("Strikethrough ✓")
+
+    // Images
+    let html = to_html("![alt](img.png)")
+    assert(html.contains(r#"<img src="img.png" alt="alt">"#))
+    print("Images ✓")
+
+    print("Markdown Parser complete ✓")
+}
