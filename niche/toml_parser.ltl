@@ -1,0 +1,315 @@
+// Niche Example - TOML Parser
+// Key-value pairs, tables, arrays, inline tables, strings.
+
+use std.collections.HashMap
+
+enum TomlValue {
+    String(string),
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+    Array([TomlValue]),
+    Table(TomlTable),
+    DateTime(string),
+}
+
+type TomlTable = HashMap<string, TomlValue>
+
+impl TomlValue {
+    fn as_str(self) -> Option<&str> {
+        match self { TomlValue.String(s) => some(s.as_str()), _ => none }
+    }
+    fn as_i64(self) -> Option<i64> {
+        match self { TomlValue.Integer(n) => some(*n), _ => none }
+    }
+    fn as_f64(self) -> Option<f64> {
+        match self { TomlValue.Float(f) => some(*f), TomlValue.Integer(n) => some(*n as f64), _ => none }
+    }
+    fn as_bool(self) -> Option<bool> {
+        match self { TomlValue.Boolean(b) => some(*b), _ => none }
+    }
+    fn as_array(self) -> Option<&[TomlValue]> {
+        match self { TomlValue.Array(a) => some(a.as_slice()), _ => none }
+    }
+    fn as_table(self) -> Option<&TomlTable> {
+        match self { TomlValue.Table(t) => some(t), _ => none }
+    }
+    fn get(self, key: &str) -> Option<&TomlValue> {
+        match self { TomlValue.Table(t) => t.get(key), _ => none }
+    }
+    fn type_name(self) -> &str {
+        match self {
+            TomlValue.String(_) => "string", TomlValue.Integer(_) => "integer",
+            TomlValue.Float(_) => "float", TomlValue.Boolean(_) => "boolean",
+            TomlValue.Array(_) => "array", TomlValue.Table(_) => "table",
+            TomlValue.DateTime(_) => "datetime",
+        }
+    }
+}
+
+enum Token {
+    Key(string), Equals, Dot, Comma,
+    LBracket, RBracket, LBrace, RBrace,
+    StringVal(string), IntVal(i64), FloatVal(f64), BoolVal(bool),
+    Newline, Eof,
+}
+
+struct Tokenizer {
+    input: [char],
+    pos: usize,
+}
+
+impl Tokenizer {
+    fn new(input: &str) -> Tokenizer { Tokenizer { input: input.chars().collect(), pos: 0 } }
+    fn peek(self) -> Option<char> { self.input.get(self.pos).copied() }
+    fn advance(mut self) -> Option<char> {
+        let ch = self.input.get(self.pos).copied()?
+        self.pos += 1
+        some(ch)
+    }
+
+    fn skip_ws(mut self) {
+        while let some(ch) = self.peek() {
+            if ch == ' ' || ch == '\t' { self.advance(); }
+            else { break }
+        }
+    }
+
+    fn skip_comment(mut self) {
+        if self.peek() == some('#') {
+            while let some(ch) = self.advance() {
+                if ch == '\n' { break }
+            }
+        }
+    }
+
+    fn next_token(mut self) -> Token {
+        self.skip_ws()
+        self.skip_comment()
+        self.skip_ws()
+
+        match self.peek() {
+            none => Token.Eof,
+            some('\n') | some('\r') => { self.advance(); Token.Newline }
+            some('=') => { self.advance(); Token.Equals }
+            some('.') => { self.advance(); Token.Dot }
+            some(',') => { self.advance(); Token.Comma }
+            some('[') => { self.advance(); Token.LBracket }
+            some(']') => { self.advance(); Token.RBracket }
+            some('{') => { self.advance(); Token.LBrace }
+            some('}') => { self.advance(); Token.RBrace }
+            some('"') => self.read_string(),
+            some(ch) if ch.is_ascii_digit() || ch == '+' || ch == '-' => self.read_number(),
+            some('t') | some('f') => self.read_bool_or_key(),
+            some(ch) if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' => self.read_bare_key(),
+            _ => { self.advance(); Token.Eof }
+        }
+    }
+
+    fn read_string(mut self) -> Token {
+        self.advance()  // opening quote
+        let mut s = string.new()
+        while let some(ch) = self.advance() {
+            if ch == '"' { break }
+            if ch == '\\' {
+                match self.advance() {
+                    some('n') => s.push('\n'),
+                    some('t') => s.push('\t'),
+                    some('\\') => s.push('\\'),
+                    some('"') => s.push('"'),
+                    some(c) => { s.push('\\'); s.push(c) }
+                    none => break,
+                }
+            } else { s.push(ch) }
+        }
+        Token.StringVal(s)
+    }
+
+    fn read_number(mut self) -> Token {
+        let mut s = string.new()
+        let mut is_float = false
+        if self.peek() == some('+') || self.peek() == some('-') {
+            s.push(self.advance().unwrap())
+        }
+        while let some(ch) = self.peek() {
+            if ch.is_ascii_digit() || ch == '_' {
+                if ch != '_' { s.push(ch) }
+                self.advance();
+            } else if ch == '.' && !is_float {
+                is_float = true; s.push(ch); self.advance();
+            } else { break }
+        }
+        if is_float { Token.FloatVal(s.parse::<f64>().unwrap_or(0.0)) }
+        else { Token.IntVal(s.parse::<i64>().unwrap_or(0)) }
+    }
+
+    fn read_bool_or_key(mut self) -> Token {
+        let mut s = string.new()
+        while let some(ch) = self.peek() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                s.push(ch); self.advance();
+            } else { break }
+        }
+        match s.as_str() {
+            "true" => Token.BoolVal(true),
+            "false" => Token.BoolVal(false),
+            _ => Token.Key(s),
+        }
+    }
+
+    fn read_bare_key(mut self) -> Token {
+        let mut s = string.new()
+        while let some(ch) = self.peek() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                s.push(ch); self.advance();
+            } else { break }
+        }
+        Token.Key(s)
+    }
+}
+
+struct TomlParser {
+    tokenizer: Tokenizer,
+    current: Token,
+}
+
+impl TomlParser {
+    fn new(input: &str) -> TomlParser {
+        let mut tokenizer = Tokenizer.new(input)
+        let current = tokenizer.next_token()
+        TomlParser { tokenizer, current }
+    }
+
+    fn next(mut self) -> Token {
+        let old = std.mem.replace(&mut self.current, self.tokenizer.next_token())
+        old
+    }
+
+    fn skip_newlines(mut self) {
+        while match &self.current { Token.Newline => true, _ => false } { self.next(); }
+    }
+
+    fn parse(mut self) -> Result<TomlTable, string> {
+        let mut root: TomlTable = HashMap.new()
+        let mut current_path: [string] = []
+
+        loop {
+            self.skip_newlines()
+            match &self.current {
+                Token.Eof => break,
+                Token.LBracket => {
+                    self.next()
+                    let mut path: [string] = []
+                    loop {
+                        match self.next() {
+                            Token.Key(k) => path.push(k),
+                            Token.StringVal(s) => path.push(s),
+                            _ => break,
+                        }
+                        match &self.current { Token.Dot => { self.next(); } _ => break }
+                    }
+                    // consume ]
+                    match &self.current { Token.RBracket => { self.next(); } _ => {} }
+                    current_path = path
+                    // ensure table
+                    let mut cur = &mut root
+                    for key in &current_path {
+                        if !cur.contains_key(key) {
+                            cur.insert(key.clone(), TomlValue.Table(HashMap.new()))
+                        }
+                    }
+                }
+                Token.Key(_) | Token.StringVal(_) => {
+                    let key = match self.next() {
+                        Token.Key(k) => k,
+                        Token.StringVal(s) => s,
+                        _ => continue,
+                    };
+                    match &self.current { Token.Equals => { self.next(); } _ => continue }
+                    let value = self.parse_value()?
+
+                    // Insert at current_path
+                    let mut cur = &mut root
+                    for p in &current_path {
+                        match cur.get_mut(p) {
+                            some(TomlValue.Table(t)) => { cur = t }
+                            _ => {}
+                        }
+                    }
+                    cur.insert(key, value)
+                }
+                _ => { self.next(); }
+            }
+        }
+        ok(root)
+    }
+
+    fn parse_value(mut self) -> Result<TomlValue, string> {
+        match self.next() {
+            Token.StringVal(s) => ok(TomlValue.String(s)),
+            Token.IntVal(n) => ok(TomlValue.Integer(n)),
+            Token.FloatVal(f) => ok(TomlValue.Float(f)),
+            Token.BoolVal(b) => ok(TomlValue.Boolean(b)),
+            Token.LBracket => {
+                let mut items: [TomlValue] = []
+                self.skip_newlines()
+                loop {
+                    match &self.current { Token.RBracket => { self.next(); break } _ => {} }
+                    items.push(self.parse_value()?)
+                    self.skip_newlines()
+                    match &self.current { Token.Comma => { self.next(); self.skip_newlines(); } _ => {} }
+                }
+                ok(TomlValue.Array(items))
+            }
+            Token.LBrace => {
+                let mut table: TomlTable = HashMap.new()
+                loop {
+                    match &self.current { Token.RBrace => { self.next(); break } _ => {} }
+                    let key = match self.next() {
+                        Token.Key(k) => k,
+                        Token.StringVal(s) => s,
+                        _ => return err("expected key in inline table".to_string()),
+                    };
+                    match &self.current { Token.Equals => { self.next(); } _ => {} }
+                    let val = self.parse_value()?
+                    table.insert(key, val)
+                    match &self.current { Token.Comma => { self.next(); } _ => {} }
+                }
+                ok(TomlValue.Table(table))
+            }
+            _ => err("unexpected token".to_string()),
+        }
+    }
+}
+
+pub fn parse(input: &str) -> Result<TomlTable, string> { TomlParser.new(input).parse() }
+
+fn main() {
+    let toml = "title = \"TOML Example\"\ncount = 42\npi = 3.14\nenabled = true"
+    let table = parse(toml).unwrap()
+    assert(table.get("title").unwrap().as_str().unwrap() == "TOML Example")
+    assert(table.get("count").unwrap().as_i64().unwrap() == 42)
+    assert(table.get("pi").unwrap().as_f64().unwrap() == 3.14)
+    assert(table.get("enabled").unwrap().as_bool().unwrap() == true)
+    print("Basic key-value \u2713")
+
+    let toml2 = "[server]\nhost = \"localhost\"\nport = 8080"
+    let table2 = parse(toml2).unwrap()
+    let server = table2.get("server").unwrap().as_table().unwrap()
+    assert(server.get("host").unwrap().as_str().unwrap() == "localhost")
+    assert(server.get("port").unwrap().as_i64().unwrap() == 8080)
+    print("Tables \u2713")
+
+    let toml3 = "ports = [80, 443, 8080]"
+    let table3 = parse(toml3).unwrap()
+    let ports = table3.get("ports").unwrap().as_array().unwrap()
+    assert(ports.len() == 3)
+    assert(ports[0].as_i64().unwrap() == 80)
+    print("Arrays \u2713")
+
+    assert(TomlValue.String("x".to_string()).type_name() == "string")
+    assert(TomlValue.Integer(1).type_name() == "integer")
+    print("Type names \u2713")
+
+    print("TOML Parser complete \u2713")
+}
