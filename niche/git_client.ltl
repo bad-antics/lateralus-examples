@@ -1,0 +1,313 @@
+// Niche Example - Git Client
+// Minimal Git client: object store, index, refs, commit/tree/blob.
+
+use std.collections.HashMap
+use std.crypto.sha1
+use std.fs.{read, write, create_dir_all, read_dir}
+use std.io.{Read, Write}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ObjectId {
+    hash: [u8; 20],
+}
+
+impl ObjectId {
+    fn from_hex(hex: &str) -> Result<ObjectId, string> {
+        if hex.len() != 40 { return err("invalid hex length".to_string()) }
+        let mut hash = [0u8; 20]
+        for i in 0..20 {
+            hash[i] = u8.from_str_radix(&hex[i*2..i*2+2], 16).map_err(|e| e.to_string())?
+        }
+        ok(ObjectId { hash })
+    }
+
+    fn to_hex(self) -> string {
+        self.hash.iter().map(|b| format!("{:02x}", b)).collect::<[string]>().join("")
+    }
+
+    fn zero() -> ObjectId { ObjectId { hash: [0u8; 20] } }
+}
+
+impl fmt.Display for ObjectId {
+    fn fmt(self, f: &mut fmt.Formatter) -> fmt.Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ObjectType { Blob, Tree, Commit, Tag }
+
+impl ObjectType {
+    fn as_str(self) -> &str {
+        match self { ObjectType.Blob => "blob", ObjectType.Tree => "tree",
+                     ObjectType.Commit => "commit", ObjectType.Tag => "tag" }
+    }
+    fn from_str(s: &str) -> Result<ObjectType, string> {
+        match s {
+            "blob" => ok(ObjectType.Blob), "tree" => ok(ObjectType.Tree),
+            "commit" => ok(ObjectType.Commit), "tag" => ok(ObjectType.Tag),
+            _ => err(format!("unknown object type: {}", s)),
+        }
+    }
+}
+
+struct GitObject {
+    obj_type: ObjectType,
+    data: [u8],
+}
+
+impl GitObject {
+    fn serialize(self) -> [u8] {
+        let header = format!("{} {}\0", self.obj_type.as_str(), self.data.len())
+        let mut bytes = header.into_bytes()
+        bytes.extend(&self.data)
+        bytes
+    }
+
+    fn hash(self) -> ObjectId {
+        let serialized = self.serialize()
+        let hash = sha1.digest(&serialized)
+        ObjectId { hash }
+    }
+
+    fn deserialize(raw: &[u8]) -> Result<GitObject, string> {
+        let null_pos = raw.iter().position(|&b| b == 0).ok_or("no null byte")?
+        let header = std.str.from_utf8(&raw[..null_pos]).map_err(|e| e.to_string())?
+        let space = header.find(' ').ok_or("no space in header")?
+        let type_str = &header[..space]
+        let _size_str = &header[space+1..]
+        let obj_type = ObjectType.from_str(type_str)?
+        let data = raw[null_pos+1..].to_vec()
+        ok(GitObject { obj_type, data })
+    }
+}
+
+struct TreeEntry {
+    mode: string,
+    name: string,
+    oid: ObjectId,
+}
+
+impl TreeEntry {
+    fn is_tree(self) -> bool { self.mode.starts_with("40") }
+    fn is_blob(self) -> bool { self.mode.starts_with("10") }
+    fn is_executable(self) -> bool { self.mode == "100755" }
+}
+
+fn parse_tree(data: &[u8]) -> Result<[TreeEntry], string> {
+    let mut entries: [TreeEntry] = []
+    let mut pos = 0
+    while pos < data.len() {
+        let space = data[pos..].iter().position(|&b| b == b' ').ok_or("no space")?
+        let mode = std.str.from_utf8(&data[pos..pos+space]).map_err(|e| e.to_string())?.to_string()
+        pos += space + 1
+        let null = data[pos..].iter().position(|&b| b == 0).ok_or("no null")?
+        let name = std.str.from_utf8(&data[pos..pos+null]).map_err(|e| e.to_string())?.to_string()
+        pos += null + 1
+        if pos + 20 > data.len() { return err("truncated".to_string()) }
+        let mut hash = [0u8; 20]
+        hash.copy_from_slice(&data[pos..pos+20])
+        pos += 20
+        entries.push(TreeEntry { mode, name, oid: ObjectId { hash } })
+    }
+    ok(entries)
+}
+
+struct Commit {
+    tree: ObjectId,
+    parents: [ObjectId],
+    author: string,
+    committer: string,
+    message: string,
+}
+
+impl Commit {
+    fn parse(data: &[u8]) -> Result<Commit, string> {
+        let text = std.str.from_utf8(data).map_err(|e| e.to_string())?
+        let mut tree = ObjectId.zero()
+        let mut parents: [ObjectId] = []
+        let mut author = string.new()
+        let mut committer = string.new()
+        let mut in_message = false
+        let mut message = string.new()
+
+        for line in text.lines() {
+            if in_message {
+                if !message.is_empty() { message.push('\n') }
+                message.push_str(line)
+                continue
+            }
+            if line.is_empty() { in_message = true; continue }
+            if line.starts_with("tree ") {
+                tree = ObjectId.from_hex(&line[5..])?
+            } else if line.starts_with("parent ") {
+                parents.push(ObjectId.from_hex(&line[7..])?)
+            } else if line.starts_with("author ") {
+                author = line[7..].to_string()
+            } else if line.starts_with("committer ") {
+                committer = line[10..].to_string()
+            }
+        }
+        ok(Commit { tree, parents, author, committer, message })
+    }
+
+    fn to_bytes(self) -> [u8] {
+        let mut s = format!("tree {}\n", self.tree.to_hex())
+        for p in &self.parents {
+            s.push_str(&format!("parent {}\n", p.to_hex()))
+        }
+        s.push_str(&format!("author {}\n", self.author))
+        s.push_str(&format!("committer {}\n", self.committer))
+        s.push_str(&format!("\n{}", self.message))
+        s.into_bytes()
+    }
+}
+
+struct IndexEntry {
+    oid: ObjectId,
+    path: string,
+    mode: u32,
+    size: u32,
+}
+
+struct Index {
+    entries: [IndexEntry],
+}
+
+impl Index {
+    fn new() -> Index { Index { entries: [] } }
+
+    fn add(mut self, path: &str, oid: ObjectId, mode: u32, size: u32) {
+        self.entries.retain(|e| e.path != path)
+        self.entries.push(IndexEntry { oid, path: path.to_string(), mode, size })
+        self.entries.sort_by(|a, b| a.path.cmp(&b.path))
+    }
+
+    fn remove(mut self, path: &str) -> bool {
+        let before = self.entries.len()
+        self.entries.retain(|e| e.path != path)
+        self.entries.len() < before
+    }
+
+    fn get(self, path: &str) -> Option<&IndexEntry> {
+        self.entries.iter().find(|e| e.path == path)
+    }
+
+    fn len(self) -> usize { self.entries.len() }
+}
+
+struct RefStore {
+    refs: HashMap<string, ObjectId>,
+    head: string,  // current branch name or detached oid
+}
+
+impl RefStore {
+    fn new() -> RefStore {
+        RefStore { refs: HashMap.new(), head: "refs/heads/main".to_string() }
+    }
+
+    fn set_ref(mut self, name: &str, oid: ObjectId) {
+        self.refs.insert(name.to_string(), oid)
+    }
+
+    fn get_ref(self, name: &str) -> Option<&ObjectId> {
+        self.refs.get(name)
+    }
+
+    fn resolve_head(self) -> Option<&ObjectId> {
+        self.refs.get(&self.head)
+    }
+
+    fn set_head(mut self, branch: &str) {
+        self.head = branch.to_string()
+    }
+
+    fn list_branches(self) -> [string] {
+        self.refs.keys()
+            .filter(|k| k.starts_with("refs/heads/"))
+            .map(|k| k[11..].to_string())
+            .collect()
+    }
+}
+
+fn main() {
+    // ObjectId
+    let oid = ObjectId.from_hex("da39a3ee5e6b4b0d3255bfef95601890afd80709").unwrap()
+    assert(oid.to_hex() == "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    print("ObjectId roundtrip ✓")
+
+    let zero = ObjectId.zero()
+    assert(zero.to_hex() == "0000000000000000000000000000000000000000")
+    print("ObjectId zero ✓")
+
+    // ObjectType
+    assert(ObjectType.Blob.as_str() == "blob")
+    assert(ObjectType.from_str("commit").unwrap().as_str() == "commit")
+    assert(ObjectType.from_str("invalid").is_err())
+    print("ObjectType ✓")
+
+    // GitObject hash
+    let obj = GitObject { obj_type: ObjectType.Blob, data: b"hello".to_vec() }
+    let hash = obj.hash()
+    assert(!hash.to_hex().is_empty())
+    assert(hash.to_hex().len() == 40)
+    print("Object hash ✓")
+
+    // Commit parse
+    let commit_data = b"tree da39a3ee5e6b4b0d3255bfef95601890afd80709\nauthor Test <test@test.com> 1234567890 +0000\ncommitter Test <test@test.com> 1234567890 +0000\n\nInitial commit"
+    let commit = Commit.parse(commit_data).unwrap()
+    assert(commit.tree.to_hex() == "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    assert(commit.message == "Initial commit")
+    assert(commit.parents.is_empty())
+    print("Commit parse ✓")
+
+    // Commit roundtrip
+    let bytes = commit.to_bytes()
+    let commit2 = Commit.parse(&bytes).unwrap()
+    assert(commit2.tree == commit.tree)
+    assert(commit2.message == commit.message)
+    print("Commit roundtrip ✓")
+
+    // Index
+    let mut index = Index.new()
+    let oid1 = ObjectId.from_hex("da39a3ee5e6b4b0d3255bfef95601890afd80709").unwrap()
+    index.add("src/main.ltl", oid1.clone(), 0o100644, 100)
+    index.add("README.md", ObjectId.zero(), 0o100644, 50)
+    assert(index.len() == 2)
+    assert(index.get("src/main.ltl").is_some())
+    print("Index add ✓")
+
+    // Index sorted
+    assert(index.entries[0].path == "README.md")
+    assert(index.entries[1].path == "src/main.ltl")
+    print("Index sorted ✓")
+
+    index.remove("README.md")
+    assert(index.len() == 1)
+    print("Index remove ✓")
+
+    // RefStore
+    let mut refs = RefStore.new()
+    refs.set_ref("refs/heads/main", oid1.clone())
+    refs.set_ref("refs/heads/dev", ObjectId.zero())
+    assert(refs.resolve_head().is_some())
+    assert(refs.get_ref("refs/heads/main") == some(&oid1))
+    print("RefStore ✓")
+
+    let branches = refs.list_branches()
+    assert(branches.len() == 2)
+    assert(branches.contains(&"main".to_string()))
+    assert(branches.contains(&"dev".to_string()))
+    print("List branches ✓")
+
+    // TreeEntry
+    let te = TreeEntry { mode: "100644".to_string(), name: "file.txt".to_string(), oid: ObjectId.zero() }
+    assert(te.is_blob())
+    assert(!te.is_tree())
+    assert(!te.is_executable())
+    let te2 = TreeEntry { mode: "40000".to_string(), name: "dir".to_string(), oid: ObjectId.zero() }
+    assert(te2.is_tree())
+    print("TreeEntry ✓")
+
+    print("Git Client complete ✓")
+}
