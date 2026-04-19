@@ -1,0 +1,105 @@
+// starfield.ltl — 3D starfield with perspective projection (terminal, truecolor)
+
+use std.math.{sin, cos, sqrt, PI}
+use std.time.sleep_ms
+
+struct Star { x: float, y: float, z: float, prev_sx: int, prev_sy: int }
+
+struct Starfield {
+    stars:  [Star],
+    width:  int,
+    height: int,
+    speed:  float,
+    fov:    float,
+}
+
+fn rand_float(seed: &mut u64, lo: float, hi: float) -> float {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)
+    let f = (*seed >> 33) as float / (u32.MAX as float)
+    lo + f * (hi - lo)
+}
+
+impl Starfield {
+    fn new(count: int, width: int, height: int) -> Starfield {
+        let mut seed: u64 = 0xdeadbeef_cafebabe
+        let hw = width  as float / 2.0
+        let hh = height as float / 2.0
+        let mut stars = []
+        for _ in range(0, count) {
+            stars.push(Star {
+                x: rand_float(&mut seed, -hw, hw),
+                y: rand_float(&mut seed, -hh, hh),
+                z: rand_float(&mut seed, 1.0, 100.0),
+                prev_sx: -1, prev_sy: -1,
+            })
+        }
+        Starfield { stars, width, height, speed: 2.0, fov: 256.0 }
+    }
+
+    fn project(self, x: float, y: float, z: float) -> (int, int, float) {
+        let sx = (x / z * self.fov + self.width  as float / 2.0) as int
+        let sy = (y / z * self.fov + self.height as float / 2.0) as int
+        (sx, sy, 1.0 - z / 100.0)
+    }
+
+    fn in_bounds(self, sx: int, sy: int) -> bool {
+        sx >= 0 && sx < self.width && sy >= 0 && sy < self.height
+    }
+
+    fn step(mut self, frame: int) -> string {
+        let mut canvas: [[(u8,u8,u8,bool)]] = vec![vec![(0,0,0,false); self.width]; self.height]
+
+        for star in &mut self.stars {
+            star.z -= self.speed
+            if star.z <= 0.1 {
+                let mut seed: u64 = (star.x as u64).wrapping_mul(frame as u64 + 1)
+                let hw = self.width  as float / 2.0
+                let hh = self.height as float / 2.0
+                star.x = rand_float(&mut seed, -hw, hw)
+                star.y = rand_float(&mut seed, -hh, hh)
+                star.z = 100.0
+                star.prev_sx = -1; star.prev_sy = -1
+            }
+
+            let (sx, sy, brightness) = self.project(star.x, star.y, star.z)
+            if self.in_bounds(sx, sy) {
+                let b = (brightness * 255.0) as u8
+                canvas[sy as usize][sx as usize] = (b, b, b, true)
+                star.prev_sx = sx; star.prev_sy = sy
+            } else {
+                star.prev_sx = -1; star.prev_sy = -1
+            }
+        }
+
+        let mut out = "[H"  // cursor home
+        for row in canvas {
+            for (r, g, b, filled) in row {
+                if filled {
+                    out += "[38;2;${r};${g};${b}m"
+                    if r > 200 { out += "★" } else if r > 128 { out += "·" } else { out += "." }
+                    out += "[0m"
+                } else {
+                    out += " "
+                }
+            }
+            out += "
+"
+        }
+        out
+    }
+}
+
+fn main() {
+    let mut sf = Starfield.new(200, 80, 24)
+
+    // Print 5 frames for demo
+    print("[2J")   // clear screen
+    for frame in range(0, 60) {
+        let screen = sf.step(frame)
+        print!("{screen}", end="")
+        sleep_ms(33)    // ~30 fps
+    }
+
+    print("[0m
+Starfield — 60 frames rendered ✓")
+}
