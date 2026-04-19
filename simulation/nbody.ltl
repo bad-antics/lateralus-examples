@@ -1,0 +1,106 @@
+// nbody.ltl — N-body gravitational simulation (leapfrog integrator)
+use std.math.{sqrt, abs}
+
+const G: float = 6.674e-11   // gravitational constant
+
+struct Body {
+    name:  string,
+    mass:  float,     // kg
+    pos:   [float; 3],
+    vel:   [float; 3],
+    acc:   [float; 3],
+}
+
+impl Body {
+    fn kinetic_energy(self) -> float {
+        let v2 = self.vel |> map(|v| v*v) |> sum()
+        0.5 * self.mass * v2
+    }
+}
+
+fn compute_accelerations(bodies: mut [Body]) {
+    for i in range(0, bodies.len()) {
+        bodies[i].acc = [0.0; 3]
+    }
+    for i in range(0, bodies.len()) {
+        for j in range(i+1, bodies.len()) {
+            let dx = bodies[j].pos[0] - bodies[i].pos[0]
+            let dy = bodies[j].pos[1] - bodies[i].pos[1]
+            let dz = bodies[j].pos[2] - bodies[i].pos[2]
+            let r2  = dx*dx + dy*dy + dz*dz + 1e-10   // softening
+            let r3  = r2 * sqrt(r2)
+            let fi  =  G * bodies[j].mass / r3
+            let fj  = -G * bodies[i].mass / r3
+            bodies[i].acc[0] += fi * dx
+            bodies[i].acc[1] += fi * dy
+            bodies[i].acc[2] += fi * dz
+            bodies[j].acc[0] += fj * dx
+            bodies[j].acc[1] += fj * dy
+            bodies[j].acc[2] += fj * dz
+        }
+    }
+}
+
+fn leapfrog_step(mut bodies: [Body], dt: float) -> [Body] {
+    // Kick: v += a * dt/2
+    for b in bodies.iter_mut() {
+        for k in range(0, 3) { b.vel[k] += b.acc[k] * dt * 0.5 }
+    }
+    // Drift: x += v * dt
+    for b in bodies.iter_mut() {
+        for k in range(0, 3) { b.pos[k] += b.vel[k] * dt }
+    }
+    // Recompute accelerations
+    compute_accelerations(mut bodies)
+    // Kick again
+    for b in bodies.iter_mut() {
+        for k in range(0, 3) { b.vel[k] += b.acc[k] * dt * 0.5 }
+    }
+    bodies
+}
+
+fn total_energy(bodies: [Body]) -> float {
+    let ke = bodies |> map(|b| b.kinetic_energy()) |> sum()
+    let mut pe = 0.0
+    for i in range(0, bodies.len()) {
+        for j in range(i+1, bodies.len()) {
+            let dx = bodies[j].pos[0] - bodies[i].pos[0]
+            let dy = bodies[j].pos[1] - bodies[i].pos[1]
+            let dz = bodies[j].pos[2] - bodies[i].pos[2]
+            let r  = sqrt(dx*dx + dy*dy + dz*dz + 1e-10)
+            pe -= G * bodies[i].mass * bodies[j].mass / r
+        }
+    }
+    ke + pe
+}
+
+fn main() {
+    // Solar system (simplified, AU / year units scaled to SI)
+    let AU  = 1.496e11   // metres
+    let YR  = 3.156e7    // seconds
+    let ME  = 5.972e24   // Earth mass
+
+    let mut bodies: [Body] = [
+        Body { name: "Sun",     mass: 1.989e30, pos: [0.0;3],               vel: [0.0;3],                      acc: [0.0;3] },
+        Body { name: "Mercury", mass: 3.301e23, pos: [0.387*AU,0.0,0.0],    vel: [0.0, 47870.0, 0.0],           acc: [0.0;3] },
+        Body { name: "Venus",   mass: 4.867e24, pos: [0.723*AU,0.0,0.0],    vel: [0.0, 35020.0, 0.0],           acc: [0.0;3] },
+        Body { name: "Earth",   mass: ME,       pos: [1.0*AU, 0.0, 0.0],    vel: [0.0, 29783.0, 0.0],           acc: [0.0;3] },
+        Body { name: "Mars",    mass: 6.390e23, pos: [1.524*AU, 0.0, 0.0],  vel: [0.0, 24131.0, 0.0],           acc: [0.0;3] },
+        Body { name: "Jupiter", mass: 1.898e27, pos: [5.203*AU, 0.0, 0.0],  vel: [0.0, 13070.0, 0.0],           acc: [0.0;3] },
+    ]
+
+    compute_accelerations(mut bodies)
+    let e0   = total_energy(bodies)
+    let dt   = 3600.0 * 24.0   // 1-day time step
+    let days = 365
+
+    for _ in range(0, days) {
+        bodies = leapfrog_step(bodies, dt)
+    }
+
+    let e1     = total_energy(bodies)
+    let drift  = abs((e1 - e0) / e0)
+    print("N-body simulation: ${days} days")
+    for b in bodies { print("  ${b.name:8s}: pos = (${(b.pos[0]/AU):.3} AU, ${(b.pos[1]/AU):.3} AU)") }
+    print("Energy drift: ${drift:.2e} (should be < 1e-5 for leapfrog) ✓")
+}
