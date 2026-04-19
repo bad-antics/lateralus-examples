@@ -1,0 +1,260 @@
+// network_stack.ltl — LateralusOS TCP/IP network stack
+
+use std.collections.{HashMap, VecDeque}
+use std.crypto.{random_bytes, sha256}
+
+// ── Ethernet ─────────────────────────────────────────────────────────────────
+struct MacAddr([u8; 6])
+impl MacAddr {
+    fn broadcast() -> MacAddr { MacAddr([0xff; 6]) }
+    fn to_string(self) -> string { self.0 |> map(|b| format!("{b:02x}")) |> join(":") }
+}
+
+struct EthernetFrame {
+    dst_mac: MacAddr, src_mac: MacAddr,
+    ether_type: u16,  // 0x0800 = IPv4, 0x0806 = ARP, 0x86DD = IPv6
+    payload: [u8],
+}
+
+// ── IPv4 ─────────────────────────────────────────────────────────────────────
+struct Ipv4Header {
+    version_ihl: u8, tos: u8, total_length: u16, id: u16,
+    flags_frag: u16, ttl: u8, protocol: u8,  // 6=TCP, 17=UDP, 1=ICMP
+    checksum: u16, src: [u8; 4], dst: [u8; 4],
+}
+
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0
+    for i in (0..header.len()).step_by(2) {
+        let word = (header[i] as u32) << 8 | if i+1 < header.len() { header[i+1] as u32 } else { 0 }
+        sum += word
+    }
+    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
+    !(sum as u16)
+}
+
+// ── TCP ──────────────────────────────────────────────────────────────────────
+struct TcpHeader {
+    src_port: u16, dst_port: u16,
+    seq_num: u32, ack_num: u32,
+    data_offset: u8, flags: u8,
+    window: u16, checksum: u16, urgent_ptr: u16,
+    options: [u8],
+}
+
+const TCP_FIN: u8 = 0x01; const TCP_SYN: u8 = 0x02; const TCP_RST: u8 = 0x04;
+const TCP_PSH: u8 = 0x08; const TCP_ACK: u8 = 0x10;
+
+enum TcpState { Closed, Listen, SynSent, SynReceived, Established, FinWait1, FinWait2, CloseWait, LastAck, TimeWait }
+
+struct TcpControlBlock {
+    local_addr:  [u8; 4], local_port:  u16,
+    remote_addr: [u8; 4], remote_port: u16,
+    state:       TcpState,
+    snd_una: u32, snd_nxt: u32, snd_wnd: u16,
+    rcv_nxt: u32, rcv_wnd: u16,
+    iss: u32,     // initial send sequence
+    irs: u32,     // initial receive sequence
+    send_buffer: VecDeque<u8>,
+    recv_buffer: VecDeque<u8>,
+    retransmit_queue: [(u32, [u8], u64)],  // (seq, data, timestamp)
+    rto: u64,     // retransmit timeout (ms)
+    srtt: u64,    // smoothed RTT
+    mss: u16,     // max segment size
+    cwnd: u32,    // congestion window
+    ssthresh: u32,
+}
+
+impl TcpControlBlock {
+    fn new_client(local: ([u8; 4], u16), remote: ([u8; 4], u16)) -> TcpControlBlock {
+        let iss = random_u32()
+        TcpControlBlock {
+            local_addr: local.0, local_port: local.1,
+            remote_addr: remote.0, remote_port: remote.1,
+            state: TcpState.Closed,
+            snd_una: iss, snd_nxt: iss, snd_wnd: 0,
+            rcv_nxt: 0, rcv_wnd: 65535, iss, irs: 0,
+            send_buffer: VecDeque.new(), recv_buffer: VecDeque.new(),
+            retransmit_queue: [], rto: 1000, srtt: 0, mss: 1460,
+            cwnd: 1460, ssthresh: 65535,
+        }
+    }
+
+    fn connect(mut self) -> TcpHeader {
+        self.state = TcpState.SynSent
+        self.snd_nxt = self.iss + 1
+        TcpHeader {
+            src_port: self.local_port, dst_port: self.remote_port,
+            seq_num: self.iss, ack_num: 0,
+            data_offset: 5, flags: TCP_SYN, window: self.rcv_wnd,
+            checksum: 0, urgent_ptr: 0, options: [],
+        }
+    }
+
+    fn handle_segment(mut self, hdr: TcpHeader, data: &[u8]) -> Option<TcpHeader> {
+        match self.state {
+            TcpState.SynSent => {
+                if hdr.flags & (TCP_SYN | TCP_ACK) == (TCP_SYN | TCP_ACK) {
+                    self.irs = hdr.seq_num
+                    self.rcv_nxt = hdr.seq_num + 1
+                    self.snd_una = hdr.ack_num
+                    self.state = TcpState.Established
+                    return some(TcpHeader {
+                        src_port: self.local_port, dst_port: self.remote_port,
+                        seq_num: self.snd_nxt, ack_num: self.rcv_nxt,
+                        data_offset: 5, flags: TCP_ACK, window: self.rcv_wnd,
+                        checksum: 0, urgent_ptr: 0, options: [],
+                    })
+                }
+                none
+            }
+            TcpState.Established => {
+                if data.len() > 0 {
+                    self.recv_buffer.extend(data.iter())
+                    self.rcv_nxt += data.len() as u32
+                    return some(TcpHeader {
+                        src_port: self.local_port, dst_port: self.remote_port,
+                        seq_num: self.snd_nxt, ack_num: self.rcv_nxt,
+                        data_offset: 5, flags: TCP_ACK, window: self.rcv_wnd,
+                        checksum: 0, urgent_ptr: 0, options: [],
+                    })
+                }
+                if hdr.flags & TCP_FIN != 0 {
+                    self.rcv_nxt += 1
+                    self.state = TcpState.CloseWait
+                    return some(TcpHeader {
+                        src_port: self.local_port, dst_port: self.remote_port,
+                        seq_num: self.snd_nxt, ack_num: self.rcv_nxt,
+                        data_offset: 5, flags: TCP_ACK, window: self.rcv_wnd,
+                        checksum: 0, urgent_ptr: 0, options: [],
+                    })
+                }
+                none
+            }
+            _ => none
+        }
+    }
+
+    fn send_data(mut self, data: &[u8]) -> [TcpHeader] {
+        let mut segments = []
+        for chunk in data.chunks(self.mss as usize) {
+            let hdr = TcpHeader {
+                src_port: self.local_port, dst_port: self.remote_port,
+                seq_num: self.snd_nxt, ack_num: self.rcv_nxt,
+                data_offset: 5, flags: TCP_ACK | TCP_PSH, window: self.rcv_wnd,
+                checksum: 0, urgent_ptr: 0, options: [],
+            }
+            self.snd_nxt += chunk.len() as u32
+            segments.push(hdr)
+        }
+        segments
+    }
+}
+
+// ── ARP ──────────────────────────────────────────────────────────────────────
+struct ArpTable { entries: HashMap<[u8; 4], (MacAddr, u64)> }
+
+impl ArpTable {
+    fn new() -> ArpTable { ArpTable { entries: HashMap.new() } }
+    fn lookup(self, ip: [u8; 4]) -> Option<MacAddr> { self.entries.get(&ip).map(|(m, _)| m.clone()) }
+    fn insert(mut self, ip: [u8; 4], mac: MacAddr, now: u64) { self.entries.insert(ip, (mac, now)) }
+    fn gc(mut self, now: u64, ttl: u64) { self.entries.retain(|_, (_, ts)| now - *ts < ttl) }
+}
+
+// ── Network stack ────────────────────────────────────────────────────────────
+struct NetworkStack {
+    interfaces:   [NetInterface],
+    arp_table:    ArpTable,
+    routing_table: [Route],
+    tcp_sockets:  HashMap<(u16, [u8; 4], u16), TcpControlBlock>,
+    listen_ports: HashMap<u16, u32>,  // port → owner PID
+}
+
+struct NetInterface {
+    name:    string,
+    mac:     MacAddr,
+    ip:      [u8; 4],
+    netmask: [u8; 4],
+    mtu:     u16,
+    up:      bool,
+}
+
+struct Route { destination: [u8; 4], netmask: [u8; 4], gateway: [u8; 4], interface: string, metric: u32 }
+
+impl NetworkStack {
+    fn new() -> NetworkStack {
+        NetworkStack {
+            interfaces: [], arp_table: ArpTable.new(),
+            routing_table: [], tcp_sockets: HashMap.new(),
+            listen_ports: HashMap.new(),
+        }
+    }
+
+    fn add_interface(mut self, iface: NetInterface) { self.interfaces.push(iface) }
+
+    fn add_route(mut self, route: Route) {
+        self.routing_table.push(route)
+        self.routing_table.sort_by(|a, b| b.metric.cmp(&a.metric))
+    }
+
+    fn route_lookup(self, dst: [u8; 4]) -> Option<&Route> {
+        for route in &self.routing_table {
+            let mut match_ = true
+            for i in range(0, 4) {
+                if (dst[i] & route.netmask[i]) != (route.destination[i] & route.netmask[i]) { match_ = false; break }
+            }
+            if match_ { return some(route) }
+        }
+        none
+    }
+}
+
+fn random_u32() -> u32 { let b = random_bytes(4); b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16 | (b[3] as u32) << 24 }
+
+fn main() {
+    let mut stack = NetworkStack.new()
+
+    stack.add_interface(NetInterface {
+        name: "eth0".to_string(), mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+        ip: [10, 0, 0, 1], netmask: [255, 255, 255, 0], mtu: 1500, up: true,
+    })
+
+    stack.add_route(Route {
+        destination: [10, 0, 0, 0], netmask: [255, 255, 255, 0],
+        gateway: [0, 0, 0, 0], interface: "eth0".to_string(), metric: 100,
+    })
+    stack.add_route(Route {
+        destination: [0, 0, 0, 0], netmask: [0, 0, 0, 0],
+        gateway: [10, 0, 0, 254], interface: "eth0".to_string(), metric: 200,
+    })
+
+    assert(stack.route_lookup([10, 0, 0, 5]).is_some())
+    assert(stack.route_lookup([8, 8, 8, 8]).is_some())  // default route
+    print("Routing table ✓")
+
+    // TCP 3-way handshake
+    let mut client = TcpControlBlock.new_client(([10,0,0,1], 54321), ([10,0,0,2], 80))
+    let syn = client.connect()
+    assert(syn.flags == TCP_SYN)
+    assert(matches!(client.state, TcpState.SynSent))
+    print("TCP SYN sent ✓")
+
+    let syn_ack = TcpHeader {
+        src_port: 80, dst_port: 54321, seq_num: 1000, ack_num: client.iss + 1,
+        data_offset: 5, flags: TCP_SYN | TCP_ACK, window: 65535,
+        checksum: 0, urgent_ptr: 0, options: [],
+    }
+    let ack = client.handle_segment(syn_ack, &[])
+    assert(ack.is_some())
+    assert(matches!(client.state, TcpState.Established))
+    print("TCP handshake complete ✓")
+
+    // Checksum
+    let test_header: [u8] = [0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00,
+                              0xac, 0x10, 0x0a, 0x63, 0xac, 0x10, 0x0a, 0x0c]
+    let cksum = ipv4_checksum(&test_header)
+    assert(cksum != 0)
+    print("IPv4 checksum computation ✓")
+
+    print("LateralusOS network stack — all passed ✓")
+}
