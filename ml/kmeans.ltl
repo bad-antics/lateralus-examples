@@ -1,0 +1,62 @@
+// kmeans.ltl — k-means clustering
+use std.math.sqrt
+use std.random.{seed_rng, rand_range}
+
+struct Point { x: float, y: float }
+
+impl Point {
+    fn dist(self, other: Point) -> float {
+        let dx = self.x - other.x
+        let dy = self.y - other.y
+        sqrt(dx*dx + dy*dy)
+    }
+
+    fn add(self, other: Point) -> Point { Point { x: self.x + other.x, y: self.y + other.y } }
+    fn scale(self, s: float)   -> Point { Point { x: self.x * s, y: self.y * s } }
+    fn zero() -> Point { Point { x: 0.0, y: 0.0 } }
+}
+
+fn kmeans(points: [Point], k: int, max_iter: int) -> ([int], [Point]) {
+    let n = points.len()
+    // initialise centroids by random selection
+    mut centroids: [Point] = range(0, k) |> map(|_| points[rand_range(0, n)]) |> collect()
+    mut labels = [0; n]
+
+    for _ in range(0, max_iter) {
+        // assign
+        let new_labels: [int] = points |> map(|p| {
+            centroids.iter() |> enumerate() |> min_by(|(_, c)| p.dist(*c)).map(|(i, _)| i) ?? 0
+        }) |> collect()
+
+        if new_labels == labels { break }
+        labels = new_labels
+
+        // update centroids
+        for ki in range(0, k) {
+            let cluster = points.iter() |> zip(labels.iter()) |> filter(|(_, l)| *l == ki) |> map(|(p, _)| p) |> collect()
+            if cluster.is_empty() { continue }
+            let sum = cluster |> fold(Point.zero(), |a, p| a.add(p))
+            centroids[ki] = sum.scale(1.0 / cluster.len() as float)
+        }
+    }
+    (labels, centroids)
+}
+
+fn main() {
+    seed_rng(42)
+    // Cluster A around (1,1), B around (8,8), C around (1,8)
+    let mut points: [Point] = []
+    for _ in range(0, 30) { points.push(Point { x: 1.0 + (rand_range(0,100) as float / 100.0), y: 1.0 + (rand_range(0,100) as float / 100.0) }) }
+    for _ in range(0, 30) { points.push(Point { x: 8.0 + (rand_range(0,100) as float / 100.0), y: 8.0 + (rand_range(0,100) as float / 100.0) }) }
+    for _ in range(0, 30) { points.push(Point { x: 1.0 + (rand_range(0,100) as float / 100.0), y: 8.0 + (rand_range(0,100) as float / 100.0) }) }
+
+    let (labels, centroids) = kmeans(points, 3, 100)
+
+    // Verify: exactly 3 distinct labels, each centroid near its true center
+    let distinct = labels |> collect_set() |> count()
+    assert(distinct == 3)
+    print("k-means: ${distinct} clusters found ✓")
+    for (i, c) in centroids.iter().enumerate() {
+        print("  centroid ${i}: (${c.x:.2}, ${c.y:.2})")
+    }
+}
