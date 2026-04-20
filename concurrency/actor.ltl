@@ -1,0 +1,222 @@
+
+// Actor Model - Message-passing concurrency with isolated actors
+// Each actor has a mailbox, processes messages sequentially, and can spawn child actors.
+
+use std.sync.{Mutex, Arc, Condvar}
+use std.collections.VecDeque
+
+type ActorId = u64
+
+#[derive(Clone, Debug)]
+enum Message {
+    Text(string),
+    Number(i64),
+    Ping(ActorId),
+    Pong(ActorId),
+    Stop,
+    Custom(string, [u8]),
+}
+
+impl Message {
+    fn is_stop(self) -> bool { matches!(self, Message.Stop) }
+    fn as_text(self) -> Option<&str> {
+        match self { Message.Text(s) => Some(s), _ => None }
+    }
+    fn as_number(self) -> Option<i64> {
+        match self { Message.Number(n) => Some(*n), _ => None }
+    }
+}
+
+struct Mailbox {
+    queue: Mutex<VecDeque<Message>>,
+    cv: Condvar,
+}
+
+impl Mailbox {
+    fn new() -> Mailbox { Mailbox { queue: Mutex.new(VecDeque.new()), cv: Condvar.new() } }
+
+    fn send(self, msg: Message) {
+        self.queue.lock().push_back(msg)
+        self.cv.notify_one()
+    }
+
+    fn receive(self) -> Message {
+        let mut guard = self.queue.lock()
+        while guard.is_empty() { guard = self.cv.wait(guard) }
+        guard.pop_front().unwrap()
+    }
+
+    fn try_receive(self) -> Option<Message> { self.queue.lock().pop_front() }
+    fn pending(self) -> usize { self.queue.lock().len() }
+    fn is_empty(self) -> bool { self.queue.lock().is_empty() }
+}
+
+struct Actor {
+    id: ActorId,
+    name: string,
+    mailbox: Arc<Mailbox>,
+    message_count: Mutex<u64>,
+    running: Mutex<bool>,
+}
+
+impl Actor {
+    fn new(id: ActorId, name: &str) -> Actor {
+        Actor {
+            id,
+            name: name.into(),
+            mailbox: Arc.new(Mailbox.new()),
+            message_count: Mutex.new(0),
+            running: Mutex.new(true),
+        }
+    }
+
+    fn send(self, msg: Message) { self.mailbox.send(msg) }
+    fn receive(self) -> Message {
+        let msg = self.mailbox.receive()
+        *self.message_count.lock() += 1
+        msg
+    }
+    fn try_receive(self) -> Option<Message> {
+        let msg = self.mailbox.try_receive()
+        if msg.is_some() { *self.message_count.lock() += 1 }
+        msg
+    }
+
+    fn messages_processed(self) -> u64 { *self.message_count.lock() }
+    fn is_running(self) -> bool { *self.running.lock() }
+    fn stop(self) { *self.running.lock() = false }
+    fn pending(self) -> usize { self.mailbox.pending() }
+}
+
+struct ActorSystem {
+    actors: Mutex<HashMap<ActorId, Arc<Actor>>>,
+    next_id: Mutex<ActorId>,
+    total_messages: Mutex<u64>,
+}
+
+impl ActorSystem {
+    fn new() -> ActorSystem {
+        ActorSystem {
+            actors: Mutex.new(HashMap.new()),
+            next_id: Mutex.new(1),
+            total_messages: Mutex.new(0),
+        }
+    }
+
+    fn spawn(self, name: &str) -> Arc<Actor> {
+        let mut id_guard = self.next_id.lock()
+        let id = *id_guard
+        *id_guard += 1
+        let actor = Arc.new(Actor.new(id, name))
+        self.actors.lock().insert(id, actor.clone())
+        actor
+    }
+
+    fn send_to(self, id: ActorId, msg: Message) -> bool {
+        if let Some(actor) = self.actors.lock().get(&id) {
+            actor.send(msg)
+            *self.total_messages.lock() += 1
+            true
+        } else { false }
+    }
+
+    fn actor_count(self) -> usize { self.actors.lock().len() }
+    fn total_messages(self) -> u64 { *self.total_messages.lock() }
+
+    fn remove(self, id: ActorId) -> bool { self.actors.lock().remove(&id).is_some() }
+
+    fn broadcast(self, msg: Message) {
+        let actors = self.actors.lock()
+        for (_, actor) in actors.iter() {
+            actor.send(msg.clone())
+            *self.total_messages.lock() += 1
+        }
+    }
+
+    fn shutdown_all(self) { self.broadcast(Message.Stop) }
+}
+
+fn main() {
+    // Message types
+    let m1 = Message.Text("hello".into())
+    assert(!m1.is_stop())
+    assert(m1.as_text() == Some("hello"))
+    let m2 = Message.Number(42)
+    assert(m2.as_number() == Some(42))
+    let m3 = Message.Stop
+    assert(m3.is_stop())
+    print("Messages ✓")
+
+    // Mailbox
+    let mb = Mailbox.new()
+    assert(mb.is_empty())
+    mb.send(Message.Text("hi".into()))
+    assert(!mb.is_empty())
+    assert(mb.pending() == 1)
+    let received = mb.receive()
+    assert(received.as_text() == Some("hi"))
+    assert(mb.is_empty())
+    print("Mailbox ✓")
+
+    // Try receive
+    let mb2 = Mailbox.new()
+    assert(mb2.try_receive().is_none())
+    mb2.send(Message.Number(7))
+    assert(mb2.try_receive().is_some())
+    print("Try receive ✓")
+
+    // Actor
+    let actor = Actor.new(1, "worker")
+    assert(actor.id == 1)
+    assert(actor.name == "worker")
+    assert(actor.is_running())
+    assert(actor.messages_processed() == 0)
+    print("Actor init ✓")
+
+    // Actor send/receive
+    actor.send(Message.Number(10))
+    actor.send(Message.Number(20))
+    assert(actor.pending() == 2)
+    let msg = actor.receive()
+    assert(msg.as_number() == Some(10))
+    assert(actor.messages_processed() == 1)
+    print("Actor msg ✓")
+
+    // Actor stop
+    actor.stop()
+    assert(!actor.is_running())
+    print("Actor stop ✓")
+
+    // Actor system
+    let sys = ActorSystem.new()
+    let a1 = sys.spawn("alpha")
+    let a2 = sys.spawn("beta")
+    assert(sys.actor_count() == 2)
+    assert(a1.id == 1)
+    assert(a2.id == 2)
+    print("System spawn ✓")
+
+    // Send to actor
+    assert(sys.send_to(1, Message.Text("msg1".into())))
+    assert(sys.send_to(2, Message.Text("msg2".into())))
+    assert(!sys.send_to(99, Message.Text("fail".into())))
+    assert(sys.total_messages() == 2)
+    print("System send ✓")
+
+    // Remove
+    assert(sys.remove(2))
+    assert(sys.actor_count() == 1)
+    assert(!sys.remove(2))  // already removed
+    print("System remove ✓")
+
+    // Broadcast
+    let sys2 = ActorSystem.new()
+    sys2.spawn("a")
+    sys2.spawn("b")
+    sys2.spawn("c")
+    sys2.broadcast(Message.Text("all".into()))
+    assert(sys2.total_messages() == 3)
+    print("Broadcast ✓")
+
+    print("Actor model complete ✓")
+}
