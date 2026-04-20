@@ -1,0 +1,233 @@
+
+// Breakout Game - Classic brick-breaking arcade game
+// Implements paddle, ball physics, bricks, scoring, and collision detection.
+
+use std.collections.HashMap
+
+#[derive(Clone, Copy, Debug)]
+struct Vec2 { x: f64, y: f64 }
+
+impl Vec2 {
+    fn new(x: f64, y: f64) -> Vec2 { Vec2 { x, y } }
+    fn add(self, other: Vec2) -> Vec2 { Vec2 { x: self.x + other.x, y: self.y + other.y } }
+    fn scale(self, s: f64) -> Vec2 { Vec2 { x: self.x * s, y: self.y * s } }
+    fn length(self) -> f64 { (self.x * self.x + self.y * self.y).sqrt() }
+    fn normalize(self) -> Vec2 { let l = self.length(); Vec2 { x: self.x / l, y: self.y / l } }
+    fn reflect_x(self) -> Vec2 { Vec2 { x: -self.x, y: self.y } }
+    fn reflect_y(self) -> Vec2 { Vec2 { x: self.x, y: -self.y } }
+}
+
+struct Rect { x: f64, y: f64, w: f64, h: f64 }
+
+impl Rect {
+    fn new(x: f64, y: f64, w: f64, h: f64) -> Rect { Rect { x, y, w, h } }
+    fn center(self) -> Vec2 { Vec2.new(self.x + self.w / 2.0, self.y + self.h / 2.0) }
+    fn contains(self, p: Vec2) -> bool {
+        p.x >= self.x && p.x <= self.x + self.w && p.y >= self.y && p.y <= self.y + self.h
+    }
+    fn intersects(self, other: &Rect) -> bool {
+        self.x < other.x + other.w && self.x + self.w > other.x &&
+        self.y < other.y + other.h && self.y + self.h > other.y
+    }
+    fn right(self) -> f64 { self.x + self.w }
+    fn bottom(self) -> f64 { self.y + self.h }
+}
+
+struct Ball { pos: Vec2, vel: Vec2, radius: f64 }
+
+impl Ball {
+    fn new(x: f64, y: f64, speed: f64) -> Ball {
+        Ball { pos: Vec2.new(x, y), vel: Vec2.new(speed * 0.7, -speed * 0.7), radius: 5.0 }
+    }
+    fn bounds(self) -> Rect {
+        Rect.new(self.pos.x - self.radius, self.pos.y - self.radius, self.radius * 2.0, self.radius * 2.0)
+    }
+    fn update(mut self, dt: f64) { self.pos = self.pos.add(self.vel.scale(dt)) }
+    fn speed(self) -> f64 { self.vel.length() }
+}
+
+struct Paddle { rect: Rect, speed: f64 }
+
+impl Paddle {
+    fn new(x: f64, y: f64) -> Paddle { Paddle { rect: Rect.new(x, y, 80.0, 12.0), speed: 400.0 } }
+    fn move_left(mut self, dt: f64) { self.rect.x -= self.speed * dt; if self.rect.x < 0.0 { self.rect.x = 0.0 } }
+    fn move_right(mut self, dt: f64, max_x: f64) {
+        self.rect.x += self.speed * dt
+        if self.rect.right() > max_x { self.rect.x = max_x - self.rect.w }
+    }
+    fn center_x(self) -> f64 { self.rect.x + self.rect.w / 2.0 }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BrickType { Normal, Hard, Indestructible }
+
+struct Brick { rect: Rect, brick_type: BrickType, hits: u32, alive: bool }
+
+impl Brick {
+    fn new(x: f64, y: f64, bt: BrickType) -> Brick {
+        Brick { rect: Rect.new(x, y, 60.0, 20.0), brick_type: bt, hits: 0, alive: true }
+    }
+    fn max_hits(self) -> u32 {
+        match self.brick_type { BrickType.Normal => 1, BrickType.Hard => 3, BrickType.Indestructible => u32.MAX }
+    }
+    fn hit(mut self) -> bool {
+        self.hits += 1
+        if self.hits >= self.max_hits() && self.brick_type != BrickType.Indestructible {
+            self.alive = false; true
+        } else { false }
+    }
+    fn points(self) -> u32 {
+        match self.brick_type { BrickType.Normal => 10, BrickType.Hard => 30, BrickType.Indestructible => 0 }
+    }
+}
+
+struct Game {
+    ball: Ball,
+    paddle: Paddle,
+    bricks: [Brick],
+    score: u32,
+    lives: u32,
+    width: f64,
+    height: f64,
+    level: u32,
+}
+
+impl Game {
+    fn new(w: f64, h: f64) -> Game {
+        let paddle = Paddle.new(w / 2.0 - 40.0, h - 30.0)
+        let ball = Ball.new(w / 2.0, h - 50.0, 300.0)
+        let bricks = Game.create_bricks(w)
+        Game { ball, paddle, bricks, score: 0, lives: 3, width: w, height: h, level: 1 }
+    }
+
+    fn create_bricks(width: f64) -> [Brick] {
+        let mut bricks = []
+        let cols = ((width - 20.0) / 65.0) as usize
+        for row in 0..5 {
+            for col in 0..cols {
+                let x = 10.0 + col as f64 * 65.0
+                let y = 40.0 + row as f64 * 25.0
+                let bt = if row == 0 { BrickType.Hard } else { BrickType.Normal }
+                bricks.push(Brick.new(x, y, bt))
+            }
+        }
+        bricks
+    }
+
+    fn alive_bricks(self) -> usize { self.bricks.iter().filter(|b| b.alive && b.brick_type != BrickType.Indestructible).count() }
+    fn is_won(self) -> bool { self.alive_bricks() == 0 }
+    fn is_lost(self) -> bool { self.lives == 0 }
+
+    fn update(mut self, dt: f64) {
+        self.ball.update(dt)
+        // Wall collisions
+        if self.ball.pos.x - self.ball.radius <= 0.0 || self.ball.pos.x + self.ball.radius >= self.width {
+            self.ball.vel = self.ball.vel.reflect_x()
+        }
+        if self.ball.pos.y - self.ball.radius <= 0.0 {
+            self.ball.vel = self.ball.vel.reflect_y()
+        }
+        // Ball lost
+        if self.ball.pos.y > self.height {
+            self.lives -= 1
+            self.ball = Ball.new(self.width / 2.0, self.height - 50.0, 300.0)
+        }
+        // Paddle collision
+        if self.ball.bounds().intersects(&self.paddle.rect) && self.ball.vel.y > 0.0 {
+            self.ball.vel = self.ball.vel.reflect_y()
+            let offset = (self.ball.pos.x - self.paddle.center_x()) / (self.paddle.rect.w / 2.0)
+            self.ball.vel.x += offset * 100.0
+        }
+        // Brick collisions
+        for brick in &mut self.bricks {
+            if brick.alive && self.ball.bounds().intersects(&brick.rect) {
+                self.ball.vel = self.ball.vel.reflect_y()
+                if brick.hit() { self.score += brick.points() }
+                break
+            }
+        }
+    }
+}
+
+fn main() {
+    // Vec2 tests
+    let v = Vec2.new(3.0, 4.0)
+    assert((v.length() - 5.0).abs() < 0.001)
+    let n = v.normalize()
+    assert((n.length() - 1.0).abs() < 0.001)
+    assert(v.reflect_x().x == -3.0)
+    assert(v.reflect_y().y == -4.0)
+    print("Vec2 ✓")
+
+    // Rect tests
+    let r = Rect.new(10.0, 20.0, 30.0, 40.0)
+    assert(r.contains(Vec2.new(15.0, 30.0)))
+    assert(!r.contains(Vec2.new(5.0, 5.0)))
+    assert(r.right() == 40.0)
+    assert(r.bottom() == 60.0)
+    print("Rect ✓")
+
+    // Rect intersection
+    let r2 = Rect.new(35.0, 55.0, 10.0, 10.0)
+    assert(r.intersects(&r2))
+    let r3 = Rect.new(100.0, 100.0, 5.0, 5.0)
+    assert(!r.intersects(&r3))
+    print("Intersect ✓")
+
+    // Brick tests
+    let mut b = Brick.new(0.0, 0.0, BrickType.Normal)
+    assert(b.alive)
+    assert(b.max_hits() == 1)
+    assert(b.hit())
+    assert(!b.alive)
+    assert(b.points() == 10)
+    print("Normal brick ✓")
+
+    let mut bh = Brick.new(0.0, 0.0, BrickType.Hard)
+    assert(bh.max_hits() == 3)
+    assert(!bh.hit())  // hit 1
+    assert(!bh.hit())  // hit 2
+    assert(bh.hit())   // hit 3 - destroyed
+    assert(!bh.alive)
+    assert(bh.points() == 30)
+    print("Hard brick ✓")
+
+    let mut bi = Brick.new(0.0, 0.0, BrickType.Indestructible)
+    assert(!bi.hit())
+    assert(bi.alive)  // still alive
+    print("Indestructible ✓")
+
+    // Paddle
+    let mut pad = Paddle.new(100.0, 500.0)
+    assert((pad.center_x() - 140.0).abs() < 0.1)
+    pad.move_left(0.1)
+    assert(pad.rect.x < 100.0)
+    print("Paddle ✓")
+
+    // Ball
+    let mut ball = Ball.new(200.0, 300.0, 300.0)
+    let old_y = ball.pos.y
+    ball.update(0.016)
+    assert(ball.pos.y != old_y)
+    assert((ball.speed() - 300.0).abs() < 1.0)
+    print("Ball ✓")
+
+    // Game
+    let game = Game.new(800.0, 600.0)
+    assert(game.lives == 3)
+    assert(game.score == 0)
+    assert(game.level == 1)
+    assert(game.alive_bricks() > 0)
+    assert(!game.is_won())
+    assert(!game.is_lost())
+    print("Game init ✓")
+
+    // Brick creation
+    let bricks = Game.create_bricks(800.0)
+    assert(bricks.len() > 0)
+    let hard_count = bricks.iter().filter(|b| b.brick_type == BrickType.Hard).count()
+    assert(hard_count > 0)
+    print("Brick layout ✓")
+
+    print("Breakout complete ✓")
+}
