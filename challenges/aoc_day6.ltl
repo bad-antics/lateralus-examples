@@ -1,0 +1,150 @@
+
+// Advent of Code - Day 6: Tuning Trouble
+// Find first position where N consecutive distinct characters occur.
+
+use std.collections.{HashMap, HashSet}
+
+fn first_unique_window(signal: &str, window_size: usize) -> Option<usize> {
+    if signal.len() < window_size { return none }
+    let chars: [char] = signal.chars().collect()
+
+    for i in 0..=(chars.len() - window_size) {
+        let window = &chars[i..i + window_size]
+        let unique: HashSet<char> = window.iter().copied().collect()
+        if unique.len() == window_size {
+            return some(i + window_size)
+        }
+    }
+    none
+}
+
+fn first_unique_window_optimized(signal: &str, window_size: usize) -> Option<usize> {
+    if signal.len() < window_size { return none }
+    let chars: [char] = signal.chars().collect()
+    let mut freq: HashMap<char, usize> = HashMap.new()
+    let mut duplicates = 0
+
+    // Initialize first window
+    for i in 0..window_size {
+        let count = freq.entry(chars[i]).or_insert(0)
+        *count += 1
+        if *count == 2 { duplicates += 1 }
+    }
+
+    if duplicates == 0 { return some(window_size) }
+
+    // Slide window
+    for i in window_size..chars.len() {
+        // Add new char
+        let add_count = freq.entry(chars[i]).or_insert(0)
+        *add_count += 1
+        if *add_count == 2 { duplicates += 1 }
+
+        // Remove old char
+        let remove_idx = i - window_size
+        let rem_count = freq.get_mut(&chars[remove_idx]).unwrap()
+        if *rem_count == 2 { duplicates -= 1 }
+        *rem_count -= 1
+
+        if duplicates == 0 { return some(i + 1) }
+    }
+    none
+}
+
+fn count_char_frequencies(s: &str) -> HashMap<char, usize> {
+    let mut freq = HashMap.new()
+    for ch in s.chars() {
+        *freq.entry(ch).or_insert(0) += 1
+    }
+    freq
+}
+
+fn most_common_char(s: &str) -> Option<(char, usize)> {
+    let freq = count_char_frequencies(s)
+    freq.into_iter().max_by_key(|(_, count)| *count)
+}
+
+fn all_unique(s: &str) -> bool {
+    let mut seen = HashSet.new()
+    for ch in s.chars() {
+        if !seen.insert(ch) { return false }
+    }
+    true
+}
+
+fn longest_unique_substring(s: &str) -> usize {
+    let chars: [char] = s.chars().collect()
+    let mut max_len = 0
+    let mut start = 0
+    let mut last_seen: HashMap<char, usize> = HashMap.new()
+
+    for end in 0..chars.len() {
+        if let some(&prev) = last_seen.get(&chars[end]) {
+            if prev >= start { start = prev + 1 }
+        }
+        last_seen.insert(chars[end], end)
+        let current_len = end - start + 1
+        if current_len > max_len { max_len = current_len }
+    }
+    max_len
+}
+
+fn main() {
+    // Part 1: Start-of-packet marker (4 unique)
+    assert(first_unique_window("mjqjpqmgbljsphdztnvjfqwrcgsmlb", 4) == some(7))
+    assert(first_unique_window("bvwbjplbgvbhsrlpgdmjqwftvncz", 4) == some(5))
+    assert(first_unique_window("nppdvjthqldpwncqszvftbrmjlhg", 4) == some(6))
+    assert(first_unique_window("nznrnfrfntjfmvfwmzdfjlvtqnbhcprsg", 4) == some(10))
+    assert(first_unique_window("zcfzfwzzqfrljwzlrfnpqdbhtmscgvjw", 4) == some(11))
+    print("Part 1 ✓")
+
+    // Part 2: Start-of-message marker (14 unique)
+    assert(first_unique_window("mjqjpqmgbljsphdztnvjfqwrcgsmlb", 14) == some(19))
+    assert(first_unique_window("bvwbjplbgvbhsrlpgdmjqwftvncz", 14) == some(23))
+    assert(first_unique_window("nppdvjthqldpwncqszvftbrmjlhg", 14) == some(23))
+    assert(first_unique_window("nznrnfrfntjfmvfwmzdfjlvtqnbhcprsg", 14) == some(29))
+    assert(first_unique_window("zcfzfwzzqfrljwzlrfnpqdbhtmscgvjw", 14) == some(26))
+    print("Part 2 ✓")
+
+    // Optimized version matches
+    assert(first_unique_window_optimized("mjqjpqmgbljsphdztnvjfqwrcgsmlb", 4) == some(7))
+    assert(first_unique_window_optimized("bvwbjplbgvbhsrlpgdmjqwftvncz", 14) == some(23))
+    print("Optimized ✓")
+
+    // Edge cases
+    assert(first_unique_window("aaa", 4).is_none())
+    assert(first_unique_window("abcd", 4) == some(4))
+    assert(first_unique_window("", 1).is_none())
+    print("Edge cases ✓")
+
+    // Char frequencies
+    let freq = count_char_frequencies("aabbc")
+    assert(*freq.get(&'a').unwrap() == 2)
+    assert(*freq.get(&'b').unwrap() == 2)
+    assert(*freq.get(&'c').unwrap() == 1)
+    print("Frequencies ✓")
+
+    // Most common
+    let (ch, count) = most_common_char("aabbbcc").unwrap()
+    assert(ch == 'b')
+    assert(count == 3)
+    assert(most_common_char("").is_none())
+    print("Most common ✓")
+
+    // All unique
+    assert(all_unique("abcdef"))
+    assert(!all_unique("abcaef"))
+    assert(all_unique(""))
+    assert(all_unique("x"))
+    print("All unique ✓")
+
+    // Longest unique substring
+    assert(longest_unique_substring("abcabcbb") == 3)
+    assert(longest_unique_substring("bbbbb") == 1)
+    assert(longest_unique_substring("pwwkew") == 3)
+    assert(longest_unique_substring("") == 0)
+    assert(longest_unique_substring("abcdef") == 6)
+    print("Longest unique ✓")
+
+    print("AoC Day 6 complete ✓")
+}
