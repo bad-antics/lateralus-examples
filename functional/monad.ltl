@@ -1,0 +1,254 @@
+// Monads in Lateralus
+// Option, Result, and IO monads with bind (flat_map), map, and do-notation style chaining.
+
+use std.fmt.{Display, Formatter}
+
+// ─── Option Monad ───
+
+fn option_map<A, B>(opt: Option<A>, f: fn(A) -> B) -> Option<B> {
+    match opt {
+        some(a) => some(f(a)),
+        none => none,
+    }
+}
+
+fn option_bind<A, B>(opt: Option<A>, f: fn(A) -> Option<B>) -> Option<B> {
+    match opt {
+        some(a) => f(a),
+        none => none,
+    }
+}
+
+fn option_pure<A>(a: A) -> Option<A> { some(a) }
+
+fn option_ap<A, B>(f: Option<fn(A) -> B>, x: Option<A>) -> Option<B> {
+    option_bind(f, |func| option_map(x, func))
+}
+
+fn option_or<A>(a: Option<A>, b: Option<A>) -> Option<A> {
+    match a { some(_) => a, none => b }
+}
+
+fn option_filter<A>(opt: Option<A>, pred: fn(&A) -> bool) -> Option<A> {
+    match opt {
+        some(a) if pred(&a) => some(a),
+        _ => none,
+    }
+}
+
+// ─── Result Monad ───
+
+fn result_map<A, B, E>(res: Result<A, E>, f: fn(A) -> B) -> Result<B, E> {
+    match res {
+        ok(a) => ok(f(a)),
+        err(e) => err(e),
+    }
+}
+
+fn result_bind<A, B, E>(res: Result<A, E>, f: fn(A) -> Result<B, E>) -> Result<B, E> {
+    match res {
+        ok(a) => f(a),
+        err(e) => err(e),
+    }
+}
+
+fn result_pure<A, E>(a: A) -> Result<A, E> { ok(a) }
+
+fn result_map_err<A, E, F>(res: Result<A, E>, f: fn(E) -> F) -> Result<A, F> {
+    match res {
+        ok(a) => ok(a),
+        err(e) => err(f(e)),
+    }
+}
+
+// ─── Writer Monad (for logging) ───
+
+#[derive(Clone, Debug, PartialEq)]
+struct Writer<A> {
+    value: A,
+    log: [string],
+}
+
+impl<A> Writer<A> {
+    fn pure(a: A) -> Writer<A> {
+        Writer { value: a, log: [] }
+    }
+
+    fn tell(a: A, msg: &str) -> Writer<A> {
+        Writer { value: a, log: vec![msg.to_string()] }
+    }
+
+    fn map<B>(self, f: fn(A) -> B) -> Writer<B> {
+        Writer { value: f(self.value), log: self.log }
+    }
+
+    fn bind<B>(self, f: fn(A) -> Writer<B>) -> Writer<B> {
+        let next = f(self.value)
+        let mut combined_log = self.log
+        combined_log.extend(next.log)
+        Writer { value: next.value, log: combined_log }
+    }
+
+    fn run(self) -> (A, [string]) {
+        (self.value, self.log)
+    }
+}
+
+// ─── Identity Monad ───
+
+#[derive(Clone, Debug, PartialEq)]
+struct Identity<A> {
+    value: A,
+}
+
+impl<A> Identity<A> {
+    fn pure(a: A) -> Identity<A> { Identity { value: a } }
+    fn map<B>(self, f: fn(A) -> B) -> Identity<B> { Identity { value: f(self.value) } }
+    fn bind<B>(self, f: fn(A) -> Identity<B>) -> Identity<B> { f(self.value) }
+    fn run(self) -> A { self.value }
+}
+
+// ─── List Monad ───
+
+fn list_pure<A>(a: A) -> [A] { vec![a] }
+
+fn list_bind<A, B>(xs: [A], f: fn(A) -> [B]) -> [B] {
+    xs.into_iter().flat_map(f).collect()
+}
+
+fn list_map<A, B>(xs: [A], f: fn(A) -> B) -> [B] {
+    xs.into_iter().map(f).collect()
+}
+
+fn list_guard(cond: bool) -> [()]  {
+    if cond { vec![()] } else { vec![] }
+}
+
+// ─── Utility: safe_div ───
+
+fn safe_div(a: i64, b: i64) -> Option<i64> {
+    if b == 0 { none } else { some(a / b) }
+}
+
+fn safe_sqrt(x: f64) -> Option<f64> {
+    if x < 0.0 { none } else { some(x.sqrt()) }
+}
+
+fn parse_int(s: &str) -> Result<i64, string> {
+    s.parse::<i64>().map_err(|_| format!("not a number: {}", s))
+}
+
+fn main() {
+    // Option monad laws
+    // Left identity: pure(a) >>= f == f(a)
+    let f = |x: i64| some(x * 2)
+    assert(option_bind(option_pure(5), f) == f(5))
+    print("Option left identity ✓")
+
+    // Right identity: m >>= pure == m
+    let m = some(42)
+    assert(option_bind(m, option_pure) == m)
+    print("Option right identity ✓")
+
+    // Associativity: (m >>= f) >>= g == m >>= (x -> f(x) >>= g)
+    let g = |x: i64| some(x + 1)
+    let lhs = option_bind(option_bind(m, f), g)
+    let rhs = option_bind(m, |x| option_bind(f(x), g))
+    assert(lhs == rhs)
+    print("Option associativity ✓")
+
+    // Option chaining
+    let result = option_bind(some(10), |x|
+        option_bind(safe_div(x, 2), |y|
+            option_bind(safe_div(y, 0), |z|
+                some(z))))
+    assert(result.is_none())
+    print("Option chain (div by zero) ✓")
+
+    let result2 = option_bind(some(100), |x|
+        option_bind(safe_div(x, 5), |y|
+            some(y + 1)))
+    assert(result2 == some(21))
+    print("Option chain (success) ✓")
+
+    // Option map
+    assert(option_map(some(3), |x| x * x) == some(9))
+    assert(option_map(none::<i64>, |x| x * x).is_none())
+    print("Option map ✓")
+
+    // Option filter
+    assert(option_filter(some(4), |x| *x > 3) == some(4))
+    assert(option_filter(some(2), |x| *x > 3).is_none())
+    print("Option filter ✓")
+
+    // Option or
+    assert(option_or(some(1), some(2)) == some(1))
+    assert(option_or(none, some(2)) == some(2))
+    print("Option or ✓")
+
+    // Result monad
+    let r = result_bind(parse_int("42"), |n| ok(n * 2))
+    assert(r == ok(84))
+    print("Result bind ✓")
+
+    let r2 = result_bind(parse_int("abc"), |n| ok(n * 2))
+    assert(r2.is_err())
+    print("Result error propagation ✓")
+
+    // Result map
+    assert(result_map(ok::<i64, string>(5), |x| x + 1) == ok(6))
+    print("Result map ✓")
+
+    // Result map_err
+    let r3 = result_map_err(err::<i64, i64>(42), |e| format!("error: {}", e))
+    assert(r3 == err("error: 42".to_string()))
+    print("Result map_err ✓")
+
+    // Writer monad
+    let w = Writer.tell(1, "start")
+        .bind(|x| Writer.tell(x + 1, "increment"))
+        .bind(|x| Writer.tell(x * 3, "triple"))
+    let (val, log) = w.run()
+    assert(val == 6)
+    assert(log == vec!["start".into(), "increment".into(), "triple".into()])
+    print("Writer monad ✓")
+
+    // Writer pure (no log)
+    let wp = Writer.pure(42)
+    assert(wp.value == 42)
+    assert(wp.log.is_empty())
+    print("Writer pure ✓")
+
+    // Writer map
+    let wm = Writer.tell(5, "five").map(|x| x * 2)
+    assert(wm.value == 10)
+    assert(wm.log == vec!["five".into()])
+    print("Writer map ✓")
+
+    // Identity monad
+    let id = Identity.pure(7).bind(|x| Identity.pure(x * 3)).map(|x| x + 1)
+    assert(id.run() == 22)
+    print("Identity monad ✓")
+
+    // List monad: Pythagorean triples
+    let triples = list_bind((1..=20).collect(), |a|
+        list_bind((a..=20).collect(), |b|
+            list_bind((b..=20).collect(), |c|
+                list_bind(list_guard(a*a + b*b == c*c), |_|
+                    list_pure((a, b, c))))))
+    assert(triples.contains(&(3, 4, 5)))
+    assert(triples.contains(&(5, 12, 13)))
+    print("List monad ✓")
+
+    // List bind
+    let doubled = list_bind(vec![1, 2, 3], |x| vec![x, x])
+    assert(doubled == vec![1, 1, 2, 2, 3, 3])
+    print("List bind ✓")
+
+    // safe_sqrt
+    assert(safe_sqrt(4.0) == some(2.0))
+    assert(safe_sqrt(-1.0).is_none())
+    print("safe_sqrt ✓")
+
+    print("Monads complete ✓")
+}
