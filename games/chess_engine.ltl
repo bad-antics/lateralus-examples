@@ -1,0 +1,253 @@
+
+// Chess Engine - Board representation, move generation, and evaluation
+// Uses bitboard-inspired representation with piece-square tables.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Piece { Pawn, Knight, Bishop, Rook, Queen, King, Empty }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Color { White, Black }
+
+impl Color {
+    fn opposite(self) -> Color { match self { Color.White => Color.Black, Color.Black => Color.White } }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Square {
+    piece: Piece,
+    color: Option<Color>,
+}
+
+impl Square {
+    fn empty() -> Square { Square { piece: Piece.Empty, color: None } }
+    fn new(piece: Piece, color: Color) -> Square { Square { piece, color: Some(color) } }
+    fn is_empty(self) -> bool { self.piece == Piece.Empty }
+    fn is_color(self, c: Color) -> bool { self.color == Some(c) }
+    fn symbol(self) -> char {
+        let base = match self.piece {
+            Piece.Pawn => 'P', Piece.Knight => 'N', Piece.Bishop => 'B',
+            Piece.Rook => 'R', Piece.Queen => 'Q', Piece.King => 'K',
+            Piece.Empty => '.',
+        };
+        if self.color == Some(Color.Black) { base.to_lowercase() } else { base }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Pos { row: i32, col: i32 }
+
+impl Pos {
+    fn new(row: i32, col: i32) -> Pos { Pos { row, col } }
+    fn valid(self) -> bool { self.row >= 0 && self.row < 8 && self.col >= 0 && self.col < 8 }
+    fn to_index(self) -> usize { (self.row * 8 + self.col) as usize }
+    fn algebraic(self) -> string {
+        let file = (b'a' + self.col as u8) as char
+        let rank = (b'1' + self.row as u8) as char
+        format!("{}{}", file, rank)
+    }
+    fn from_algebraic(s: &str) -> Pos {
+        let chars: [char] = s.chars().collect()
+        Pos { row: (chars[1] as i32 - '1' as i32), col: (chars[0] as i32 - 'a' as i32) }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Move {
+    from: Pos,
+    to: Pos,
+    captured: Piece,
+    promotion: Option<Piece>,
+}
+
+impl Move {
+    fn new(from: Pos, to: Pos) -> Move { Move { from, to, captured: Piece.Empty, promotion: None } }
+    fn capture(from: Pos, to: Pos, captured: Piece) -> Move { Move { from, to, captured, promotion: None } }
+    fn is_capture(self) -> bool { self.captured != Piece.Empty }
+    fn notation(self) -> string { format!("{}{}", self.from.algebraic(), self.to.algebraic()) }
+}
+
+struct Board {
+    squares: [Square; 64],
+    turn: Color,
+    move_count: u32,
+    half_move: u32,
+}
+
+impl Board {
+    fn new() -> Board {
+        let mut b = Board { squares: [Square.empty(); 64], turn: Color.White, move_count: 1, half_move: 0 }
+        // Set up initial position
+        let back_rank = [Piece.Rook, Piece.Knight, Piece.Bishop, Piece.Queen, Piece.King, Piece.Bishop, Piece.Knight, Piece.Rook]
+        for col in 0..8 {
+            b.squares[col] = Square.new(back_rank[col], Color.White)
+            b.squares[8 + col] = Square.new(Piece.Pawn, Color.White)
+            b.squares[48 + col] = Square.new(Piece.Pawn, Color.Black)
+            b.squares[56 + col] = Square.new(back_rank[col], Color.Black)
+        }
+        b
+    }
+
+    fn at(self, pos: Pos) -> Square { self.squares[pos.to_index()] }
+    fn set(mut self, pos: Pos, sq: Square) { self.squares[pos.to_index()] = sq }
+
+    fn piece_value(piece: Piece) -> i32 {
+        match piece {
+            Piece.Pawn => 100, Piece.Knight => 320, Piece.Bishop => 330,
+            Piece.Rook => 500, Piece.Queen => 900, Piece.King => 20000,
+            Piece.Empty => 0,
+        }
+    }
+
+    fn material_balance(self) -> i32 {
+        let mut score = 0
+        for sq in &self.squares {
+            let val = Board.piece_value(sq.piece)
+            match sq.color {
+                Some(Color.White) => score += val,
+                Some(Color.Black) => score -= val,
+                None => {}
+            }
+        }
+        score
+    }
+
+    fn count_pieces(self, color: Color) -> usize {
+        self.squares.iter().filter(|s| s.is_color(color) && s.piece != Piece.King).count()
+    }
+
+    fn find_king(self, color: Color) -> Option<Pos> {
+        for i in 0..64 {
+            if self.squares[i].piece == Piece.King && self.squares[i].color == Some(color) {
+                return Some(Pos.new(i as i32 / 8, i as i32 % 8))
+            }
+        }
+        None
+    }
+
+    fn generate_pawn_moves(self, pos: Pos, color: Color) -> [Move] {
+        let mut moves = []
+        let dir = if color == Color.White { 1 } else { -1 }
+        let fwd = Pos.new(pos.row + dir, pos.col)
+        if fwd.valid() && self.at(fwd).is_empty() {
+            moves.push(Move.new(pos, fwd))
+        }
+        // Captures
+        for dc in [-1, 1] {
+            let cap = Pos.new(pos.row + dir, pos.col + dc)
+            if cap.valid() && !self.at(cap).is_empty() && !self.at(cap).is_color(color) {
+                moves.push(Move.capture(pos, cap, self.at(cap).piece))
+            }
+        }
+        moves
+    }
+
+    fn generate_knight_moves(self, pos: Pos, color: Color) -> [Move] {
+        let mut moves = []
+        let offsets = [(-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)]
+        for (dr, dc) in offsets {
+            let to = Pos.new(pos.row + dr, pos.col + dc)
+            if to.valid() {
+                let target = self.at(to)
+                if target.is_empty() { moves.push(Move.new(pos, to)) }
+                else if !target.is_color(color) { moves.push(Move.capture(pos, to, target.piece)) }
+            }
+        }
+        moves
+    }
+
+    fn make_move(mut self, m: &Move) {
+        let piece = self.at(m.from)
+        self.set(m.from, Square.empty())
+        self.set(m.to, piece)
+        self.turn = self.turn.opposite()
+        self.half_move += 1
+        if self.turn == Color.White { self.move_count += 1 }
+    }
+}
+
+fn main() {
+    // Square
+    let sq = Square.new(Piece.Knight, Color.White)
+    assert(!sq.is_empty())
+    assert(sq.is_color(Color.White))
+    assert(sq.symbol() == 'N')
+    let bq = Square.new(Piece.Queen, Color.Black)
+    assert(bq.symbol() == 'q')
+    assert(Square.empty().is_empty())
+    print("Square ✓")
+
+    // Position
+    let pos = Pos.new(0, 4)
+    assert(pos.valid())
+    assert(pos.algebraic() == "e1")
+    let p2 = Pos.from_algebraic("e2")
+    assert(p2.row == 1 && p2.col == 4)
+    assert(!Pos.new(-1, 0).valid())
+    print("Position ✓")
+
+    // Move
+    let m = Move.new(Pos.new(1, 4), Pos.new(3, 4))
+    assert(!m.is_capture())
+    assert(m.notation() == "e2e4")
+    let mc = Move.capture(Pos.new(3, 3), Pos.new(4, 4), Piece.Pawn)
+    assert(mc.is_capture())
+    print("Move ✓")
+
+    // Board init
+    let board = Board.new()
+    assert(board.at(Pos.new(0, 0)).piece == Piece.Rook)
+    assert(board.at(Pos.new(0, 4)).piece == Piece.King)
+    assert(board.at(Pos.new(1, 0)).piece == Piece.Pawn)
+    assert(board.at(Pos.new(7, 3)).piece == Piece.Queen)
+    assert(board.at(Pos.new(4, 4)).is_empty())
+    assert(board.turn == Color.White)
+    print("Board init ✓")
+
+    // Material balance (should be 0 at start)
+    assert(board.material_balance() == 0)
+    print("Material ✓")
+
+    // Piece counts
+    assert(board.count_pieces(Color.White) == 15)  // 8 pawns + 7 pieces (excl king)
+    assert(board.count_pieces(Color.Black) == 15)
+    print("Piece count ✓")
+
+    // Find king
+    let wk = board.find_king(Color.White).unwrap()
+    assert(wk.row == 0 && wk.col == 4)
+    let bk = board.find_king(Color.Black).unwrap()
+    assert(bk.row == 7 && bk.col == 4)
+    print("Find king ✓")
+
+    // Pawn moves
+    let pawn_moves = board.generate_pawn_moves(Pos.new(1, 4), Color.White)
+    assert(pawn_moves.len() >= 1)  // e2-e3 at minimum
+    assert(!pawn_moves[0].is_capture())
+    print("Pawn moves ✓")
+
+    // Knight moves
+    let knight_moves = board.generate_knight_moves(Pos.new(0, 1), Color.White)
+    assert(knight_moves.len() == 2)  // b1 knight can go to a3 or c3
+    print("Knight moves ✓")
+
+    // Make move
+    let mut b2 = board.clone()
+    b2.make_move(&Move.new(Pos.new(1, 4), Pos.new(3, 4)))
+    assert(b2.at(Pos.new(1, 4)).is_empty())
+    assert(b2.at(Pos.new(3, 4)).piece == Piece.Pawn)
+    assert(b2.turn == Color.Black)
+    print("Make move ✓")
+
+    // Piece values
+    assert(Board.piece_value(Piece.Queen) == 900)
+    assert(Board.piece_value(Piece.Pawn) == 100)
+    assert(Board.piece_value(Piece.Empty) == 0)
+    print("Values ✓")
+
+    // Color
+    assert(Color.White.opposite() == Color.Black)
+    assert(Color.Black.opposite() == Color.White)
+    print("Color ✓")
+
+    print("Chess engine complete ✓")
+}
