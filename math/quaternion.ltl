@@ -1,0 +1,205 @@
+
+// Quaternion Mathematics
+// 3D rotation representation with full arithmetic, SLERP, and conversion.
+
+use std.math.{sqrt, sin, cos, acos, atan2, PI, abs}
+
+struct Quat {
+    w: f64,
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+impl Quat {
+    fn identity() -> Quat { Quat { w: 1.0, x: 0.0, y: 0.0, z: 0.0 } }
+
+    fn new(w: f64, x: f64, y: f64, z: f64) -> Quat { Quat { w, x, y, z } }
+
+    fn from_axis_angle(axis: (f64, f64, f64), angle: f64) -> Quat {
+        let half = angle / 2.0
+        let s = sin(half)
+        let len = sqrt(axis.0 * axis.0 + axis.1 * axis.1 + axis.2 * axis.2)
+        Quat {
+            w: cos(half),
+            x: axis.0 / len * s,
+            y: axis.1 / len * s,
+            z: axis.2 / len * s,
+        }
+    }
+
+    fn from_euler(roll: f64, pitch: f64, yaw: f64) -> Quat {
+        let (cr, sr) = (cos(roll / 2.0), sin(roll / 2.0))
+        let (cp, sp) = (cos(pitch / 2.0), sin(pitch / 2.0))
+        let (cy, sy) = (cos(yaw / 2.0), sin(yaw / 2.0))
+        Quat {
+            w: cr * cp * cy + sr * sp * sy,
+            x: sr * cp * cy - cr * sp * sy,
+            y: cr * sp * cy + sr * cp * sy,
+            z: cr * cp * sy - sr * sp * cy,
+        }
+    }
+
+    fn norm(self) -> f64 { sqrt(self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z) }
+    fn norm_sq(self) -> f64 { self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z }
+
+    fn normalize(self) -> Quat {
+        let n = self.norm()
+        if n < 1e-10 { return Quat.identity() }
+        Quat { w: self.w / n, x: self.x / n, y: self.y / n, z: self.z / n }
+    }
+
+    fn conjugate(self) -> Quat { Quat { w: self.w, x: -self.x, y: -self.y, z: -self.z } }
+
+    fn inverse(self) -> Quat {
+        let ns = self.norm_sq()
+        Quat { w: self.w / ns, x: -self.x / ns, y: -self.y / ns, z: -self.z / ns }
+    }
+
+    fn mul(self, other: &Quat) -> Quat {
+        Quat {
+            w: self.w * other.w - self.x * other.x - self.y * other.y - self.z * other.z,
+            x: self.w * other.x + self.x * other.w + self.y * other.z - self.z * other.y,
+            y: self.w * other.y - self.x * other.z + self.y * other.w + self.z * other.x,
+            z: self.w * other.z + self.x * other.y - self.y * other.x + self.z * other.w,
+        }
+    }
+
+    fn add(self, other: &Quat) -> Quat {
+        Quat { w: self.w + other.w, x: self.x + other.x, y: self.y + other.y, z: self.z + other.z }
+    }
+
+    fn scale(self, s: f64) -> Quat {
+        Quat { w: self.w * s, x: self.x * s, y: self.y * s, z: self.z * s }
+    }
+
+    fn dot(self, other: &Quat) -> f64 {
+        self.w * other.w + self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    fn rotate_point(self, p: (f64, f64, f64)) -> (f64, f64, f64) {
+        let q_p = Quat { w: 0.0, x: p.0, y: p.1, z: p.2 }
+        let result = self.mul(&q_p).mul(&self.conjugate())
+        (result.x, result.y, result.z)
+    }
+
+    fn to_axis_angle(self) -> ((f64, f64, f64), f64) {
+        let n = self.normalize()
+        let angle = 2.0 * acos(n.w.clamp(-1.0, 1.0))
+        let s = sqrt(1.0 - n.w * n.w)
+        if s < 1e-10 { ((1.0, 0.0, 0.0), angle) }
+        else { ((n.x / s, n.y / s, n.z / s), angle) }
+    }
+
+    fn approx_eq(self, other: &Quat, eps: f64) -> bool {
+        (self.w - other.w).abs() < eps &&
+        (self.x - other.x).abs() < eps &&
+        (self.y - other.y).abs() < eps &&
+        (self.z - other.z).abs() < eps
+    }
+}
+
+fn slerp(a: &Quat, b: &Quat, t: f64) -> Quat {
+    let mut dot = a.dot(b)
+    let mut b_adj = b.clone()
+    if dot < 0.0 {
+        b_adj = b_adj.scale(-1.0)
+        dot = -dot
+    }
+    if dot > 0.9995 {
+        // Linear interpolation for very close quaternions
+        let result = a.scale(1.0 - t).add(&b_adj.scale(t))
+        return result.normalize()
+    }
+    let theta = acos(dot.clamp(-1.0, 1.0))
+    let sin_theta = sin(theta)
+    let wa = sin((1.0 - t) * theta) / sin_theta
+    let wb = sin(t * theta) / sin_theta
+    a.scale(wa).add(&b_adj.scale(wb))
+}
+
+fn main() {
+    let eps = 1e-6
+
+    // Identity
+    let id = Quat.identity()
+    assert((id.norm() - 1.0).abs() < eps)
+    assert(id.w == 1.0)
+    print("Identity ✓")
+
+    // Normalize
+    let q = Quat.new(1.0, 1.0, 1.0, 1.0).normalize()
+    assert((q.norm() - 1.0).abs() < eps)
+    print("Normalize ✓")
+
+    // Conjugate
+    let c = Quat.new(1.0, 2.0, 3.0, 4.0).conjugate()
+    assert(c.x == -2.0 && c.y == -3.0 && c.z == -4.0 && c.w == 1.0)
+    print("Conjugate ✓")
+
+    // Inverse
+    let q2 = Quat.new(1.0, 0.0, 1.0, 0.0).normalize()
+    let inv = q2.inverse()
+    let prod = q2.mul(&inv)
+    assert(prod.approx_eq(&Quat.identity(), eps))
+    print("Inverse ✓")
+
+    // Multiplication is non-commutative
+    let a = Quat.from_axis_angle((1.0, 0.0, 0.0), PI / 2.0)
+    let b = Quat.from_axis_angle((0.0, 1.0, 0.0), PI / 2.0)
+    let ab = a.mul(&b)
+    let ba = b.mul(&a)
+    assert(!ab.approx_eq(&ba, 0.01))
+    print("Non-commutative ✓")
+
+    // Identity multiplication
+    let id_prod = a.mul(&Quat.identity())
+    assert(id_prod.approx_eq(&a, eps))
+    print("Identity mul ✓")
+
+    // Axis-angle roundtrip
+    let q3 = Quat.from_axis_angle((0.0, 0.0, 1.0), PI / 3.0)
+    let (axis, angle) = q3.to_axis_angle()
+    assert((angle - PI / 3.0).abs() < eps)
+    assert(axis.2.abs() > 0.99)
+    print("Axis-angle ✓")
+
+    // Rotate point: 90° around Z should map (1,0,0) to (0,1,0)
+    let rz = Quat.from_axis_angle((0.0, 0.0, 1.0), PI / 2.0)
+    let rotated = rz.rotate_point((1.0, 0.0, 0.0))
+    assert(rotated.0.abs() < eps)
+    assert((rotated.1 - 1.0).abs() < eps)
+    assert(rotated.2.abs() < eps)
+    print("Rotate point ✓")
+
+    // Dot product
+    assert((Quat.identity().dot(&Quat.identity()) - 1.0).abs() < eps)
+    print("Dot ✓")
+
+    // SLERP
+    let s0 = Quat.identity()
+    let s1 = Quat.from_axis_angle((0.0, 1.0, 0.0), PI)
+    let mid = slerp(&s0, &s1, 0.5)
+    assert((mid.norm() - 1.0).abs() < eps)
+    // t=0 gives start
+    let t0 = slerp(&s0, &s1, 0.0)
+    assert(t0.approx_eq(&s0, eps))
+    // t=1 gives end (or negated)
+    let t1 = slerp(&s0, &s1, 1.0)
+    assert(t1.approx_eq(&s1, eps) || t1.scale(-1.0).approx_eq(&s1, eps))
+    print("SLERP ✓")
+
+    // Euler angles
+    let euler = Quat.from_euler(0.0, 0.0, PI / 2.0)
+    assert((euler.norm() - 1.0).abs() < eps)
+    let rp = euler.rotate_point((1.0, 0.0, 0.0))
+    assert(rp.0.abs() < eps)
+    print("Euler ✓")
+
+    // Scale
+    let scaled = Quat.new(1.0, 2.0, 3.0, 4.0).scale(2.0)
+    assert(scaled.w == 2.0 && scaled.x == 4.0)
+    print("Scale ✓")
+
+    print("Quaternion complete ✓")
+}
