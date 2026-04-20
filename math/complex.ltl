@@ -1,0 +1,179 @@
+
+// Complex number arithmetic
+// Full support for arithmetic, polar form, and common functions.
+
+use std.math.{sqrt, atan2, cos, sin, exp, ln, PI}
+
+#[derive(Clone, Debug)]
+struct Complex {
+    re: f64,
+    im: f64,
+}
+
+impl Complex {
+    fn new(re: f64, im: f64) -> Complex { Complex { re, im } }
+    fn real(val: f64) -> Complex { Complex { re: val, im: 0.0 } }
+    fn imaginary(val: f64) -> Complex { Complex { re: 0.0, im: val } }
+    fn zero() -> Complex { Complex { re: 0.0, im: 0.0 } }
+    fn one() -> Complex { Complex { re: 1.0, im: 0.0 } }
+    fn i() -> Complex { Complex { re: 0.0, im: 1.0 } }
+
+    fn from_polar(r: f64, theta: f64) -> Complex {
+        Complex { re: r * cos(theta), im: r * sin(theta) }
+    }
+
+    fn add(self, other: &Complex) -> Complex {
+        Complex { re: self.re + other.re, im: self.im + other.im }
+    }
+
+    fn sub(self, other: &Complex) -> Complex {
+        Complex { re: self.re - other.re, im: self.im - other.im }
+    }
+
+    fn mul(self, other: &Complex) -> Complex {
+        Complex {
+            re: self.re * other.re - self.im * other.im,
+            im: self.re * other.im + self.im * other.re,
+        }
+    }
+
+    fn div(self, other: &Complex) -> Complex {
+        let denom = other.re * other.re + other.im * other.im
+        Complex {
+            re: (self.re * other.re + self.im * other.im) / denom,
+            im: (self.im * other.re - self.re * other.im) / denom,
+        }
+    }
+
+    fn conjugate(self) -> Complex { Complex { re: self.re, im: -self.im } }
+    fn magnitude(self) -> f64 { sqrt(self.re * self.re + self.im * self.im) }
+    fn magnitude_squared(self) -> f64 { self.re * self.re + self.im * self.im }
+    fn phase(self) -> f64 { atan2(self.im, self.re) }
+    fn is_real(self) -> bool { self.im.abs() < 1e-10 }
+    fn is_imaginary(self) -> bool { self.re.abs() < 1e-10 }
+    fn is_zero(self) -> bool { self.magnitude() < 1e-10 }
+
+    fn scale(self, s: f64) -> Complex { Complex { re: self.re * s, im: self.im * s } }
+    fn negate(self) -> Complex { Complex { re: -self.re, im: -self.im } }
+    fn reciprocal(self) -> Complex { Complex.one().div(self) }
+
+    fn pow(self, n: i32) -> Complex {
+        if n == 0 { return Complex.one() }
+        if n < 0 { return self.reciprocal().pow(-n) }
+        let mut result = Complex.one()
+        for _ in 0..n { result = result.mul(self) }
+        result
+    }
+
+    fn sqrt_complex(self) -> Complex {
+        let r = self.magnitude()
+        let theta = self.phase()
+        Complex.from_polar(sqrt(r), theta / 2.0)
+    }
+
+    fn approx_eq(self, other: &Complex, epsilon: f64) -> bool {
+        (self.re - other.re).abs() < epsilon && (self.im - other.im).abs() < epsilon
+    }
+
+    fn to_string(self) -> string {
+        if self.im >= 0.0 { format!("{} + {}i", self.re, self.im) }
+        else { format!("{} - {}i", self.re, -self.im) }
+    }
+}
+
+fn main() {
+    let eps = 1e-9
+
+    // Construction
+    let z = Complex.new(3.0, 4.0)
+    assert(z.re == 3.0 && z.im == 4.0)
+    assert(Complex.real(5.0).is_real())
+    assert(Complex.imaginary(3.0).is_imaginary())
+    assert(Complex.zero().is_zero())
+    print("Construction ✓")
+
+    // Magnitude and phase
+    assert((z.magnitude() - 5.0).abs() < eps)
+    assert(z.magnitude_squared() == 25.0)
+    assert((Complex.real(1.0).phase()).abs() < eps)
+    assert((Complex.imaginary(1.0).phase() - PI / 2.0).abs() < eps)
+    print("Magnitude/phase ✓")
+
+    // Polar form
+    let polar = Complex.from_polar(5.0, PI / 4.0)
+    assert((polar.re - 5.0 * cos(PI / 4.0)).abs() < eps)
+    assert((polar.im - 5.0 * sin(PI / 4.0)).abs() < eps)
+    print("Polar ✓")
+
+    // Addition
+    let a = Complex.new(1.0, 2.0)
+    let b = Complex.new(3.0, 4.0)
+    let sum = a.add(&b)
+    assert(sum.approx_eq(&Complex.new(4.0, 6.0), eps))
+    print("Addition ✓")
+
+    // Subtraction
+    let diff = b.sub(&a)
+    assert(diff.approx_eq(&Complex.new(2.0, 2.0), eps))
+    print("Subtraction ✓")
+
+    // Multiplication
+    // (1+2i)(3+4i) = 3+4i+6i+8i² = 3+10i-8 = -5+10i
+    let prod = a.mul(&b)
+    assert(prod.approx_eq(&Complex.new(-5.0, 10.0), eps))
+    print("Multiplication ✓")
+
+    // Division
+    // (1+2i)/(3+4i) = (1+2i)(3-4i)/25 = (3-4i+6i-8i²)/25 = (11+2i)/25
+    let quot = a.div(&b)
+    assert(quot.approx_eq(&Complex.new(11.0 / 25.0, 2.0 / 25.0), eps))
+    print("Division ✓")
+
+    // Conjugate
+    let conj = a.conjugate()
+    assert(conj.re == 1.0 && conj.im == -2.0)
+    // z * conj(z) should be real
+    let prod2 = a.mul(&conj)
+    assert(prod2.is_real())
+    assert((prod2.re - a.magnitude_squared()).abs() < eps)
+    print("Conjugate ✓")
+
+    // Power
+    let z2 = Complex.new(1.0, 1.0)
+    let sq = z2.pow(2)
+    assert(sq.approx_eq(&Complex.new(0.0, 2.0), eps))
+    assert(z2.pow(0).approx_eq(&Complex.one(), eps))
+    print("Power ✓")
+
+    // Square root
+    let neg4 = Complex.new(-4.0, 0.0)
+    let root = neg4.sqrt_complex()
+    assert(root.approx_eq(&Complex.new(0.0, 2.0), eps))
+    print("Square root ✓")
+
+    // Scale and negate
+    let scaled = a.scale(3.0)
+    assert(scaled.approx_eq(&Complex.new(3.0, 6.0), eps))
+    let neg = a.negate()
+    assert(neg.approx_eq(&Complex.new(-1.0, -2.0), eps))
+    print("Scale/negate ✓")
+
+    // Reciprocal
+    let rec = a.reciprocal()
+    let should_be_one = a.mul(&rec)
+    assert(should_be_one.approx_eq(&Complex.one(), eps))
+    print("Reciprocal ✓")
+
+    // i unit
+    let i = Complex.i()
+    let i_sq = i.pow(2)
+    assert(i_sq.approx_eq(&Complex.new(-1.0, 0.0), eps))
+    print("i² = -1 ✓")
+
+    // to_string
+    assert(Complex.new(3.0, 4.0).to_string().contains("+"))
+    assert(Complex.new(3.0, -4.0).to_string().contains("-"))
+    print("to_string ✓")
+
+    print("Complex numbers complete ✓")
+}
