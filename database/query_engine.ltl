@@ -1,0 +1,414 @@
+// Query Engine
+// Simple SQL-like query engine with table storage, WHERE/SELECT/ORDER BY/LIMIT.
+
+use std.collections.HashMap
+use std.fmt.{Display, Formatter}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Value {
+    Null,
+    Int(i64),
+    Float(f64),
+    Str(string),
+    Bool(bool),
+}
+
+impl Value {
+    fn as_int(self) -> Option<i64> { match self { Value.Int(n) => some(n), _ => none } }
+    fn as_str(self) -> Option<&string> { match self { Value.Str(s) => some(s), _ => none } }
+    fn is_null(self) -> bool { matches!(self, Value.Null) }
+
+    fn cmp_value(self, other: &Value) -> i64 {
+        match (self, other) {
+            (Value.Int(a), Value.Int(b)) => {
+                if a < b { -1 } else if a > b { 1 } else { 0 }
+            },
+            (Value.Float(a), Value.Float(b)) => {
+                if a < b { -1.0 as i64 } else if a > b { 1 } else { 0 }
+            },
+            (Value.Str(a), Value.Str(b)) => {
+                if a < b { -1 } else if a > b { 1 } else { 0 }
+            },
+            _ => 0,
+        }
+    }
+}
+
+impl Display for Value {
+    fn fmt(self, f: &mut Formatter) -> Result<(), std.fmt.FmtError> {
+        match self {
+            Value.Null => f.write_str("NULL"),
+            Value.Int(n) => f.write_str(&n.to_string()),
+            Value.Float(v) => f.write_str(&v.to_string()),
+            Value.Str(s) => f.write_str(s),
+            Value.Bool(b) => f.write_str(if b { "true" } else { "false" }),
+        }
+    }
+}
+
+type Row = HashMap<string, Value>
+
+#[derive(Clone, Debug)]
+struct Table {
+    name: string,
+    columns: [string],
+    rows: [Row],
+}
+
+impl Table {
+    fn new(name: &str, columns: [string]) -> Table {
+        Table { name: name.to_string(), columns, rows: [] }
+    }
+
+    fn insert(mut self, row: Row) {
+        self.rows.push(row)
+    }
+
+    fn row_count(self) -> usize { self.rows.len() }
+    fn col_count(self) -> usize { self.columns.len() }
+}
+
+#[derive(Clone, Debug)]
+enum Expr {
+    Column(string),
+    Literal(Value),
+    Eq(Box<Expr>, Box<Expr>),
+    NotEq(Box<Expr>, Box<Expr>),
+    Lt(Box<Expr>, Box<Expr>),
+    Gt(Box<Expr>, Box<Expr>),
+    LtEq(Box<Expr>, Box<Expr>),
+    GtEq(Box<Expr>, Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    Not(Box<Expr>),
+    Like(Box<Expr>, string),
+    IsNull(Box<Expr>),
+}
+
+impl Expr {
+    fn evaluate(self, row: &Row) -> Value {
+        match self {
+            Expr.Column(name) => row.get(&name).cloned().unwrap_or(Value.Null),
+            Expr.Literal(v) => v,
+            Expr.Eq(a, b) => Value.Bool(a.evaluate(row) == b.evaluate(row)),
+            Expr.NotEq(a, b) => Value.Bool(a.evaluate(row) != b.evaluate(row)),
+            Expr.Lt(a, b) => Value.Bool(a.evaluate(row).cmp_value(&b.evaluate(row)) < 0),
+            Expr.Gt(a, b) => Value.Bool(a.evaluate(row).cmp_value(&b.evaluate(row)) > 0),
+            Expr.LtEq(a, b) => Value.Bool(a.evaluate(row).cmp_value(&b.evaluate(row)) <= 0),
+            Expr.GtEq(a, b) => Value.Bool(a.evaluate(row).cmp_value(&b.evaluate(row)) >= 0),
+            Expr.And(a, b) => {
+                let va = a.evaluate(row); let vb = b.evaluate(row)
+                match (va, vb) {
+                    (Value.Bool(x), Value.Bool(y)) => Value.Bool(x && y),
+                    _ => Value.Bool(false),
+                }
+            },
+            Expr.Or(a, b) => {
+                let va = a.evaluate(row); let vb = b.evaluate(row)
+                match (va, vb) {
+                    (Value.Bool(x), Value.Bool(y)) => Value.Bool(x || y),
+                    _ => Value.Bool(false),
+                }
+            },
+            Expr.Not(e) => {
+                match e.evaluate(row) {
+                    Value.Bool(b) => Value.Bool(!b),
+                    _ => Value.Bool(false),
+                }
+            },
+            Expr.Like(e, pattern) => {
+                match e.evaluate(row) {
+                    Value.Str(s) => {
+                        let regex = pattern.replace("%", ".*").replace("_", ".")
+                        Value.Bool(s.matches_pattern(&regex))
+                    },
+                    _ => Value.Bool(false),
+                }
+            },
+            Expr.IsNull(e) => Value.Bool(e.evaluate(row).is_null()),
+        }
+    }
+
+    fn is_truthy(self, row: &Row) -> bool {
+        match self.evaluate(row) {
+            Value.Bool(b) => b,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SortOrder { Asc, Desc }
+
+#[derive(Clone, Debug)]
+struct Query {
+    select: [string],         // columns to return, empty = all
+    from: string,             // table name
+    where_clause: Option<Expr>,
+    order_by: Option<(string, SortOrder)>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+impl Query {
+    fn new(table: &str) -> Query {
+        Query {
+            select: [], from: table.to_string(),
+            where_clause: none, order_by: none,
+            limit: none, offset: 0,
+        }
+    }
+
+    fn select(mut self, cols: [string]) -> Query { self.select = cols; self }
+    fn where_(mut self, expr: Expr) -> Query { self.where_clause = some(expr); self }
+    fn order_by(mut self, col: &str, order: SortOrder) -> Query { self.order_by = some((col.to_string(), order)); self }
+    fn limit(mut self, n: usize) -> Query { self.limit = some(n); self }
+    fn offset(mut self, n: usize) -> Query { self.offset = n; self }
+}
+
+struct Database {
+    tables: HashMap<string, Table>,
+}
+
+impl Database {
+    fn new() -> Database { Database { tables: HashMap.new() } }
+
+    fn create_table(mut self, name: &str, columns: [string]) {
+        self.tables.insert(name.to_string(), Table.new(name, columns))
+    }
+
+    fn table(self, name: &str) -> Option<&Table> {
+        self.tables.get(&name.to_string())
+    }
+
+    fn table_mut(mut self, name: &str) -> Option<&mut Table> {
+        self.tables.get_mut(&name.to_string())
+    }
+
+    fn insert(mut self, table: &str, row: Row) -> bool {
+        match self.tables.get_mut(&table.to_string()) {
+            some(t) => { t.insert(row); true },
+            none => false,
+        }
+    }
+
+    fn execute(self, query: &Query) -> Result<[Row], string> {
+        let table = self.tables.get(&query.from)
+            .ok_or(format!("table '{}' not found", query.from))?
+
+        // Filter
+        let mut results: [Row] = match &query.where_clause {
+            some(expr) => table.rows.iter()
+                .filter(|row| expr.is_truthy(row))
+                .cloned().collect(),
+            none => table.rows.clone(),
+        }
+
+        // Order
+        if let some((col, order)) = &query.order_by {
+            results.sort_by(|a, b| {
+                let va = a.get(col).unwrap_or(&Value.Null)
+                let vb = b.get(col).unwrap_or(&Value.Null)
+                let cmp = va.cmp_value(vb)
+                match order {
+                    SortOrder.Asc => cmp,
+                    SortOrder.Desc => -cmp,
+                }
+            })
+        }
+
+        // Offset
+        if query.offset > 0 {
+            results = results.into_iter().skip(query.offset).collect()
+        }
+
+        // Limit
+        if let some(limit) = query.limit {
+            results = results.into_iter().take(limit).collect()
+        }
+
+        // Project columns
+        if !query.select.is_empty() {
+            results = results.into_iter().map(|row| {
+                let mut projected = HashMap.new()
+                for col in &query.select {
+                    if let some(v) = row.get(col) {
+                        projected.insert(col.clone(), v.clone())
+                    }
+                }
+                projected
+            }).collect()
+        }
+
+        ok(results)
+    }
+
+    fn delete(mut self, table: &str, predicate: &Expr) -> usize {
+        match self.tables.get_mut(&table.to_string()) {
+            some(t) => {
+                let before = t.rows.len()
+                t.rows.retain(|row| !predicate.is_truthy(row))
+                before - t.rows.len()
+            },
+            none => 0,
+        }
+    }
+
+    fn update(mut self, table: &str, predicate: &Expr, updates: &[(string, Value)]) -> usize {
+        match self.tables.get_mut(&table.to_string()) {
+            some(t) => {
+                let mut count = 0
+                for row in &mut t.rows {
+                    if predicate.is_truthy(row) {
+                        for (col, val) in updates {
+                            row.insert(col.clone(), val.clone())
+                        }
+                        count += 1
+                    }
+                }
+                count
+            },
+            none => 0,
+        }
+    }
+
+    fn table_count(self) -> usize { self.tables.len() }
+}
+
+fn make_row(pairs: [(string, Value)]) -> Row {
+    let mut row = HashMap.new()
+    for (k, v) in pairs { row.insert(k, v); }
+    row
+}
+
+fn main() {
+    let mut db = Database.new()
+    db.create_table("users", vec!["id".into(), "name".into(), "age".into()])
+    assert(db.table_count() == 1)
+    print("Create table ✓")
+
+    // Insert
+    db.insert("users", make_row(vec![
+        ("id".into(), Value.Int(1)), ("name".into(), Value.Str("Alice".into())), ("age".into(), Value.Int(30))
+    ]))
+    db.insert("users", make_row(vec![
+        ("id".into(), Value.Int(2)), ("name".into(), Value.Str("Bob".into())), ("age".into(), Value.Int(25))
+    ]))
+    db.insert("users", make_row(vec![
+        ("id".into(), Value.Int(3)), ("name".into(), Value.Str("Carol".into())), ("age".into(), Value.Int(35))
+    ]))
+    db.insert("users", make_row(vec![
+        ("id".into(), Value.Int(4)), ("name".into(), Value.Str("Dave".into())), ("age".into(), Value.Int(28))
+    ]))
+    assert(db.table("users").unwrap().row_count() == 4)
+    print("Insert ✓")
+
+    // Select all
+    let all = db.execute(&Query.new("users")).unwrap()
+    assert(all.len() == 4)
+    print("Select all ✓")
+
+    // Where clause
+    let older = db.execute(
+        &Query.new("users").where_(
+            Expr.Gt(Box.new(Expr.Column("age".into())), Box.new(Expr.Literal(Value.Int(28))))
+        )
+    ).unwrap()
+    assert(older.len() == 2)  // Alice(30) and Carol(35)
+    print("Where ✓")
+
+    // Select columns
+    let names = db.execute(
+        &Query.new("users").select(vec!["name".into()])
+    ).unwrap()
+    assert(names[0].len() == 1)
+    assert(names[0].contains_key(&"name".to_string()))
+    print("Select columns ✓")
+
+    // Order by
+    let sorted = db.execute(
+        &Query.new("users").order_by("age", SortOrder.Desc)
+    ).unwrap()
+    assert(sorted[0].get(&"name".to_string()).unwrap() == &Value.Str("Carol".into()))
+    assert(sorted[3].get(&"name".to_string()).unwrap() == &Value.Str("Bob".into()))
+    print("Order by ✓")
+
+    // Limit + offset
+    let page = db.execute(
+        &Query.new("users").order_by("id", SortOrder.Asc).limit(2).offset(1)
+    ).unwrap()
+    assert(page.len() == 2)
+    assert(page[0].get(&"id".to_string()).unwrap() == &Value.Int(2))
+    print("Limit/offset ✓")
+
+    // AND condition
+    let and_q = db.execute(
+        &Query.new("users").where_(
+            Expr.And(
+                Box.new(Expr.Gt(Box.new(Expr.Column("age".into())), Box.new(Expr.Literal(Value.Int(25))))),
+                Box.new(Expr.Lt(Box.new(Expr.Column("age".into())), Box.new(Expr.Literal(Value.Int(35)))))
+            )
+        )
+    ).unwrap()
+    assert(and_q.len() == 2)  // Alice(30), Dave(28)
+    print("AND ✓")
+
+    // Update
+    let updated = db.update("users",
+        &Expr.Eq(Box.new(Expr.Column("id".into())), Box.new(Expr.Literal(Value.Int(2)))),
+        &vec![("age".into(), Value.Int(26))]
+    )
+    assert(updated == 1)
+    let bob = db.execute(
+        &Query.new("users").where_(Expr.Eq(Box.new(Expr.Column("id".into())), Box.new(Expr.Literal(Value.Int(2)))))
+    ).unwrap()
+    assert(bob[0].get(&"age".to_string()).unwrap() == &Value.Int(26))
+    print("Update ✓")
+
+    // Delete
+    let deleted = db.delete("users",
+        &Expr.Eq(Box.new(Expr.Column("id".into())), Box.new(Expr.Literal(Value.Int(4))))
+    )
+    assert(deleted == 1)
+    assert(db.table("users").unwrap().row_count() == 3)
+    print("Delete ✓")
+
+    // IsNull
+    db.insert("users", make_row(vec![
+        ("id".into(), Value.Int(5)), ("name".into(), Value.Null), ("age".into(), Value.Int(20))
+    ]))
+    let nulls = db.execute(
+        &Query.new("users").where_(Expr.IsNull(Box.new(Expr.Column("name".into()))))
+    ).unwrap()
+    assert(nulls.len() == 1)
+    print("IsNull ✓")
+
+    // Value display
+    assert(Value.Int(42).to_string() == "42")
+    assert(Value.Null.to_string() == "NULL")
+    assert(Value.Bool(true).to_string() == "true")
+    print("Value display ✓")
+
+    // Missing table
+    assert(db.execute(&Query.new("missing")).is_err())
+    print("Missing table error ✓")
+
+    // Not expression
+    let not_q = Expr.Not(Box.new(Expr.Eq(
+        Box.new(Expr.Literal(Value.Int(1))),
+        Box.new(Expr.Literal(Value.Int(2)))
+    )))
+    let row = HashMap.new()
+    assert(not_q.evaluate(&row) == Value.Bool(true))
+    print("Not expr ✓")
+
+    // OR expression
+    let or_q = Expr.Or(
+        Box.new(Expr.Literal(Value.Bool(false))),
+        Box.new(Expr.Literal(Value.Bool(true)))
+    )
+    assert(or_q.evaluate(&HashMap.new()) == Value.Bool(true))
+    print("Or expr ✓")
+
+    print("Query Engine complete ✓")
+}
