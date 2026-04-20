@@ -1,0 +1,219 @@
+
+// Minesweeper Game Engine
+// Grid-based mine placement, flood-fill reveal, and flagging.
+
+use std.collections.HashSet
+
+#[derive(Clone, Copy, PartialEq)]
+enum CellState { Hidden, Revealed, Flagged }
+
+#[derive(Clone, Copy, PartialEq)]
+enum GameStatus { Playing, Won, Lost }
+
+struct Cell {
+    mine: bool,
+    state: CellState,
+    adjacent: u8,
+}
+
+struct Minesweeper {
+    width: usize,
+    height: usize,
+    cells: [[Cell]],
+    mine_count: usize,
+    status: GameStatus,
+    revealed_count: usize,
+    flag_count: usize,
+}
+
+impl Minesweeper {
+    fn new(width: usize, height: usize, mines: &[(usize, usize)]) -> Minesweeper {
+        let mut cells = []
+        for y in 0..height {
+            let mut row = []
+            for x in 0..width {
+                row.push(Cell { mine: false, state: CellState.Hidden, adjacent: 0 })
+            }
+            cells.push(row)
+        }
+        let mut game = Minesweeper {
+            width, height, cells, mine_count: mines.len(),
+            status: GameStatus.Playing, revealed_count: 0, flag_count: 0,
+        }
+        for &(mx, my) in mines {
+            game.cells[my][mx].mine = true
+        }
+        game.calc_adjacent()
+        game
+    }
+
+    fn in_bounds(self, x: i32, y: i32) -> bool {
+        x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height
+    }
+
+    fn neighbors(self, x: usize, y: usize) -> [(usize, usize)] {
+        let mut result = []
+        for dy in -1..=1i32 {
+            for dx in -1..=1i32 {
+                if dx == 0 && dy == 0 { continue }
+                let nx = x as i32 + dx
+                let ny = y as i32 + dy
+                if self.in_bounds(nx, ny) { result.push((nx as usize, ny as usize)) }
+            }
+        }
+        result
+    }
+
+    fn calc_adjacent(mut self) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.cells[y][x].mine { continue }
+                let count = self.neighbors(x, y).iter()
+                    .filter(|&&(nx, ny)| self.cells[ny][nx].mine)
+                    .count() as u8
+                self.cells[y][x].adjacent = count
+            }
+        }
+    }
+
+    fn reveal(mut self, x: usize, y: usize) -> bool {
+        if self.status != GameStatus.Playing { return false }
+        if self.cells[y][x].state != CellState.Hidden { return false }
+
+        if self.cells[y][x].mine {
+            self.cells[y][x].state = CellState.Revealed
+            self.status = GameStatus.Lost
+            return true
+        }
+
+        self.flood_reveal(x, y)
+        self.check_win()
+        true
+    }
+
+    fn flood_reveal(mut self, x: usize, y: usize) {
+        if self.cells[y][x].state != CellState.Hidden { return }
+        self.cells[y][x].state = CellState.Revealed
+        self.revealed_count += 1
+
+        if self.cells[y][x].adjacent == 0 {
+            for (nx, ny) in self.neighbors(x, y) {
+                self.flood_reveal(nx, ny)
+            }
+        }
+    }
+
+    fn toggle_flag(mut self, x: usize, y: usize) -> bool {
+        if self.status != GameStatus.Playing { return false }
+        match self.cells[y][x].state {
+            CellState.Hidden => {
+                self.cells[y][x].state = CellState.Flagged
+                self.flag_count += 1
+                true
+            }
+            CellState.Flagged => {
+                self.cells[y][x].state = CellState.Hidden
+                self.flag_count -= 1
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn check_win(mut self) {
+        let total = self.width * self.height
+        if self.revealed_count == total - self.mine_count {
+            self.status = GameStatus.Won
+        }
+    }
+
+    fn is_mine(self, x: usize, y: usize) -> bool { self.cells[y][x].mine }
+    fn adjacent_count(self, x: usize, y: usize) -> u8 { self.cells[y][x].adjacent }
+    fn cell_state(self, x: usize, y: usize) -> CellState { self.cells[y][x].state }
+    fn remaining_mines(self) -> i32 { self.mine_count as i32 - self.flag_count as i32 }
+}
+
+fn main() {
+    // 5x5 grid with 3 mines
+    let mines = [(0, 0), (2, 2), (4, 4)]
+    let mut game = Minesweeper.new(5, 5, &mines)
+    assert(game.status == GameStatus.Playing)
+    assert(game.mine_count == 3)
+    print("Init ✓")
+
+    // Mine placement
+    assert(game.is_mine(0, 0))
+    assert(game.is_mine(2, 2))
+    assert(!game.is_mine(1, 0))
+    print("Mines ✓")
+
+    // Adjacent counts
+    assert(game.adjacent_count(1, 0) >= 1)  // next to (0,0)
+    assert(game.adjacent_count(1, 1) >= 1)  // diag to (0,0) and near (2,2)
+    assert(game.adjacent_count(4, 0) == 0)  // far corner, no adjacent mines
+    print("Adjacent ✓")
+
+    // Reveal safe cell
+    assert(game.reveal(4, 0))
+    assert(game.cell_state(4, 0) == CellState.Revealed)
+    assert(game.status == GameStatus.Playing)
+    print("Reveal safe ✓")
+
+    // Flood fill - revealing a 0-adjacent cell reveals neighbors
+    let prev = game.revealed_count
+    game.reveal(4, 0)  // already revealed, no-op
+    assert(game.revealed_count == prev)
+    print("No double reveal ✓")
+
+    // Flag
+    assert(game.toggle_flag(0, 0))
+    assert(game.cell_state(0, 0) == CellState.Flagged)
+    assert(game.flag_count == 1)
+    assert(game.remaining_mines() == 2)
+    print("Flag ✓")
+
+    // Unflag
+    assert(game.toggle_flag(0, 0))
+    assert(game.cell_state(0, 0) == CellState.Hidden)
+    assert(game.flag_count == 0)
+    print("Unflag ✓")
+
+    // Can't flag revealed cell
+    assert(!game.toggle_flag(4, 0))
+    print("No flag revealed ✓")
+
+    // Reveal mine = lose
+    let mut game2 = Minesweeper.new(3, 3, &[(1, 1)])
+    game2.reveal(1, 1)
+    assert(game2.status == GameStatus.Lost)
+    print("Lose ✓")
+
+    // Win condition
+    let mut game3 = Minesweeper.new(3, 3, &[(0, 0)])
+    // Reveal all non-mine cells
+    for y in 0..3 {
+        for x in 0..3 {
+            if !(x == 0 && y == 0) { game3.reveal(x, y) }
+        }
+    }
+    assert(game3.status == GameStatus.Won)
+    print("Win ✓")
+
+    // Neighbors count
+    let n_corner = game.neighbors(0, 0)
+    assert(n_corner.len() == 3)  // corner has 3 neighbors
+    let n_edge = game.neighbors(2, 0)
+    assert(n_edge.len() == 5)
+    let n_mid = game.neighbors(2, 2)
+    assert(n_mid.len() == 8)
+    print("Neighbors ✓")
+
+    // Can't act after game over
+    let mut game4 = Minesweeper.new(2, 2, &[(0, 0)])
+    game4.reveal(0, 0)  // lose
+    assert(!game4.reveal(1, 1))
+    assert(!game4.toggle_flag(1, 0))
+    print("No action after over ✓")
+
+    print("Minesweeper complete ✓")
+}
