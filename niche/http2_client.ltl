@@ -1,31 +1,74 @@
 // Niche Example - HTTP/2 Client
-// Frame parsing, HPACK header compression, stream multiplexing, flow control.
+// HTTP/2 frame types, HPACK header compression, and stream management.
 
-use std.collections.HashMap
-use std.net.TcpStream
-use std.io.{Write, Read}
+use std.collections.{HashMap, VecDeque}
+use std.io.{Read, Write}
 
-const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
+#[derive(Clone, Debug, PartialEq)]
 enum FrameType {
-    Data = 0x0, Headers = 0x1, Priority = 0x2, RstStream = 0x3,
-    Settings = 0x4, PushPromise = 0x5, Ping = 0x6, GoAway = 0x7,
-    WindowUpdate = 0x8, Continuation = 0x9,
+    Data,           // 0x0
+    Headers,        // 0x1
+    Priority,       // 0x2
+    RstStream,      // 0x3
+    Settings,       // 0x4
+    PushPromise,    // 0x5
+    Ping,           // 0x6
+    GoAway,         // 0x7
+    WindowUpdate,   // 0x8
+    Continuation,   // 0x9
+    Unknown(u8),
 }
 
 impl FrameType {
-    fn from_u8(b: u8) -> Option<FrameType> {
-        match b {
-            0x0 => some(FrameType.Data), 0x1 => some(FrameType.Headers),
-            0x2 => some(FrameType.Priority), 0x3 => some(FrameType.RstStream),
-            0x4 => some(FrameType.Settings), 0x5 => some(FrameType.PushPromise),
-            0x6 => some(FrameType.Ping), 0x7 => some(FrameType.GoAway),
-            0x8 => some(FrameType.WindowUpdate), 0x9 => some(FrameType.Continuation),
-            _ => none,
+    fn from_u8(val: u8) -> FrameType {
+        match val {
+            0 => FrameType.Data, 1 => FrameType.Headers,
+            2 => FrameType.Priority, 3 => FrameType.RstStream,
+            4 => FrameType.Settings, 5 => FrameType.PushPromise,
+            6 => FrameType.Ping, 7 => FrameType.GoAway,
+            8 => FrameType.WindowUpdate, 9 => FrameType.Continuation,
+            x => FrameType.Unknown(x),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            FrameType.Data => 0, FrameType.Headers => 1,
+            FrameType.Priority => 2, FrameType.RstStream => 3,
+            FrameType.Settings => 4, FrameType.PushPromise => 5,
+            FrameType.Ping => 6, FrameType.GoAway => 7,
+            FrameType.WindowUpdate => 8, FrameType.Continuation => 9,
+            FrameType.Unknown(x) => x,
         }
     }
 }
 
+struct FrameFlags {
+    bits: u8,
+}
+
+impl FrameFlags {
+    fn empty() -> FrameFlags { FrameFlags { bits: 0 } }
+    fn end_stream() -> FrameFlags { FrameFlags { bits: 0x1 } }
+    fn end_headers() -> FrameFlags { FrameFlags { bits: 0x4 } }
+    fn padded() -> FrameFlags { FrameFlags { bits: 0x8 } }
+    fn priority() -> FrameFlags { FrameFlags { bits: 0x20 } }
+    fn ack() -> FrameFlags { FrameFlags { bits: 0x1 } }
+
+    fn has_end_stream(self) -> bool { self.bits & 0x1 != 0 }
+    fn has_end_headers(self) -> bool { self.bits & 0x4 != 0 }
+    fn has_padded(self) -> bool { self.bits & 0x8 != 0 }
+    fn has_priority(self) -> bool { self.bits & 0x20 != 0 }
+    fn has_ack(self) -> bool { self.bits & 0x1 != 0 }
+
+    fn combine(self, other: FrameFlags) -> FrameFlags {
+        FrameFlags { bits: self.bits | other.bits }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Frame {
     length: u32,
     frame_type: FrameType,
@@ -35,105 +78,91 @@ struct Frame {
 }
 
 impl Frame {
+    fn new(frame_type: FrameType, flags: u8, stream_id: u32, payload: [u8]) -> Frame {
+        Frame {
+            length: payload.len() as u32,
+            frame_type, flags, stream_id, payload,
+        }
+    }
+
     fn encode(self) -> [u8] {
-        let mut buf: [u8] = []
+        let mut buf: [u8] = Vec.with_capacity(9 + self.payload.len())
+        // 3 bytes length
         buf.push(((self.length >> 16) & 0xFF) as u8)
         buf.push(((self.length >> 8) & 0xFF) as u8)
         buf.push((self.length & 0xFF) as u8)
-        buf.push(self.frame_type as u8)
+        // 1 byte type
+        buf.push(self.frame_type.to_u8())
+        // 1 byte flags
         buf.push(self.flags)
+        // 4 bytes stream id (31 bits)
         buf.push(((self.stream_id >> 24) & 0x7F) as u8)
         buf.push(((self.stream_id >> 16) & 0xFF) as u8)
         buf.push(((self.stream_id >> 8) & 0xFF) as u8)
         buf.push((self.stream_id & 0xFF) as u8)
-        buf.extend_from_slice(&self.payload)
+        buf.extend(&self.payload)
         buf
     }
 
     fn decode(data: &[u8]) -> Result<Frame, string> {
         if data.len() < 9 { return err("frame too short".to_string()) }
         let length = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32)
-        let frame_type = FrameType.from_u8(data[3]).ok_or("unknown frame type")?
+        let frame_type = FrameType.from_u8(data[3])
         let flags = data[4]
-        let stream_id = ((data[5] as u32 & 0x7F) << 24) | ((data[6] as u32) << 16) | ((data[7] as u32) << 8) | (data[8] as u32)
-        let payload = data[9..9 + length as usize].to_vec()
+        let stream_id = ((data[5] as u32 & 0x7F) << 24) | ((data[6] as u32) << 16)
+                       | ((data[7] as u32) << 8) | (data[8] as u32)
+        let payload = if data.len() > 9 { data[9..].to_vec() } else { [] }
         ok(Frame { length, frame_type, flags, stream_id, payload })
     }
 
-    fn has_flag(self, flag: u8) -> bool { (self.flags & flag) != 0 }
+    fn is_data(self) -> bool { self.frame_type == FrameType.Data }
+    fn is_headers(self) -> bool { self.frame_type == FrameType.Headers }
 }
 
-// HPACK static table (subset)
-fn static_header(index: usize) -> Option<(&str, &str)> {
-    match index {
-        1 => some((":authority", "")), 2 => some((":method", "GET")),
-        3 => some((":method", "POST")), 4 => some((":path", "/")),
-        5 => some((":path", "/index.html")), 6 => some((":scheme", "http")),
-        7 => some((":scheme", "https")), 8 => some((":status", "200")),
-        9 => some((":status", "204")), 10 => some((":status", "206")),
-        11 => some((":status", "304")), 12 => some((":status", "400")),
-        13 => some((":status", "404")), 14 => some((":status", "500")),
-        _ => none,
-    }
+#[derive(Clone, Debug, PartialEq)]
+enum StreamState {
+    Idle,
+    Open,
+    HalfClosedLocal,
+    HalfClosedRemote,
+    Closed,
+    ReservedLocal,
+    ReservedRemote,
 }
-
-struct HpackEncoder {
-    dynamic_table: [(string, string)],
-    max_size: usize,
-}
-
-impl HpackEncoder {
-    fn new(max_size: usize) -> HpackEncoder { HpackEncoder { dynamic_table: [], max_size } }
-
-    fn encode_integer(mut self, value: usize, prefix_bits: u8, prefix_mask: u8) -> [u8] {
-        let max_prefix = (1 << prefix_bits) - 1
-        if value < max_prefix {
-            return [prefix_mask | value as u8]
-        }
-        let mut result = [prefix_mask | max_prefix as u8]
-        let mut remaining = value - max_prefix
-        while remaining >= 128 {
-            result.push((remaining % 128 + 128) as u8)
-            remaining /= 128
-        }
-        result.push(remaining as u8)
-        result
-    }
-
-    fn encode_string(self, s: &str) -> [u8] {
-        let mut result = self.encode_integer(s.len(), 7, 0x00)
-        result.extend_from_slice(s.as_bytes())
-        result
-    }
-
-    fn encode_header(mut self, name: &str, value: &str) -> [u8] {
-        // Literal header without indexing
-        let mut result = [0x00u8]
-        result.extend(self.encode_string(name))
-        result.extend(self.encode_string(value))
-        result
-    }
-}
-
-enum StreamState { Idle, Open, HalfClosedLocal, HalfClosedRemote, Closed }
 
 struct Stream {
     id: u32,
     state: StreamState,
-    recv_window: i32,
-    send_window: i32,
-    response_headers: [(string, string)],
-    response_body: [u8],
+    send_window: i64,
+    recv_window: i64,
+    headers: [(string, string)],
+    data: [u8],
+    weight: u8,
+    dependency: u32,
 }
 
 impl Stream {
     fn new(id: u32) -> Stream {
-        Stream { id, state: StreamState.Idle, recv_window: 65535, send_window: 65535,
-            response_headers: [], response_body: [] }
+        Stream {
+            id, state: StreamState.Idle,
+            send_window: 65535, recv_window: 65535,
+            headers: [], data: [],
+            weight: 16, dependency: 0,
+        }
     }
 }
 
-struct Http2Settings {
+#[derive(Clone, Debug)]
+enum SettingId {
+    HeaderTableSize,      // 0x1
+    EnablePush,           // 0x2
+    MaxConcurrentStreams,  // 0x3
+    InitialWindowSize,    // 0x4
+    MaxFrameSize,         // 0x5
+    MaxHeaderListSize,    // 0x6
+}
+
+struct Settings {
     header_table_size: u32,
     enable_push: bool,
     max_concurrent_streams: u32,
@@ -142,182 +171,210 @@ struct Http2Settings {
     max_header_list_size: u32,
 }
 
-impl Http2Settings {
-    fn default() -> Http2Settings {
-        Http2Settings {
-            header_table_size: 4096, enable_push: true,
-            max_concurrent_streams: 100, initial_window_size: 65535,
-            max_frame_size: 16384, max_header_list_size: 8192,
+impl Settings {
+    fn default() -> Settings {
+        Settings {
+            header_table_size: 4096,
+            enable_push: true,
+            max_concurrent_streams: 100,
+            initial_window_size: 65535,
+            max_frame_size: 16384,
+            max_header_list_size: 8192,
         }
     }
 
     fn encode(self) -> [u8] {
         let mut payload: [u8] = []
-        fn put_setting(buf: &mut [u8], id: u16, value: u32) {
-            buf.push((id >> 8) as u8); buf.push(id as u8)
-            buf.push((value >> 24) as u8); buf.push((value >> 16) as u8)
-            buf.push((value >> 8) as u8); buf.push(value as u8)
+        fn push_setting(buf: &mut [u8], id: u16, val: u32) {
+            buf.push((id >> 8) as u8)
+            buf.push((id & 0xFF) as u8)
+            buf.push((val >> 24) as u8)
+            buf.push((val >> 16 & 0xFF) as u8)
+            buf.push((val >> 8 & 0xFF) as u8)
+            buf.push((val & 0xFF) as u8)
         }
-        put_setting(&mut payload, 1, self.header_table_size)
-        put_setting(&mut payload, 3, self.max_concurrent_streams)
-        put_setting(&mut payload, 4, self.initial_window_size)
-        put_setting(&mut payload, 5, self.max_frame_size)
+        push_setting(&mut payload, 1, self.header_table_size)
+        push_setting(&mut payload, 3, self.max_concurrent_streams)
+        push_setting(&mut payload, 4, self.initial_window_size)
+        push_setting(&mut payload, 5, self.max_frame_size)
         payload
     }
 }
 
-struct Http2Client {
-    streams: HashMap<u32, Stream>,
-    next_stream_id: u32,
-    settings: Http2Settings,
-    encoder: HpackEncoder,
-    connection_window: i32,
+// HPACK static table (subset)
+fn hpack_static_entry(index: usize) -> Option<(&str, &str)> {
+    match index {
+        1 => some((":authority", "")),
+        2 => some((":method", "GET")),
+        3 => some((":method", "POST")),
+        4 => some((":path", "/")),
+        5 => some((":path", "/index.html")),
+        6 => some((":scheme", "http")),
+        7 => some((":scheme", "https")),
+        8 => some((":status", "200")),
+        9 => some((":status", "204")),
+        10 => some((":status", "206")),
+        11 => some((":status", "304")),
+        12 => some((":status", "400")),
+        13 => some((":status", "404")),
+        14 => some((":status", "500")),
+        _ => none,
+    }
 }
 
-impl Http2Client {
-    fn new() -> Http2Client {
-        Http2Client {
-            streams: HashMap.new(), next_stream_id: 1,
-            settings: Http2Settings.default(),
-            encoder: HpackEncoder.new(4096), connection_window: 65535,
+struct Http2Connection {
+    streams: HashMap<u32, Stream>,
+    next_stream_id: u32,
+    local_settings: Settings,
+    remote_settings: Settings,
+    connection_window: i64,
+    goaway_sent: bool,
+    goaway_received: bool,
+}
+
+impl Http2Connection {
+    fn new() -> Http2Connection {
+        Http2Connection {
+            streams: HashMap.new(),
+            next_stream_id: 1,
+            local_settings: Settings.default(),
+            remote_settings: Settings.default(),
+            connection_window: 65535,
+            goaway_sent: false,
+            goaway_received: false,
         }
     }
 
-    fn create_stream(mut self) -> u32 {
+    fn open_stream(mut self) -> u32 {
         let id = self.next_stream_id
-        self.next_stream_id += 2  // client uses odd IDs
-        self.streams.insert(id, Stream.new(id))
+        self.next_stream_id += 2  // odd for client-initiated
+        let stream = Stream.new(id)
+        self.streams.insert(id, stream)
         id
     }
 
-    fn build_headers_frame(mut self, stream_id: u32, headers: &[(&str, &str)]) -> Frame {
-        let mut payload: [u8] = []
-        for (name, value) in headers {
-            payload.extend(self.encoder.encode_header(name, value))
-        }
-        Frame {
-            length: payload.len() as u32,
-            frame_type: FrameType.Headers,
-            flags: 0x04 | 0x01,  // END_HEADERS | END_STREAM
-            stream_id, payload,
-        }
+    fn get_stream(self, id: u32) -> Option<&Stream> { self.streams.get(&id) }
+
+    fn active_streams(self) -> usize {
+        self.streams.values().filter(|s| s.state == StreamState.Open).count()
     }
 
-    fn build_settings_frame(self) -> Frame {
-        let payload = self.settings.encode()
-        Frame { length: payload.len() as u32, frame_type: FrameType.Settings, flags: 0, stream_id: 0, payload }
+    fn create_settings_frame(self) -> Frame {
+        Frame.new(FrameType.Settings, 0, 0, self.local_settings.encode())
     }
 
-    fn build_window_update(self, stream_id: u32, increment: u32) -> Frame {
-        let payload = [
-            ((increment >> 24) & 0x7F) as u8, ((increment >> 16) & 0xFF) as u8,
-            ((increment >> 8) & 0xFF) as u8, (increment & 0xFF) as u8,
-        ]
-        Frame { length: 4, frame_type: FrameType.WindowUpdate, flags: 0, stream_id, payload: payload.to_vec() }
+    fn create_ping_frame(self, data: [u8; 8]) -> Frame {
+        Frame.new(FrameType.Ping, 0, 0, data.to_vec())
     }
 
-    fn process_frame(mut self, frame: &Frame) {
-        match frame.frame_type {
-            FrameType.Settings => {
-                if !frame.has_flag(0x01) {
-                    // ACK settings
-                }
-            }
-            FrameType.Headers => {
-                if let some(stream) = self.streams.get_mut(&frame.stream_id) {
-                    stream.state = StreamState.Open
-                }
-            }
-            FrameType.Data => {
-                if let some(stream) = self.streams.get_mut(&frame.stream_id) {
-                    stream.response_body.extend_from_slice(&frame.payload)
-                    stream.recv_window -= frame.length as i32
-                    if frame.has_flag(0x01) { stream.state = StreamState.HalfClosedRemote }
-                }
-                self.connection_window -= frame.length as i32
-            }
-            FrameType.RstStream => {
-                if let some(stream) = self.streams.get_mut(&frame.stream_id) {
-                    stream.state = StreamState.Closed
-                }
-            }
-            FrameType.GoAway => {}
-            FrameType.WindowUpdate => {
-                let increment = ((frame.payload[0] as u32 & 0x7F) << 24)
-                    | ((frame.payload[1] as u32) << 16)
-                    | ((frame.payload[2] as u32) << 8)
-                    | (frame.payload[3] as u32)
-                if frame.stream_id == 0 {
-                    self.connection_window += increment as i32
-                } else if let some(stream) = self.streams.get_mut(&frame.stream_id) {
-                    stream.send_window += increment as i32
-                }
-            }
-            _ => {}
-        }
+    fn create_window_update(self, stream_id: u32, increment: u32) -> Frame {
+        let mut payload = [0u8; 4]
+        payload[0] = ((increment >> 24) & 0x7F) as u8
+        payload[1] = ((increment >> 16) & 0xFF) as u8
+        payload[2] = ((increment >> 8) & 0xFF) as u8
+        payload[3] = (increment & 0xFF) as u8
+        Frame.new(FrameType.WindowUpdate, 0, stream_id, payload.to_vec())
     }
 }
 
 fn main() {
-    // Frame encoding/decoding
-    let frame = Frame {
-        length: 5, frame_type: FrameType.Data, flags: 0x01,
-        stream_id: 1, payload: [0x48, 0x65, 0x6c, 0x6c, 0x6f],
-    }
+    // FrameType
+    assert(FrameType.from_u8(0) == FrameType.Data)
+    assert(FrameType.from_u8(1) == FrameType.Headers)
+    assert(FrameType.from_u8(7) == FrameType.GoAway)
+    assert(FrameType.Data.to_u8() == 0)
+    assert(FrameType.Settings.to_u8() == 4)
+    print("FrameType ✓")
+
+    // FrameFlags
+    let flags = FrameFlags.end_stream().combine(FrameFlags.end_headers())
+    assert(flags.has_end_stream())
+    assert(flags.has_end_headers())
+    assert(!flags.has_padded())
+    print("FrameFlags ✓")
+
+    // Frame encode/decode roundtrip
+    let frame = Frame.new(FrameType.Data, 0x1, 1, vec![0x48, 0x65, 0x6c, 0x6c, 0x6f])
+    assert(frame.length == 5)
+    assert(frame.is_data())
     let encoded = frame.encode()
     assert(encoded.len() == 14)  // 9 header + 5 payload
-    let decoded = Frame.decode(&encoded).unwrap()
-    assert(decoded.stream_id == 1)
-    assert(decoded.payload == [0x48, 0x65, 0x6c, 0x6c, 0x6f])
-    print("Frame encode/decode \u2713")
 
-    // HPACK encoding
-    let mut encoder = HpackEncoder.new(4096)
-    let encoded_header = encoder.encode_header(":method", "GET")
-    assert(!encoded_header.is_empty())
-    print("HPACK encode \u2713")
+    let decoded = Frame.decode(&encoded).unwrap()
+    assert(decoded.frame_type == FrameType.Data)
+    assert(decoded.stream_id == 1)
+    assert(decoded.payload == vec![0x48, 0x65, 0x6c, 0x6c, 0x6f])
+    print("Frame encode/decode ✓")
+
+    // Frame too short
+    assert(Frame.decode(&[0, 0]).is_err())
+    print("Frame error ✓")
+
+    // StreamState
+    let mut stream = Stream.new(1)
+    assert(stream.state == StreamState.Idle)
+    assert(stream.send_window == 65535)
+    assert(stream.weight == 16)
+    print("Stream ✓")
 
     // Settings
-    let settings = Http2Settings.default()
-    let settings_payload = settings.encode()
-    assert(settings_payload.len() % 6 == 0)
-    print("Settings encode \u2713")
+    let settings = Settings.default()
+    assert(settings.max_frame_size == 16384)
+    assert(settings.initial_window_size == 65535)
+    assert(settings.enable_push)
+    let payload = settings.encode()
+    assert(payload.len() > 0)
+    assert(payload.len() % 6 == 0)
+    print("Settings ✓")
 
-    // Client
-    let mut client = Http2Client.new()
-    let stream_id = client.create_stream()
-    assert(stream_id == 1)
-    let next_id = client.create_stream()
-    assert(next_id == 3)
-    print("Stream creation \u2713")
+    // Connection
+    let mut conn = Http2Connection.new()
+    let s1 = conn.open_stream()
+    assert(s1 == 1)
+    let s2 = conn.open_stream()
+    assert(s2 == 3)  // odd numbers for client
+    assert(conn.get_stream(1).is_some())
+    assert(conn.get_stream(99).is_none())
+    print("Connection streams ✓")
 
-    let headers_frame = client.build_headers_frame(stream_id, &[
-        (":method", "GET"), (":path", "/"), (":scheme", "https"),
-        (":authority", "example.com"),
-    ])
-    assert(headers_frame.stream_id == 1)
-    assert(headers_frame.has_flag(0x04))  // END_HEADERS
-    print("Headers frame \u2713")
+    // Settings frame
+    let sf = conn.create_settings_frame()
+    assert(sf.frame_type == FrameType.Settings)
+    assert(sf.stream_id == 0)
+    print("Settings frame ✓")
+
+    // Ping frame
+    let pf = conn.create_ping_frame([1, 2, 3, 4, 5, 6, 7, 8])
+    assert(pf.frame_type == FrameType.Ping)
+    assert(pf.payload.len() == 8)
+    print("Ping frame ✓")
 
     // Window update
-    let wu = client.build_window_update(0, 32768)
-    assert(wu.length == 4)
-    print("Window update \u2713")
+    let wuf = conn.create_window_update(1, 32768)
+    assert(wuf.frame_type == FrameType.WindowUpdate)
+    assert(wuf.stream_id == 1)
+    assert(wuf.payload.len() == 4)
+    print("Window update ✓")
 
-    // Process data frame
-    let data_frame = Frame {
-        length: 3, frame_type: FrameType.Data, flags: 0x01,
-        stream_id: 1, payload: [1, 2, 3],
-    }
-    client.process_frame(&data_frame)
-    let stream = client.streams.get(&1).unwrap()
-    assert(stream.response_body == [1, 2, 3])
-    print("Data processing \u2713")
+    // HPACK static table
+    let (name, val) = hpack_static_entry(2).unwrap()
+    assert(name == ":method")
+    assert(val == "GET")
+    let (name2, _) = hpack_static_entry(7).unwrap()
+    assert(name2 == ":scheme")
+    assert(hpack_static_entry(999).is_none())
+    print("HPACK static ✓")
 
-    // Static table
-    assert(static_header(2) == some((":method", "GET")))
-    assert(static_header(8) == some((":status", "200")))
-    print("Static table \u2713")
+    // HTTP/2 preface
+    assert(HTTP2_PREFACE.len() == 24)
+    assert(HTTP2_PREFACE.starts_with(b"PRI"))
+    print("Preface ✓")
 
-    print("HTTP/2 Client complete \u2713")
+    // Headers frame check
+    let hf = Frame.new(FrameType.Headers, 0x4, 1, vec![0x82])
+    assert(hf.is_headers())
+    assert(!hf.is_data())
+    print("Headers frame ✓")
+
+    print("HTTP/2 Client complete ✓")
 }
