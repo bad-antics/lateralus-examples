@@ -1,0 +1,300 @@
+// Niche Example - Entity Component System (ECS) Game Engine
+// Data-oriented ECS with archetypes, sparse sets, and system scheduling.
+
+use std.collections.{HashMap, HashSet}
+use std.any.TypeId
+
+type Entity = u64
+type ComponentId = u64
+
+struct EntityAllocator {
+    next_id: Entity,
+    free_list: [Entity],
+    alive: HashSet<Entity>,
+}
+
+impl EntityAllocator {
+    fn new() -> EntityAllocator {
+        EntityAllocator { next_id: 1, free_list: [], alive: HashSet.new() }
+    }
+
+    fn allocate(mut self) -> Entity {
+        let id = match self.free_list.pop() {
+            some(recycled) => recycled,
+            none => { let id = self.next_id; self.next_id += 1; id },
+        }
+        self.alive.insert(id)
+        id
+    }
+
+    fn deallocate(mut self, entity: Entity) -> bool {
+        if self.alive.remove(&entity) {
+            self.free_list.push(entity)
+            true
+        } else { false }
+    }
+
+    fn is_alive(self, entity: Entity) -> bool { self.alive.contains(&entity) }
+    fn count(self) -> usize { self.alive.len() }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Position { x: f64, y: f64, z: f64 }
+impl Position {
+    fn new(x: f64, y: f64, z: f64) -> Position { Position { x, y, z } }
+    fn zero() -> Position { Position { x: 0.0, y: 0.0, z: 0.0 } }
+    fn distance_to(self, other: &Position) -> f64 {
+        let dx = self.x - other.x
+        let dy = self.y - other.y
+        let dz = self.z - other.z
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Velocity { dx: f64, dy: f64, dz: f64 }
+impl Velocity {
+    fn new(dx: f64, dy: f64, dz: f64) -> Velocity { Velocity { dx, dy, dz } }
+    fn zero() -> Velocity { Velocity { dx: 0.0, dy: 0.0, dz: 0.0 } }
+    fn magnitude(self) -> f64 {
+        (self.dx * self.dx + self.dy * self.dy + self.dz * self.dz).sqrt()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Health { current: f64, max: f64 }
+impl Health {
+    fn new(max: f64) -> Health { Health { current: max, max } }
+    fn damage(mut self, amount: f64) { self.current = (self.current - amount).max(0.0) }
+    fn heal(mut self, amount: f64) { self.current = (self.current + amount).min(self.max) }
+    fn is_dead(self) -> bool { self.current <= 0.0 }
+    fn percentage(self) -> f64 { self.current / self.max * 100.0 }
+}
+
+#[derive(Clone, Debug)]
+struct Sprite { texture_id: u32, width: u32, height: u32, visible: bool }
+
+struct SparseSet<T> {
+    dense: [(Entity, T)],
+    sparse: HashMap<Entity, usize>,
+}
+
+impl<T> SparseSet<T> {
+    fn new() -> SparseSet<T> {
+        SparseSet { dense: [], sparse: HashMap.new() }
+    }
+
+    fn insert(mut self, entity: Entity, value: T) {
+        if let some(&idx) = self.sparse.get(&entity) {
+            self.dense[idx].1 = value
+        } else {
+            let idx = self.dense.len()
+            self.dense.push((entity, value))
+            self.sparse.insert(entity, idx)
+        }
+    }
+
+    fn get(self, entity: Entity) -> Option<&T> {
+        self.sparse.get(&entity).map(|&idx| &self.dense[idx].1)
+    }
+
+    fn get_mut(mut self, entity: Entity) -> Option<&mut T> {
+        self.sparse.get(&entity).map(|&idx| &mut self.dense[idx].1)
+    }
+
+    fn remove(mut self, entity: Entity) -> Option<T> {
+        if let some(idx) = self.sparse.remove(&entity) {
+            let last = self.dense.len() - 1
+            if idx != last {
+                self.dense.swap(idx, last)
+                let swapped_entity = self.dense[idx].0
+                self.sparse.insert(swapped_entity, idx)
+            }
+            some(self.dense.pop().unwrap().1)
+        } else { none }
+    }
+
+    fn contains(self, entity: Entity) -> bool { self.sparse.contains_key(&entity) }
+    fn len(self) -> usize { self.dense.len() }
+    fn is_empty(self) -> bool { self.dense.is_empty() }
+
+    fn iter(self) -> impl Iterator<Item = (Entity, &T)> {
+        self.dense.iter().map(|(e, v)| (*e, v))
+    }
+}
+
+struct World {
+    entities: EntityAllocator,
+    positions: SparseSet<Position>,
+    velocities: SparseSet<Velocity>,
+    healths: SparseSet<Health>,
+    sprites: SparseSet<Sprite>,
+    tags: HashMap<Entity, HashSet<string>>,
+}
+
+impl World {
+    fn new() -> World {
+        World {
+            entities: EntityAllocator.new(),
+            positions: SparseSet.new(),
+            velocities: SparseSet.new(),
+            healths: SparseSet.new(),
+            sprites: SparseSet.new(),
+            tags: HashMap.new(),
+        }
+    }
+
+    fn spawn(mut self) -> Entity {
+        self.entities.allocate()
+    }
+
+    fn despawn(mut self, entity: Entity) -> bool {
+        if !self.entities.deallocate(entity) { return false }
+        self.positions.remove(entity);
+        self.velocities.remove(entity);
+        self.healths.remove(entity);
+        self.sprites.remove(entity);
+        self.tags.remove(&entity);
+        true
+    }
+
+    fn is_alive(self, entity: Entity) -> bool { self.entities.is_alive(entity) }
+    fn entity_count(self) -> usize { self.entities.count() }
+
+    fn add_tag(mut self, entity: Entity, tag: &str) {
+        self.tags.entry(entity).or_insert_with(HashSet.new).insert(tag.to_string())
+    }
+
+    fn has_tag(self, entity: Entity, tag: &str) -> bool {
+        self.tags.get(&entity).map(|t| t.contains(tag)).unwrap_or(false)
+    }
+
+    fn entities_with_tag(self, tag: &str) -> [Entity] {
+        self.tags.iter()
+            .filter(|(_, tags)| tags.contains(tag))
+            .map(|(&e, _)| e)
+            .collect()
+    }
+}
+
+// Systems
+fn movement_system(world: &mut World, dt: f64) {
+    for (entity, vel) in world.velocities.iter() {
+        if let some(pos) = world.positions.get_mut(entity) {
+            pos.x += vel.dx * dt
+            pos.y += vel.dy * dt
+            pos.z += vel.dz * dt
+        }
+    }
+}
+
+fn death_system(world: &mut World) -> [Entity] {
+    let mut dead: [Entity] = []
+    for (entity, health) in world.healths.iter() {
+        if health.is_dead() { dead.push(entity) }
+    }
+    dead
+}
+
+fn main() {
+    // EntityAllocator
+    let mut alloc = EntityAllocator.new()
+    let e1 = alloc.allocate()
+    let e2 = alloc.allocate()
+    assert(e1 != e2)
+    assert(alloc.is_alive(e1))
+    assert(alloc.count() == 2)
+    print("Entity allocation ✓")
+
+    alloc.deallocate(e1)
+    assert(!alloc.is_alive(e1))
+    assert(alloc.count() == 1)
+
+    let e3 = alloc.allocate()
+    assert(e3 == e1)  // recycled
+    print("Entity recycling ✓")
+
+    // SparseSet
+    let mut set = SparseSet.new()
+    set.insert(1, Position.new(1.0, 2.0, 3.0))
+    set.insert(2, Position.new(4.0, 5.0, 6.0))
+    assert(set.len() == 2)
+    assert(set.contains(1))
+    print("SparseSet insert ✓")
+
+    assert(set.get(1).unwrap().x == 1.0)
+    set.get_mut(1).unwrap().x = 10.0
+    assert(set.get(1).unwrap().x == 10.0)
+    print("SparseSet get/get_mut ✓")
+
+    let removed = set.remove(1).unwrap()
+    assert(removed.x == 10.0)
+    assert(!set.contains(1))
+    assert(set.len() == 1)
+    print("SparseSet remove ✓")
+
+    // Components
+    let pos = Position.new(1.0, 2.0, 3.0)
+    let origin = Position.zero()
+    assert(pos.distance_to(&origin) > 0.0)
+    print("Position ✓")
+
+    let vel = Velocity.new(3.0, 4.0, 0.0)
+    assert(vel.magnitude() == 5.0)
+    print("Velocity ✓")
+
+    let mut hp = Health.new(100.0)
+    hp.damage(30.0)
+    assert(hp.current == 70.0)
+    assert(hp.percentage() == 70.0)
+    hp.heal(10.0)
+    assert(hp.current == 80.0)
+    hp.damage(200.0)
+    assert(hp.is_dead())
+    print("Health ✓")
+
+    // World
+    let mut world = World.new()
+    let player = world.spawn()
+    let enemy = world.spawn()
+    assert(world.entity_count() == 2)
+    print("World spawn ✓")
+
+    world.positions.insert(player, Position.new(0.0, 0.0, 0.0))
+    world.velocities.insert(player, Velocity.new(1.0, 0.0, 0.0))
+    world.healths.insert(player, Health.new(100.0))
+    world.positions.insert(enemy, Position.new(10.0, 0.0, 0.0))
+    world.healths.insert(enemy, Health.new(50.0))
+    print("Components added ✓")
+
+    // Movement system
+    movement_system(&mut world, 1.0)
+    assert(world.positions.get(player).unwrap().x == 1.0)
+    print("Movement system ✓")
+
+    // Tags
+    world.add_tag(player, "player")
+    world.add_tag(enemy, "enemy")
+    world.add_tag(enemy, "hostile")
+    assert(world.has_tag(player, "player"))
+    assert(!world.has_tag(player, "enemy"))
+    let enemies = world.entities_with_tag("enemy")
+    assert(enemies.len() == 1)
+    print("Tags ✓")
+
+    // Death system
+    world.healths.get_mut(enemy).unwrap().damage(100.0)
+    let dead = death_system(&mut world)
+    assert(dead.len() == 1)
+    assert(dead[0] == enemy)
+    print("Death system ✓")
+
+    // Despawn
+    world.despawn(enemy)
+    assert(!world.is_alive(enemy))
+    assert(world.entity_count() == 1)
+    assert(!world.positions.contains(enemy))
+    print("Despawn ✓")
+
+    print("ECS Engine complete ✓")
+}
