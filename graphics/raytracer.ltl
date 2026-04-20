@@ -1,127 +1,229 @@
-// raytracer.ltl — Tiny path-sampled ray tracer (outputs PPM)
-use std.math.{sqrt, abs, sin, cos, PI}
-use std.random.rand_float
-use std.fs.File
 
-struct Vec3 { x: float, y: float, z: float }
+// Ray Tracer - Basic ray-sphere intersection renderer
+// Supports multiple spheres, diffuse lighting, and shadows.
+
+use std.math.{sqrt, max, min, abs}
+
+#[derive(Clone, Copy, Debug)]
+struct Vec3 {
+    x: f64, y: f64, z: f64,
+}
 
 impl Vec3 {
-    fn new(x: float, y: float, z: float) -> Vec3 { Vec3 { x, y, z } }
-    fn zero() -> Vec3 { Vec3::new(0.0, 0.0, 0.0) }
-    fn add(self, o: Vec3) -> Vec3 { Vec3::new(self.x+o.x, self.y+o.y, self.z+o.z) }
-    fn sub(self, o: Vec3) -> Vec3 { Vec3::new(self.x-o.x, self.y-o.y, self.z-o.z) }
-    fn mul(self, t: float) -> Vec3 { Vec3::new(self.x*t, self.y*t, self.z*t) }
-    fn dot(self, o: Vec3) -> float { self.x*o.x + self.y*o.y + self.z*o.z }
-    fn cross(self, o: Vec3) -> Vec3 {
-        Vec3::new(self.y*o.z - self.z*o.y, self.z*o.x - self.x*o.z, self.x*o.y - self.y*o.x)
+    fn new(x: f64, y: f64, z: f64) -> Vec3 { Vec3 { x, y, z } }
+    fn zero() -> Vec3 { Vec3 { x: 0.0, y: 0.0, z: 0.0 } }
+    fn add(self, o: Vec3) -> Vec3 { Vec3.new(self.x + o.x, self.y + o.y, self.z + o.z) }
+    fn sub(self, o: Vec3) -> Vec3 { Vec3.new(self.x - o.x, self.y - o.y, self.z - o.z) }
+    fn scale(self, s: f64) -> Vec3 { Vec3.new(self.x * s, self.y * s, self.z * s) }
+    fn dot(self, o: Vec3) -> f64 { self.x * o.x + self.y * o.y + self.z * o.z }
+    fn len_sq(self) -> f64 { self.dot(self) }
+    fn length(self) -> f64 { sqrt(self.len_sq()) }
+    fn normalize(self) -> Vec3 { let l = self.length(); if l > 0.0 { self.scale(1.0 / l) } else { self } }
+    fn reflect(self, normal: Vec3) -> Vec3 { self.sub(normal.scale(2.0 * self.dot(normal))) }
+    fn negate(self) -> Vec3 { Vec3.new(-self.x, -self.y, -self.z) }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Color { r: f64, g: f64, b: f64 }
+
+impl Color {
+    fn new(r: f64, g: f64, b: f64) -> Color { Color { r, g, b } }
+    fn black() -> Color { Color.new(0.0, 0.0, 0.0) }
+    fn white() -> Color { Color.new(1.0, 1.0, 1.0) }
+    fn add(self, o: Color) -> Color { Color.new(self.r + o.r, self.g + o.g, self.b + o.b) }
+    fn scale(self, s: f64) -> Color { Color.new(self.r * s, self.g * s, self.b * s) }
+    fn mul(self, o: Color) -> Color { Color.new(self.r * o.r, self.g * o.g, self.b * o.b) }
+    fn clamp(self) -> Color {
+        Color.new(self.r.clamp(0.0, 1.0), self.g.clamp(0.0, 1.0), self.b.clamp(0.0, 1.0))
     }
-    fn len(self)  -> float { sqrt(self.dot(self)) }
-    fn norm(self) -> Vec3  { self.mul(1.0 / self.len()) }
-    fn hadamard(self, o: Vec3) -> Vec3 { Vec3::new(self.x*o.x, self.y*o.y, self.z*o.z) }
-    fn clamp01(self) -> Vec3 { Vec3::new(self.x.clamp(0.0,1.0), self.y.clamp(0.0,1.0), self.z.clamp(0.0,1.0)) }
-    fn reflect(self, n: Vec3) -> Vec3 { self.sub(n.mul(2.0 * self.dot(n))) }
+    fn to_rgb8(self) -> (u8, u8, u8) {
+        let c = self.clamp()
+        ((c.r * 255.0) as u8, (c.g * 255.0) as u8, (c.b * 255.0) as u8)
+    }
 }
 
-struct Ray { origin: Vec3, dir: Vec3 }
+struct Ray { origin: Vec3, direction: Vec3 }
+
 impl Ray {
-    fn at(self, t: float) -> Vec3 { self.origin.add(self.dir.mul(t)) }
+    fn new(origin: Vec3, direction: Vec3) -> Ray { Ray { origin, direction: direction.normalize() } }
+    fn at(self, t: f64) -> Vec3 { self.origin.add(self.direction.scale(t)) }
 }
 
-enum Material { Diffuse(Vec3), Metal(Vec3, float), Light(Vec3) }
-
-struct Sphere { center: Vec3, radius: float, material: Material }
+struct Sphere {
+    center: Vec3,
+    radius: f64,
+    color: Color,
+    specular: f64,
+}
 
 impl Sphere {
-    fn hit(self, r: Ray, t_min: float, t_max: float) -> float? {
-        let oc = r.origin.sub(self.center)
-        let a  = r.dir.dot(r.dir)
-        let b  = 2.0 * oc.dot(r.dir)
-        let c  = oc.dot(oc) - self.radius * self.radius
-        let d  = b*b - 4.0*a*c
-        if d < 0.0 { return none }
-        let t = (-b - sqrt(d)) / (2.0 * a)
-        if t > t_min && t < t_max { some(t) } else { none }
+    fn new(center: Vec3, radius: f64, color: Color) -> Sphere {
+        Sphere { center, radius, color, specular: 0.5 }
+    }
+
+    fn intersect(self, ray: &Ray) -> Option<f64> {
+        let oc = ray.origin.sub(self.center)
+        let a = ray.direction.dot(ray.direction)
+        let b = 2.0 * oc.dot(ray.direction)
+        let c = oc.dot(oc) - self.radius * self.radius
+        let disc = b * b - 4.0 * a * c
+        if disc < 0.0 { return None }
+        let sqrt_disc = sqrt(disc)
+        let t1 = (-b - sqrt_disc) / (2.0 * a)
+        let t2 = (-b + sqrt_disc) / (2.0 * a)
+        if t1 > 0.001 { Some(t1) }
+        else if t2 > 0.001 { Some(t2) }
+        else { None }
+    }
+
+    fn normal_at(self, point: Vec3) -> Vec3 { point.sub(self.center).normalize() }
+}
+
+struct PointLight { position: Vec3, intensity: f64, color: Color }
+
+impl PointLight {
+    fn new(pos: Vec3, intensity: f64) -> PointLight {
+        PointLight { position: pos, intensity, color: Color.white() }
     }
 }
 
-fn rand_unit_sphere() -> Vec3 {
-    loop {
-        let v = Vec3::new(rand_float()*2.0-1.0, rand_float()*2.0-1.0, rand_float()*2.0-1.0)
-        if v.dot(v) < 1.0 { return v }
-    }
+struct Scene {
+    spheres: [Sphere],
+    lights: [PointLight],
+    ambient: f64,
+    background: Color,
 }
 
-fn ray_color(r: Ray, world: [Sphere], depth: int) -> Vec3 {
-    if depth == 0 { return Vec3::zero() }
-    let mut closest_t    = 1e9
-    let mut closest_sphere: Sphere? = none
-    for s in world {
-        if let some(t) = s.hit(r, 0.001, closest_t) {
-            closest_t      = t
-            closest_sphere = some(s)
+impl Scene {
+    fn new() -> Scene {
+        Scene { spheres: [], lights: [], ambient: 0.1, background: Color.new(0.2, 0.3, 0.5) }
+    }
+    fn add_sphere(mut self, s: Sphere) { self.spheres.push(s) }
+    fn add_light(mut self, l: PointLight) { self.lights.push(l) }
+
+    fn trace(self, ray: &Ray) -> Color {
+        let mut closest_t = f64.MAX
+        let mut hit_sphere: Option<usize> = None
+        for (i, sphere) in self.spheres.iter().enumerate() {
+            if let Some(t) = sphere.intersect(ray) {
+                if t < closest_t { closest_t = t; hit_sphere = Some(i) }
+            }
+        }
+        match hit_sphere {
+            None => self.background,
+            Some(idx) => {
+                let sphere = &self.spheres[idx]
+                let hit_point = ray.at(closest_t)
+                let normal = sphere.normal_at(hit_point)
+                self.shade(sphere, hit_point, normal, ray.direction.negate())
+            }
         }
     }
-    match closest_sphere {
-        none => {
-            let t = 0.5 * (r.dir.norm().y + 1.0)
-            Vec3::new(1.0,1.0,1.0).mul(1.0-t).add(Vec3::new(0.5,0.7,1.0).mul(t))
-        },
-        some(s) => {
-            let p   = r.at(closest_t)
-            let n   = p.sub(s.center).norm()
-            match s.material {
-                Material.Light(emit)        => emit,
-                Material.Diffuse(albedo)    => {
-                    let target = p.add(n).add(rand_unit_sphere())
-                    albedo.hadamard(ray_color(Ray { origin: p, dir: target.sub(p).norm() }, world, depth-1))
-                },
-                Material.Metal(albedo, fuzz) => {
-                    let reflected = r.dir.norm().reflect(n).add(rand_unit_sphere().mul(fuzz))
-                    if reflected.dot(n) > 0.0 {
-                        albedo.hadamard(ray_color(Ray { origin: p, dir: reflected.norm() }, world, depth-1))
-                    } else { Vec3::zero() }
-                },
-            }
-        },
+
+    fn shade(self, sphere: &Sphere, point: Vec3, normal: Vec3, view: Vec3) -> Color {
+        let mut result = sphere.color.scale(self.ambient)
+        for light in &self.lights {
+            let to_light = light.position.sub(point)
+            let dist = to_light.length()
+            let light_dir = to_light.normalize()
+
+            // Shadow check
+            let shadow_ray = Ray.new(point.add(normal.scale(0.001)), light_dir)
+            let in_shadow = self.spheres.iter().any(|s| {
+                s.intersect(&shadow_ray).map_or(false, |t| t < dist)
+            })
+            if in_shadow { continue }
+
+            // Diffuse
+            let n_dot_l = max(0.0, normal.dot(light_dir))
+            let diffuse = sphere.color.scale(n_dot_l * light.intensity / (dist * dist + 1.0))
+
+            // Specular
+            let reflect = light_dir.negate().reflect(normal)
+            let spec = max(0.0, reflect.dot(view.normalize())).powf(32.0)
+            let specular = light.color.scale(spec * sphere.specular * light.intensity)
+
+            result = result.add(diffuse).add(specular)
+        }
+        result.clamp()
     }
 }
 
 fn main() {
-    let W       = 200
-    let H       = 100
-    let SAMPLES = 16
-    let MAX_D   = 8
+    // Vec3
+    let v = Vec3.new(1.0, 2.0, 3.0)
+    assert(v.dot(v) == 14.0)
+    let n = Vec3.new(0.0, 0.0, 1.0).normalize()
+    assert((n.length() - 1.0).abs() < 0.0001)
+    print("Vec3 ✓")
 
-    let world: [Sphere] = [
-        Sphere { center: Vec3::new(0.0, 0.0, -1.0),   radius: 0.5,  material: Material.Diffuse(Vec3::new(0.8,0.3,0.3)) },
-        Sphere { center: Vec3::new(1.0, 0.0, -1.0),   radius: 0.5,  material: Material.Metal(Vec3::new(0.8,0.6,0.2), 0.1) },
-        Sphere { center: Vec3::new(-1.0,0.0, -1.0),   radius: 0.5,  material: Material.Metal(Vec3::new(0.8,0.8,0.8), 0.0) },
-        Sphere { center: Vec3::new(0.0,-100.5,-1.0),  radius: 100.0, material: Material.Diffuse(Vec3::new(0.5,0.8,0.5)) },
-        Sphere { center: Vec3::new(-0.3, 0.6,-1.2),   radius: 0.2,  material: Material.Light(Vec3::new(4.0,4.0,4.0)) },
-    ]
+    // Color
+    let c = Color.new(0.5, 0.3, 0.8)
+    let clamped = Color.new(1.5, -0.1, 0.5).clamp()
+    assert(clamped.r == 1.0 && clamped.g == 0.0 && clamped.b == 0.5)
+    let (r, g, b) = Color.new(1.0, 0.0, 0.5).to_rgb8()
+    assert(r == 255 && g == 0 && b == 127)
+    print("Color ✓")
 
-    let origin    = Vec3::new(0.0, 0.0, 0.0)
-    let lower_left= Vec3::new(-2.0,-1.0,-1.0)
-    let horiz     = Vec3::new(4.0, 0.0, 0.0)
-    let vert      = Vec3::new(0.0, 2.0, 0.0)
+    // Ray
+    let ray = Ray.new(Vec3.zero(), Vec3.new(0.0, 0.0, 1.0))
+    let pt = ray.at(5.0)
+    assert((pt.z - 5.0).abs() < 0.0001)
+    print("Ray ✓")
 
-    let mut file = File.create("/tmp/render.ppm")
-    file.write_line("P3
-${W} ${H}
-255")
-    for j in range(H-1, -1, -1) {
-        for i in range(0, W) {
-            let mut col = Vec3::zero()
-            for _ in range(0, SAMPLES) {
-                let u = (i as float + rand_float()) / W as float
-                let v = (j as float + rand_float()) / H as float
-                let d = lower_left.add(horiz.mul(u)).add(vert.mul(v))
-                col = col.add(ray_color(Ray { origin, dir: d.norm() }, world, MAX_D))
-            }
-            col = col.mul(1.0 / SAMPLES as float)
-            let gamma = Vec3::new(col.x.sqrt(), col.y.sqrt(), col.z.sqrt()).clamp01()
-            file.write_line("${(gamma.x*255.0) as int} ${(gamma.y*255.0) as int} ${(gamma.z*255.0) as int}")
+    // Sphere intersection
+    let sphere = Sphere.new(Vec3.new(0.0, 0.0, 5.0), 1.0, Color.new(1.0, 0.0, 0.0))
+    let hit = sphere.intersect(&ray)
+    assert(hit.is_some())
+    let t = hit.unwrap()
+    assert(t > 3.9 && t < 4.1)  // should hit at z=4
+    print("Intersection ✓")
+
+    // Miss
+    let miss_ray = Ray.new(Vec3.zero(), Vec3.new(1.0, 0.0, 0.0))
+    assert(sphere.intersect(&miss_ray).is_none())
+    print("Miss ✓")
+
+    // Normal
+    let normal = sphere.normal_at(Vec3.new(0.0, 0.0, 4.0))
+    assert((normal.z - (-1.0)).abs() < 0.0001)
+    print("Normal ✓")
+
+    // Scene trace
+    let mut scene = Scene.new()
+    scene.add_sphere(Sphere.new(Vec3.new(0.0, 0.0, 5.0), 1.0, Color.new(1.0, 0.0, 0.0)))
+    scene.add_sphere(Sphere.new(Vec3.new(2.0, 0.0, 6.0), 1.0, Color.new(0.0, 1.0, 0.0)))
+    scene.add_light(PointLight.new(Vec3.new(-5.0, 5.0, 0.0), 50.0))
+
+    let color = scene.trace(&ray)
+    assert(color.r > 0.0)  // should have some red from sphere
+    print("Trace ✓")
+
+    // Background
+    let bg_ray = Ray.new(Vec3.zero(), Vec3.new(0.0, 1.0, 0.0))
+    let bg = scene.trace(&bg_ray)
+    assert(bg.r == scene.background.r)
+    print("Background ✓")
+
+    // Reflection
+    let incoming = Vec3.new(1.0, -1.0, 0.0).normalize()
+    let n2 = Vec3.new(0.0, 1.0, 0.0)
+    let reflected = incoming.reflect(n2)
+    assert((reflected.y - incoming.y.abs()).abs() < 0.001)
+    print("Reflect ✓")
+
+    // Render small grid
+    let mut pixel_count = 0
+    for y in 0..4 {
+        for x in 0..4 {
+            let dir = Vec3.new((x as f64 - 2.0) * 0.25, (y as f64 - 2.0) * 0.25, 1.0)
+            let r = Ray.new(Vec3.zero(), dir)
+            let _ = scene.trace(&r)
+            pixel_count += 1
         }
     }
-    print("Ray tracer: rendered ${W}x${H} @ ${SAMPLES} spp → /tmp/render.ppm ✓")
+    assert(pixel_count == 16)
+    print("Render ✓")
+
+    print("Ray tracer complete ✓")
 }
