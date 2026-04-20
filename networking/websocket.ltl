@@ -1,0 +1,234 @@
+
+// WebSocket protocol implementation
+// Handles frame encoding/decoding, handshake, and message types.
+
+use std.crypto.sha1
+use std.encoding.base64
+
+#[derive(Clone, Debug, PartialEq)]
+enum Opcode {
+    Continuation, Text, Binary,
+    Close, Ping, Pong,
+    Reserved(u8),
+}
+
+impl Opcode {
+    fn from_u8(val: u8) -> Opcode {
+        match val {
+            0x0 => Opcode.Continuation,
+            0x1 => Opcode.Text,
+            0x2 => Opcode.Binary,
+            0x8 => Opcode.Close,
+            0x9 => Opcode.Ping,
+            0xA => Opcode.Pong,
+            v => Opcode.Reserved(v),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Opcode.Continuation => 0x0,
+            Opcode.Text => 0x1,
+            Opcode.Binary => 0x2,
+            Opcode.Close => 0x8,
+            Opcode.Ping => 0x9,
+            Opcode.Pong => 0xA,
+            Opcode.Reserved(v) => v,
+        }
+    }
+
+    fn is_control(self) -> bool {
+        match self {
+            Opcode.Close | Opcode.Ping | Opcode.Pong => true,
+            _ => false,
+        }
+    }
+
+    fn is_data(self) -> bool {
+        match self {
+            Opcode.Text | Opcode.Binary | Opcode.Continuation => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Frame {
+    fin: bool,
+    opcode: Opcode,
+    masked: bool,
+    mask_key: Option<[u8; 4]>,
+    payload: [u8],
+}
+
+impl Frame {
+    fn text(message: &str) -> Frame {
+        Frame { fin: true, opcode: Opcode.Text, masked: false, mask_key: none, payload: message.as_bytes().to_vec() }
+    }
+
+    fn binary(data: [u8]) -> Frame {
+        Frame { fin: true, opcode: Opcode.Binary, masked: false, mask_key: none, payload: data }
+    }
+
+    fn close(code: u16, reason: &str) -> Frame {
+        let mut payload = vec![]
+        payload.push((code >> 8) as u8)
+        payload.push((code & 0xFF) as u8)
+        payload.extend_from_slice(reason.as_bytes())
+        Frame { fin: true, opcode: Opcode.Close, masked: false, mask_key: none, payload }
+    }
+
+    fn ping(data: [u8]) -> Frame {
+        Frame { fin: true, opcode: Opcode.Ping, masked: false, mask_key: none, payload: data }
+    }
+
+    fn pong(data: [u8]) -> Frame {
+        Frame { fin: true, opcode: Opcode.Pong, masked: false, mask_key: none, payload: data }
+    }
+
+    fn payload_len(self) -> usize { self.payload.len() }
+
+    fn as_text(self) -> Option<string> {
+        if self.opcode != Opcode.Text { return none }
+        String.from_utf8(self.payload.clone()).ok()
+    }
+
+    fn close_code(self) -> Option<u16> {
+        if self.opcode != Opcode.Close || self.payload.len() < 2 { return none }
+        some(((self.payload[0] as u16) << 8) | self.payload[1] as u16)
+    }
+
+    fn apply_mask(mut self, key: [u8; 4]) -> Frame {
+        for i in 0..self.payload.len() {
+            self.payload[i] ^= key[i % 4]
+        }
+        self.masked = true
+        self.mask_key = some(key)
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CloseCode {
+    Normal, GoingAway, ProtocolError, UnsupportedData,
+    NoStatus, Abnormal, InvalidPayload, PolicyViolation,
+    MessageTooBig, MandatoryExtension, InternalError,
+}
+
+impl CloseCode {
+    fn to_u16(self) -> u16 {
+        match self {
+            CloseCode.Normal => 1000,
+            CloseCode.GoingAway => 1001,
+            CloseCode.ProtocolError => 1002,
+            CloseCode.UnsupportedData => 1003,
+            CloseCode.NoStatus => 1005,
+            CloseCode.Abnormal => 1006,
+            CloseCode.InvalidPayload => 1007,
+            CloseCode.PolicyViolation => 1008,
+            CloseCode.MessageTooBig => 1009,
+            CloseCode.MandatoryExtension => 1010,
+            CloseCode.InternalError => 1011,
+        }
+    }
+
+    fn from_u16(code: u16) -> Option<CloseCode> {
+        match code {
+            1000 => some(CloseCode.Normal),
+            1001 => some(CloseCode.GoingAway),
+            1002 => some(CloseCode.ProtocolError),
+            1003 => some(CloseCode.UnsupportedData),
+            1005 => some(CloseCode.NoStatus),
+            1006 => some(CloseCode.Abnormal),
+            1007 => some(CloseCode.InvalidPayload),
+            1008 => some(CloseCode.PolicyViolation),
+            1009 => some(CloseCode.MessageTooBig),
+            1010 => some(CloseCode.MandatoryExtension),
+            1011 => some(CloseCode.InternalError),
+            _ => none,
+        }
+    }
+}
+
+static WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+fn compute_accept_key(client_key: &str) -> string {
+    let combined = format!("{}{}", client_key, WS_MAGIC)
+    base64.encode(&sha1(combined.as_bytes()))
+}
+
+fn main() {
+    // Opcode
+    assert(Opcode.Text.to_u8() == 0x1)
+    assert(Opcode.from_u8(0x1) == Opcode.Text)
+    assert(Opcode.from_u8(0x8) == Opcode.Close)
+    assert(Opcode.Close.is_control())
+    assert(Opcode.Ping.is_control())
+    assert(!Opcode.Text.is_control())
+    assert(Opcode.Text.is_data())
+    assert(!Opcode.Close.is_data())
+    assert(Opcode.from_u8(0xF) == Opcode.Reserved(0xF))
+    print("Opcode ✓")
+
+    // Text frame
+    let frame = Frame.text("Hello, WebSocket!")
+    assert(frame.fin)
+    assert(frame.opcode == Opcode.Text)
+    assert(frame.payload_len() == 17)
+    assert(frame.as_text() == some("Hello, WebSocket!".into()))
+    print("Text frame ✓")
+
+    // Binary frame
+    let bin = Frame.binary(vec![0x01, 0x02, 0x03])
+    assert(bin.opcode == Opcode.Binary)
+    assert(bin.payload_len() == 3)
+    assert(bin.as_text().is_none())
+    print("Binary frame ✓")
+
+    // Close frame
+    let close = Frame.close(1000, "goodbye")
+    assert(close.opcode == Opcode.Close)
+    assert(close.close_code() == some(1000))
+    assert(close.payload_len() == 9)  // 2 bytes code + 7 bytes reason
+    print("Close frame ✓")
+
+    // Ping/Pong
+    let ping = Frame.ping(vec![1, 2, 3])
+    assert(ping.opcode == Opcode.Ping)
+    let pong = Frame.pong(vec![1, 2, 3])
+    assert(pong.opcode == Opcode.Pong)
+    print("Ping/Pong ✓")
+
+    // Masking
+    let masked = Frame.text("test").apply_mask([0x37, 0xFA, 0x21, 0x3D])
+    assert(masked.masked)
+    assert(masked.mask_key.is_some())
+    // Apply mask again to unmask
+    let unmasked = masked.apply_mask([0x37, 0xFA, 0x21, 0x3D])
+    assert(unmasked.as_text() == some("test".into()))
+    print("Masking ✓")
+
+    // Close codes
+    assert(CloseCode.Normal.to_u16() == 1000)
+    assert(CloseCode.GoingAway.to_u16() == 1001)
+    assert(CloseCode.from_u16(1000) == some(CloseCode.Normal))
+    assert(CloseCode.from_u16(9999).is_none())
+    assert(CloseCode.InternalError.to_u16() == 1011)
+    print("Close codes ✓")
+
+    // Close code from frame
+    let close2 = Frame.close(CloseCode.ProtocolError.to_u16(), "bad frame")
+    assert(close2.close_code() == some(1002))
+    print("Close code from frame ✓")
+
+    // Empty close frame
+    let empty_close = Frame { fin: true, opcode: Opcode.Close, masked: false, mask_key: none, payload: vec![] }
+    assert(empty_close.close_code().is_none())
+    print("Empty close ✓")
+
+    // Magic string
+    assert(WS_MAGIC.len() == 36)
+    print("WS magic ✓")
+
+    print("WebSocket complete ✓")
+}
