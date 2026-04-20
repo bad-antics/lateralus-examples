@@ -1,0 +1,177 @@
+
+// Fast Fourier Transform - Cooley-Tukey radix-2 DIT algorithm
+// Supports forward and inverse FFT on complex number arrays.
+
+use std.math.{PI, sqrt}
+
+#[derive(Clone, Copy, Debug)]
+struct Complex { re: f64, im: f64 }
+
+impl Complex {
+    fn new(re: f64, im: f64) -> Complex { Complex { re, im } }
+    fn zero() -> Complex { Complex { re: 0.0, im: 0.0 } }
+    fn from_real(r: f64) -> Complex { Complex { re: r, im: 0.0 } }
+
+    fn add(self, other: Complex) -> Complex { Complex { re: self.re + other.re, im: self.im + other.im } }
+    fn sub(self, other: Complex) -> Complex { Complex { re: self.re - other.re, im: self.im - other.im } }
+    fn mul(self, other: Complex) -> Complex {
+        Complex { re: self.re * other.re - self.im * other.im, im: self.re * other.im + self.im * other.re }
+    }
+    fn scale(self, s: f64) -> Complex { Complex { re: self.re * s, im: self.im * s } }
+    fn conj(self) -> Complex { Complex { re: self.re, im: -self.im } }
+    fn mag(self) -> f64 { (self.re * self.re + self.im * self.im).sqrt() }
+    fn phase(self) -> f64 { self.im.atan2(self.re) }
+
+    fn exp_i(theta: f64) -> Complex { Complex { re: theta.cos(), im: theta.sin() } }
+
+    fn approx_eq(self, other: Complex, eps: f64) -> bool {
+        (self.re - other.re).abs() < eps && (self.im - other.im).abs() < eps
+    }
+}
+
+fn is_power_of_2(n: usize) -> bool { n > 0 && (n & (n - 1)) == 0 }
+
+fn bit_reverse(mut x: usize, bits: u32) -> usize {
+    let mut result = 0usize
+    for _ in 0..bits { result = (result << 1) | (x & 1); x >>= 1 }
+    result
+}
+
+fn log2(n: usize) -> u32 {
+    let mut bits = 0u32
+    let mut v = n
+    while v > 1 { v >>= 1; bits += 1 }
+    bits
+}
+
+fn fft(input: &[Complex]) -> [Complex] {
+    let n = input.len()
+    assert(is_power_of_2(n))
+    let bits = log2(n)
+
+    // Bit-reversal permutation
+    let mut data: [Complex] = vec![Complex.zero(); n]
+    for i in 0..n { data[bit_reverse(i, bits)] = input[i] }
+
+    // Butterfly operations
+    let mut size = 2usize
+    while size <= n {
+        let half = size / 2
+        let angle = -2.0 * PI / size as f64
+        for start in (0..n).step_by(size) {
+            for k in 0..half {
+                let w = Complex.exp_i(angle * k as f64)
+                let even = data[start + k]
+                let odd = data[start + k + half].mul(w)
+                data[start + k] = even.add(odd)
+                data[start + k + half] = even.sub(odd)
+            }
+        }
+        size *= 2
+    }
+    data
+}
+
+fn ifft(input: &[Complex]) -> [Complex] {
+    let n = input.len()
+    let conj_input: [Complex] = input.iter().map(|c| c.conj()).collect()
+    let mut result = fft(&conj_input)
+    let scale = 1.0 / n as f64
+    for c in &mut result { *c = c.conj().scale(scale) }
+    result
+}
+
+fn magnitude_spectrum(signal: &[Complex]) -> [f64] {
+    fft(signal).iter().map(|c| c.mag()).collect()
+}
+
+fn power_spectrum(signal: &[Complex]) -> [f64] {
+    fft(signal).iter().map(|c| c.mag() * c.mag()).collect()
+}
+
+fn convolve(a: &[f64], b: &[f64]) -> [f64] {
+    let n = (a.len() + b.len() - 1).next_power_of_two()
+    let mut fa: [Complex] = vec![Complex.zero(); n]
+    let mut fb: [Complex] = vec![Complex.zero(); n]
+    for i in 0..a.len() { fa[i] = Complex.from_real(a[i]) }
+    for i in 0..b.len() { fb[i] = Complex.from_real(b[i]) }
+    let fa_fft = fft(&fa)
+    let fb_fft = fft(&fb)
+    let mut product: [Complex] = vec![Complex.zero(); n]
+    for i in 0..n { product[i] = fa_fft[i].mul(fb_fft[i]) }
+    let result = ifft(&product)
+    result.iter().take(a.len() + b.len() - 1).map(|c| c.re).collect()
+}
+
+fn main() {
+    // Complex basics
+    let a = Complex.new(3.0, 4.0)
+    assert((a.mag() - 5.0).abs() < 0.001)
+    let b = Complex.new(1.0, 2.0)
+    let sum = a.add(b)
+    assert(sum.approx_eq(Complex.new(4.0, 6.0), 0.001))
+    print("Complex ✓")
+
+    // Multiplication
+    let p = Complex.new(1.0, 1.0).mul(Complex.new(1.0, -1.0))
+    assert(p.approx_eq(Complex.new(2.0, 0.0), 0.001))
+    print("Mul ✓")
+
+    // Euler's formula: e^(i*pi) ≈ -1
+    let euler = Complex.exp_i(PI)
+    assert(euler.approx_eq(Complex.new(-1.0, 0.0), 0.001))
+    print("Euler ✓")
+
+    // Power of 2
+    assert(is_power_of_2(1))
+    assert(is_power_of_2(8))
+    assert(!is_power_of_2(7))
+    print("Pow2 ✓")
+
+    // Bit reverse
+    assert(bit_reverse(0b110, 3) == 0b011)
+    assert(bit_reverse(0, 4) == 0)
+    print("Bit reverse ✓")
+
+    // FFT of constant signal (DC only)
+    let dc: [Complex] = [Complex.from_real(1.0); 8]
+    let spectrum = fft(&dc)
+    assert(spectrum[0].approx_eq(Complex.new(8.0, 0.0), 0.001))
+    for i in 1..8 { assert(spectrum[i].approx_eq(Complex.zero(), 0.001)) }
+    print("DC FFT ✓")
+
+    // FFT roundtrip
+    let signal: [Complex] = [1.0, 2.0, 3.0, 4.0].iter().map(|v| Complex.from_real(*v)).collect()
+    let freq = fft(&signal)
+    let recovered = ifft(&freq)
+    for i in 0..4 { assert(recovered[i].approx_eq(signal[i], 0.001)) }
+    print("Roundtrip ✓")
+
+    // Parseval's theorem: sum |x|^2 == (1/N) sum |X|^2
+    let energy_time: f64 = signal.iter().map(|c| c.mag() * c.mag()).sum()
+    let energy_freq: f64 = freq.iter().map(|c| c.mag() * c.mag()).sum() / 4.0
+    assert((energy_time - energy_freq).abs() < 0.001)
+    print("Parseval ✓")
+
+    // Magnitude spectrum
+    let mags = magnitude_spectrum(&dc)
+    assert((mags[0] - 8.0).abs() < 0.001)
+    print("Magnitude ✓")
+
+    // Convolution
+    let ca = [1.0, 2.0, 3.0]
+    let cb = [1.0, 1.0]
+    let conv = convolve(&ca, &cb)
+    assert((conv[0] - 1.0).abs() < 0.01)
+    assert((conv[1] - 3.0).abs() < 0.01)
+    assert((conv[2] - 5.0).abs() < 0.01)
+    assert((conv[3] - 3.0).abs() < 0.01)
+    print("Convolve ✓")
+
+    // Conjugate
+    let c = Complex.new(3.0, 4.0)
+    assert(c.conj().approx_eq(Complex.new(3.0, -4.0), 0.001))
+    print("Conjugate ✓")
+
+    print("FFT complete ✓")
+}
