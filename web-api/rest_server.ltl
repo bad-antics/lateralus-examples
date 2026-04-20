@@ -1,0 +1,228 @@
+
+// REST API Server - CRUD operations with JSON responses
+// In-memory store with resource endpoints, validation, and pagination.
+
+use std.collections.HashMap
+use std.encoding.json
+
+struct Resource {
+    id: u64,
+    name: string,
+    data: HashMap<string, string>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+impl Resource {
+    fn to_json(self) -> string {
+        let mut fields = []
+        fields.push(format!(r#""id":{}"#, self.id))
+        fields.push(format!(r#""name":"{}""#, self.name))
+        fields.push(format!(r#""created_at":{}"#, self.created_at))
+        fields.push(format!(r#""updated_at":{}"#, self.updated_at))
+        let data_pairs: [string] = self.data.iter()
+            .map(|(k, v)| format!(r#""{}":"{}""#, k, v))
+            .collect()
+        fields.push(format!(r#""data":{{{}}}"#, data_pairs.join(",")))
+        format!("{{{}}}", fields.join(","))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ApiError {
+    NotFound(string),
+    BadRequest(string),
+    Conflict(string),
+    InternalError(string),
+}
+
+impl ApiError {
+    fn status_code(self) -> u16 {
+        match self {
+            ApiError.NotFound(_) => 404,
+            ApiError.BadRequest(_) => 400,
+            ApiError.Conflict(_) => 409,
+            ApiError.InternalError(_) => 500,
+        }
+    }
+
+    fn to_json(self) -> string {
+        let (code, msg) = match self {
+            ApiError.NotFound(m) => (404, m),
+            ApiError.BadRequest(m) => (400, m),
+            ApiError.Conflict(m) => (409, m),
+            ApiError.InternalError(m) => (500, m),
+        }
+        format!(r#"{{"error":true,"code":{},"message":"{}"}}"#, code, msg)
+    }
+}
+
+struct ApiResponse {
+    status: u16,
+    body: string,
+}
+
+struct RestStore {
+    resources: HashMap<u64, Resource>,
+    next_id: u64,
+    clock: u64,
+}
+
+impl RestStore {
+    fn new() -> RestStore {
+        RestStore { resources: HashMap.new(), next_id: 1, clock: 0 }
+    }
+
+    fn tick(mut self, dt: u64) { self.clock += dt }
+
+    fn create(mut self, name: &str, data: HashMap<string, string>) -> Result<ApiResponse, ApiError> {
+        if name.is_empty() {
+            return Err(ApiError.BadRequest("Name required".into()))
+        }
+        // Check for duplicate name
+        for (_, r) in &self.resources {
+            if r.name == name { return Err(ApiError.Conflict(format!("Name '{}' exists", name))) }
+        }
+        let id = self.next_id
+        self.next_id += 1
+        let resource = Resource {
+            id, name: name.into(), data,
+            created_at: self.clock, updated_at: self.clock,
+        }
+        let json = resource.to_json()
+        self.resources.insert(id, resource)
+        Ok(ApiResponse { status: 201, body: json })
+    }
+
+    fn get(self, id: u64) -> Result<ApiResponse, ApiError> {
+        match self.resources.get(&id) {
+            Some(r) => Ok(ApiResponse { status: 200, body: r.to_json() }),
+            None => Err(ApiError.NotFound(format!("Resource {} not found", id))),
+        }
+    }
+
+    fn update(mut self, id: u64, name: Option<&str>, data: Option<HashMap<string, string>>) -> Result<ApiResponse, ApiError> {
+        let resource = self.resources.get_mut(&id)
+            .ok_or(ApiError.NotFound(format!("Resource {} not found", id)))?
+        if let Some(n) = name { resource.name = n.into() }
+        if let Some(d) = data { resource.data = d }
+        resource.updated_at = self.clock
+        Ok(ApiResponse { status: 200, body: resource.to_json() })
+    }
+
+    fn delete(mut self, id: u64) -> Result<ApiResponse, ApiError> {
+        match self.resources.remove(&id) {
+            Some(_) => Ok(ApiResponse { status: 204, body: "".into() }),
+            None => Err(ApiError.NotFound(format!("Resource {} not found", id))),
+        }
+    }
+
+    fn list(self, page: usize, per_page: usize) -> ApiResponse {
+        let mut all: [&Resource] = self.resources.values().collect()
+        all.sort_by(|a, b| a.id.cmp(&b.id))
+        let total = all.len()
+        let start = page * per_page
+        let items: [string] = all.iter()
+            .skip(start).take(per_page)
+            .map(|r| r.to_json())
+            .collect()
+        let body = format!(
+            r#"{{"data":[{}],"total":{},"page":{},"per_page":{}}}"#,
+            items.join(","), total, page, per_page,
+        )
+        ApiResponse { status: 200, body }
+    }
+
+    fn count(self) -> usize { self.resources.len() }
+
+    fn search(self, query: &str) -> ApiResponse {
+        let results: [string] = self.resources.values()
+            .filter(|r| r.name.contains(query))
+            .map(|r| r.to_json())
+            .collect()
+        ApiResponse { status: 200, body: format!(r#"{{"results":[{}]}}"#, results.join(",")) }
+    }
+}
+
+fn main() {
+    let mut store = RestStore.new()
+
+    // Create
+    let resp = store.create("item1", HashMap.new()).unwrap()
+    assert(resp.status == 201)
+    assert(resp.body.contains("\"id\":1"))
+    assert(resp.body.contains("\"name\":\"item1\""))
+    print("Create ✓")
+
+    // Get
+    let resp2 = store.get(1).unwrap()
+    assert(resp2.status == 200)
+    assert(resp2.body.contains("item1"))
+    print("Get ✓")
+
+    // Get not found
+    let err = store.get(999).unwrap_err()
+    assert(err.status_code() == 404)
+    print("Not found ✓")
+
+    // Update
+    store.tick(100)
+    let resp3 = store.update(1, Some("renamed"), None).unwrap()
+    assert(resp3.body.contains("renamed"))
+    assert(resp3.body.contains("\"updated_at\":100"))
+    print("Update ✓")
+
+    // Delete
+    let resp4 = store.delete(1).unwrap()
+    assert(resp4.status == 204)
+    assert(store.count() == 0)
+    print("Delete ✓")
+
+    // Delete not found
+    let err2 = store.delete(1).unwrap_err()
+    assert(err2.status_code() == 404)
+    print("Delete not found ✓")
+
+    // Validation
+    let err3 = store.create("", HashMap.new()).unwrap_err()
+    assert(err3.status_code() == 400)
+    print("Validation ✓")
+
+    // Conflict
+    store.create("unique", HashMap.new()).unwrap()
+    let err4 = store.create("unique", HashMap.new()).unwrap_err()
+    assert(err4.status_code() == 409)
+    print("Conflict ✓")
+
+    // List with pagination
+    for i in 0..10 {
+        store.create(&format!("item_{}", i), HashMap.new()).ok()
+    }
+    let list = store.list(0, 3)
+    assert(list.status == 200)
+    assert(list.body.contains("\"per_page\":3"))
+    assert(list.body.contains("\"page\":0"))
+    print("Pagination ✓")
+
+    // Search
+    let search = store.search("item_5")
+    assert(search.body.contains("item_5"))
+    print("Search ✓")
+
+    // Error JSON
+    let err_json = ApiError.NotFound("gone".into()).to_json()
+    assert(err_json.contains("\"error\":true"))
+    assert(err_json.contains("\"code\":404"))
+    print("Error JSON ✓")
+
+    // Data fields
+    let mut data = HashMap.new()
+    data.insert("color".into(), "red".into())
+    store.create("with_data", data).unwrap()
+    let r = store.search("with_data")
+    assert(r.body.contains("color"))
+    assert(r.body.contains("red"))
+    print("Data fields ✓")
+
+    print("REST server complete ✓")
+}
