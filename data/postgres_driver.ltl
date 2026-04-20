@@ -1,0 +1,120 @@
+// examples/data/postgres_driver.ltl
+//
+// Minimal PostgreSQL driver example using std::net and std::bin.
+// Shows the pipeline-first approach to database work: queries are
+// values, parameters bind left-to-right, results stream as iterators.
+//
+// Batch 76 / gap-fill: database driver.
+
+import std::net::tcp
+import std::bin::{read_be_u32, read_be_u16, write_be_u32}
+import std::collections::Map
+import std::io
+
+/// Minimal connection state. A real driver would add TLS, auth methods,
+/// connection pooling, prepared-statement caching, and cancel tokens.
+struct Conn {
+    stream:  tcp::Stream,
+    params:  Map<String, String>,
+    pid:     Int,
+    secret:  Int,
+}
+
+pub fn connect(host: String, port: Int, user: String, db: String,
+               password: String) -> Result<Conn, String> {
+    let stream = tcp::connect("{host}:{port}")?
+    startup_message(stream, user, db)?
+    authenticate(stream, user, password)?
+    let (params, pid, secret) = read_ready_state(stream)?
+    Ok(Conn { stream, params, pid, secret })
+}
+
+/// Execute a simple query that returns rows as `Map<String, String>`.
+///
+///   conn
+///     |> query("SELECT id, name FROM users WHERE active = $1", [Param::Bool(true)])?
+///     |> iter()
+///     |> map(|row| row["name"])
+///     |> collect()
+pub fn query(conn: &mut Conn, sql: String, params: [Param]) -> Result<Rows, String> {
+    send_parse(conn.stream, "", sql)?
+    send_bind(conn.stream, "", "", params)?
+    send_execute(conn.stream, "")?
+    send_sync(conn.stream)?
+    read_row_description(conn.stream)
+        |> and_then(|desc| Ok(Rows::new(&mut conn.stream, desc)))
+}
+
+pub enum Param {
+    Null,
+    Bool(Bool),
+    Int(Int),
+    Float(Float),
+    Text(String),
+    Bytea([Byte]),
+}
+
+impl Param {
+    fn oid(self) -> Int {
+        match self {
+            Param::Null    =>    0,
+            Param::Bool    =>   16,
+            Param::Int     =>   20,  // int8
+            Param::Float   =>  701,  // float8
+            Param::Text    =>   25,
+            Param::Bytea   =>   17,
+        }
+    }
+
+    fn encode(self) -> [Byte] {
+        match self {
+            Param::Null       => [],
+            Param::Bool(b)    => [if b { 1 } else { 0 }],
+            Param::Int(n)     => (n as Int64) |> to_be_bytes(),
+            Param::Float(f)   => f |> to_be_bytes(),
+            Param::Text(s)    => s |> as_bytes(),
+            Param::Bytea(bs)  => bs,
+        }
+    }
+}
+
+pub struct Rows {
+    stream: &mut tcp::Stream,
+    desc:   RowDescription,
+    done:   Bool,
+}
+
+impl Rows {
+    pub fn iter(self) -> impl Iterator<Row> { self }
+
+    fn next(self) -> Option<Row> {
+        if self.done { return None }
+        match read_message(self.stream) {
+            Ok(Msg::DataRow(fields))    => Some(Row::build(self.desc, fields)),
+            Ok(Msg::CommandComplete(_)) => { self.done = true; None },
+            Ok(_)                       => self.next(),
+            Err(_)                      => { self.done = true; None },
+        }
+    }
+}
+
+// ---- wire protocol scaffolding ---------------------------------------------
+
+fn startup_message(s: &mut tcp::Stream, user: String, db: String) -> Result<(), String> {
+    let body = [
+        write_be_u32(196608),          // protocol 3.0
+        kv("user", user),
+        kv("database", db),
+        [0 as Byte],
+    ] |> concat()
+    let msg = [write_be_u32(len(body) + 4), body] |> concat()
+    s |> tcp::write_all(msg)
+}
+
+fn kv(k: String, v: String) -> [Byte] {
+    [k |> as_bytes(), [0], v |> as_bytes(), [0]] |> concat()
+}
+
+// `authenticate`, `read_ready_state`, `send_parse`, `send_bind`,
+// `send_execute`, `send_sync`, `read_row_description`, `read_message`
+// would follow the Extended Query protocol. Left as extension points.
