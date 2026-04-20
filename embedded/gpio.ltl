@@ -1,0 +1,230 @@
+
+// GPIO Controller Simulator
+// Models embedded GPIO pins with modes, interrupts, and PWM.
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PinMode { Input, Output, Analog, Pwm, AltFunc(u8) }
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PinState { Low, High }
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PullMode { None, PullUp, PullDown }
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Edge { Rising, Falling, Both }
+
+struct PinConfig {
+    mode: PinMode,
+    pull: PullMode,
+    state: PinState,
+    interrupt_edge: Option<Edge>,
+    pwm_duty: f32,       // 0.0 - 1.0
+    pwm_freq_hz: u32,
+    label: Option<string>,
+}
+
+impl PinConfig {
+    fn default() -> PinConfig {
+        PinConfig {
+            mode: PinMode.Input, pull: PullMode.None, state: PinState.Low,
+            interrupt_edge: None, pwm_duty: 0.0, pwm_freq_hz: 1000, label: None,
+        }
+    }
+}
+
+struct GpioController {
+    pins: [PinConfig; 32],
+    interrupt_log: [(usize, Edge, u64)],
+    tick: u64,
+}
+
+impl GpioController {
+    fn new() -> GpioController {
+        let pins = [PinConfig.default(); 32]
+        GpioController { pins, interrupt_log: [], tick: 0 }
+    }
+
+    fn set_mode(mut self, pin: usize, mode: PinMode) {
+        assert(pin < 32)
+        self.pins[pin].mode = mode
+        if mode == PinMode.Output { self.pins[pin].state = PinState.Low }
+    }
+
+    fn set_pull(mut self, pin: usize, pull: PullMode) {
+        assert(pin < 32)
+        self.pins[pin].pull = pull
+    }
+
+    fn write(mut self, pin: usize, state: PinState) {
+        assert(pin < 32)
+        assert(self.pins[pin].mode == PinMode.Output)
+        let old = self.pins[pin].state
+        self.pins[pin].state = state
+        self.check_interrupts(pin, old, state)
+    }
+
+    fn read(self, pin: usize) -> PinState {
+        assert(pin < 32)
+        match self.pins[pin].pull {
+            PullMode.PullUp if self.pins[pin].state == PinState.Low
+                && self.pins[pin].mode == PinMode.Input => PinState.High,
+            PullMode.PullDown => PinState.Low,
+            _ => self.pins[pin].state,
+        }
+    }
+
+    fn toggle(mut self, pin: usize) {
+        assert(pin < 32)
+        assert(self.pins[pin].mode == PinMode.Output)
+        let new_state = if self.pins[pin].state == PinState.Low { PinState.High } else { PinState.Low }
+        self.write(pin, new_state)
+    }
+
+    fn set_label(mut self, pin: usize, label: &str) {
+        self.pins[pin].label = Some(label.into())
+    }
+
+    fn enable_interrupt(mut self, pin: usize, edge: Edge) {
+        assert(pin < 32)
+        self.pins[pin].interrupt_edge = Some(edge)
+    }
+
+    fn disable_interrupt(mut self, pin: usize) {
+        self.pins[pin].interrupt_edge = None
+    }
+
+    fn check_interrupts(mut self, pin: usize, old: PinState, new: PinState) {
+        if old == new { return }
+        if let Some(edge) = self.pins[pin].interrupt_edge {
+            let triggered = match edge {
+                Edge.Rising => old == PinState.Low && new == PinState.High,
+                Edge.Falling => old == PinState.High && new == PinState.Low,
+                Edge.Both => true,
+            }
+            if triggered {
+                let actual_edge = if new == PinState.High { Edge.Rising } else { Edge.Falling }
+                self.interrupt_log.push((pin, actual_edge, self.tick))
+            }
+        }
+    }
+
+    fn set_pwm(mut self, pin: usize, duty: f32, freq: u32) {
+        assert(pin < 32)
+        self.pins[pin].mode = PinMode.Pwm
+        self.pins[pin].pwm_duty = duty.clamp(0.0, 1.0)
+        self.pins[pin].pwm_freq_hz = freq
+    }
+
+    fn advance_tick(mut self) { self.tick += 1 }
+
+    fn port_write(mut self, mask: u32, value: u32) {
+        for i in 0..32 {
+            if mask & (1 << i) != 0 {
+                if self.pins[i].mode == PinMode.Output {
+                    let s = if value & (1 << i) != 0 { PinState.High } else { PinState.Low }
+                    self.write(i, s)
+                }
+            }
+        }
+    }
+
+    fn port_read(self) -> u32 {
+        let mut val: u32 = 0
+        for i in 0..32 {
+            if self.read(i) == PinState.High { val |= 1 << i }
+        }
+        val
+    }
+}
+
+fn main() {
+    let mut gpio = GpioController.new()
+
+    // Default state
+    assert(gpio.pins[0].mode == PinMode.Input)
+    assert(gpio.read(0) == PinState.Low)
+    print("Init ✓")
+
+    // Output write/read
+    gpio.set_mode(5, PinMode.Output)
+    gpio.write(5, PinState.High)
+    assert(gpio.read(5) == PinState.High)
+    print("Write/Read ✓")
+
+    // Toggle
+    gpio.toggle(5)
+    assert(gpio.read(5) == PinState.Low)
+    gpio.toggle(5)
+    assert(gpio.read(5) == PinState.High)
+    print("Toggle ✓")
+
+    // Pull-up
+    gpio.set_pull(10, PullMode.PullUp)
+    assert(gpio.read(10) == PinState.High)
+    print("Pull-up ✓")
+
+    // Interrupts
+    gpio.set_mode(3, PinMode.Output)
+    gpio.enable_interrupt(3, Edge.Rising)
+    gpio.write(3, PinState.High)
+    assert(gpio.interrupt_log.len() == 1)
+    assert(gpio.interrupt_log[0].0 == 3)
+    print("Interrupt ✓")
+
+    // No interrupt on same state
+    gpio.write(3, PinState.High)  // no change
+    assert(gpio.interrupt_log.len() == 1)
+    print("No duplicate interrupt ✓")
+
+    // Falling edge not triggered on rising-only
+    gpio.write(3, PinState.Low)
+    assert(gpio.interrupt_log.len() == 1)  // still 1
+    print("Edge filter ✓")
+
+    // Both edges
+    gpio.enable_interrupt(3, Edge.Both)
+    gpio.write(3, PinState.High)
+    gpio.write(3, PinState.Low)
+    assert(gpio.interrupt_log.len() == 3)
+    print("Both edges ✓")
+
+    // PWM
+    gpio.set_pwm(7, 0.75, 5000)
+    assert(gpio.pins[7].mode == PinMode.Pwm)
+    assert(gpio.pins[7].pwm_duty == 0.75)
+    assert(gpio.pins[7].pwm_freq_hz == 5000)
+    print("PWM ✓")
+
+    // PWM clamping
+    gpio.set_pwm(7, 1.5, 1000)
+    assert(gpio.pins[7].pwm_duty == 1.0)
+    print("PWM clamp ✓")
+
+    // Label
+    gpio.set_label(0, "LED_STATUS")
+    assert(gpio.pins[0].label == Some("LED_STATUS"))
+    print("Label ✓")
+
+    // Port write/read
+    gpio.set_mode(0, PinMode.Output)
+    gpio.set_mode(1, PinMode.Output)
+    gpio.set_mode(2, PinMode.Output)
+    gpio.port_write(0x07, 0x05)  // pins 0,2 high, pin 1 low
+    assert(gpio.read(0) == PinState.High)
+    assert(gpio.read(1) == PinState.Low)
+    assert(gpio.read(2) == PinState.High)
+    print("Port write ✓")
+
+    let val = gpio.port_read()
+    assert(val & 0x01 != 0)  // pin 0
+    assert(val & 0x04 != 0)  // pin 2
+    print("Port read ✓")
+
+    // Disable interrupt
+    gpio.disable_interrupt(3)
+    assert(gpio.pins[3].interrupt_edge.is_none())
+    print("Disable interrupt ✓")
+
+    print("GPIO controller complete ✓")
+}
