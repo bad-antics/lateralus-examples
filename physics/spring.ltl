@@ -1,0 +1,207 @@
+
+// Spring Physics Simulator - Mass-spring-damper system
+// Simulates Hooke's law with damping using Verlet integration.
+
+use std.math.{sqrt, abs, sin, PI}
+
+#[derive(Clone, Copy, Debug)]
+struct Vec2 { x: f64, y: f64 }
+
+impl Vec2 {
+    fn new(x: f64, y: f64) -> Vec2 { Vec2 { x, y } }
+    fn zero() -> Vec2 { Vec2 { x: 0.0, y: 0.0 } }
+    fn add(self, o: Vec2) -> Vec2 { Vec2.new(self.x + o.x, self.y + o.y) }
+    fn sub(self, o: Vec2) -> Vec2 { Vec2.new(self.x - o.x, self.y - o.y) }
+    fn scale(self, s: f64) -> Vec2 { Vec2.new(self.x * s, self.y * s) }
+    fn length(self) -> f64 { sqrt(self.x * self.x + self.y * self.y) }
+    fn normalize(self) -> Vec2 { let l = self.length(); if l > 0.0 { self.scale(1.0/l) } else { self } }
+    fn dot(self, o: Vec2) -> f64 { self.x * o.x + self.y * o.y }
+    fn distance(self, o: Vec2) -> f64 { self.sub(o).length() }
+}
+
+#[derive(Clone, Debug)]
+struct Particle {
+    position: Vec2,
+    prev_position: Vec2,
+    acceleration: Vec2,
+    mass: f64,
+    pinned: bool,
+}
+
+impl Particle {
+    fn new(pos: Vec2, mass: f64) -> Particle {
+        Particle { position: pos, prev_position: pos, acceleration: Vec2.zero(), mass, pinned: false }
+    }
+    fn pinned_at(pos: Vec2) -> Particle {
+        Particle { position: pos, prev_position: pos, acceleration: Vec2.zero(), mass: 1.0, pinned: true }
+    }
+    fn velocity(self) -> Vec2 { self.position.sub(self.prev_position) }
+    fn kinetic_energy(self) -> f64 { 0.5 * self.mass * self.velocity().dot(self.velocity()) }
+    fn apply_force(mut self, force: Vec2) {
+        if !self.pinned { self.acceleration = self.acceleration.add(force.scale(1.0 / self.mass)) }
+    }
+    fn integrate(mut self, dt: f64) {
+        if self.pinned { return }
+        let vel = self.position.sub(self.prev_position)
+        self.prev_position = self.position
+        self.position = self.position.add(vel).add(self.acceleration.scale(dt * dt))
+        self.acceleration = Vec2.zero()
+    }
+}
+
+struct Spring {
+    a: usize,
+    b: usize,
+    rest_length: f64,
+    stiffness: f64,
+    damping: f64,
+}
+
+impl Spring {
+    fn new(a: usize, b: usize, rest: f64, stiffness: f64) -> Spring {
+        Spring { a, b, rest_length: rest, stiffness, damping: 0.98 }
+    }
+    fn with_damping(mut self, d: f64) -> Spring { self.damping = d; self }
+
+    fn current_length(self, particles: &[Particle]) -> f64 {
+        particles[self.a].position.distance(particles[self.b].position)
+    }
+    fn extension(self, particles: &[Particle]) -> f64 {
+        self.current_length(particles) - self.rest_length
+    }
+    fn potential_energy(self, particles: &[Particle]) -> f64 {
+        let ext = self.extension(particles)
+        0.5 * self.stiffness * ext * ext
+    }
+}
+
+struct SpringSystem {
+    particles: [Particle],
+    springs: [Spring],
+    gravity: Vec2,
+    time: f64,
+    steps: u64,
+}
+
+impl SpringSystem {
+    fn new() -> SpringSystem {
+        SpringSystem { particles: [], springs: [], gravity: Vec2.new(0.0, -9.81), time: 0.0, steps: 0 }
+    }
+    fn set_gravity(mut self, g: Vec2) { self.gravity = g }
+    fn add_particle(mut self, p: Particle) -> usize { let i = self.particles.len(); self.particles.push(p); i }
+    fn add_spring(mut self, s: Spring) { self.springs.push(s) }
+
+    fn step(mut self, dt: f64) {
+        // Apply gravity
+        for p in &mut self.particles { p.apply_force(self.gravity.scale(p.mass)) }
+        // Apply spring forces
+        for spring in &self.springs {
+            let delta = self.particles[spring.b].position.sub(self.particles[spring.a].position)
+            let dist = delta.length()
+            if dist < 0.0001 { continue }
+            let force_mag = spring.stiffness * (dist - spring.rest_length)
+            let force = delta.normalize().scale(force_mag)
+            self.particles[spring.a].apply_force(force)
+            self.particles[spring.b].apply_force(force.scale(-1.0))
+        }
+        // Integrate
+        for p in &mut self.particles { p.integrate(dt) }
+        // Damping
+        for spring in &self.springs {
+            if !self.particles[spring.a].pinned {
+                let vel = self.particles[spring.a].velocity()
+                self.particles[spring.a].prev_position = self.particles[spring.a].position.sub(vel.scale(spring.damping))
+            }
+        }
+        self.time += dt
+        self.steps += 1
+    }
+
+    fn total_kinetic_energy(self) -> f64 { self.particles.iter().map(|p| p.kinetic_energy()).sum() }
+    fn total_potential_energy(self) -> f64 { self.springs.iter().map(|s| s.potential_energy(&self.particles)).sum() }
+    fn particle_count(self) -> usize { self.particles.len() }
+    fn spring_count(self) -> usize { self.springs.len() }
+}
+
+fn main() {
+    // Vec2
+    let v = Vec2.new(3.0, 4.0)
+    assert((v.length() - 5.0).abs() < 0.001)
+    let n = v.normalize()
+    assert((n.length() - 1.0).abs() < 0.001)
+    assert((Vec2.new(1.0, 0.0).distance(Vec2.new(4.0, 0.0)) - 3.0).abs() < 0.001)
+    print("Vec2 ✓")
+
+    // Particle
+    let p = Particle.new(Vec2.new(1.0, 2.0), 1.0)
+    assert(!p.pinned)
+    assert(p.velocity().length() < 0.001)
+    let pinned = Particle.pinned_at(Vec2.new(0.0, 5.0))
+    assert(pinned.pinned)
+    print("Particle ✓")
+
+    // Spring
+    let mut sys = SpringSystem.new()
+    let a = sys.add_particle(Particle.pinned_at(Vec2.new(0.0, 5.0)))
+    let b = sys.add_particle(Particle.new(Vec2.new(0.0, 3.0), 1.0))
+    sys.add_spring(Spring.new(a, b, 2.0, 50.0))
+    assert(sys.particle_count() == 2)
+    assert(sys.spring_count() == 1)
+    print("Spring ✓")
+
+    // Extension
+    let ext = sys.springs[0].extension(&sys.particles)
+    assert(ext.abs() < 0.001)  // at rest length
+    print("Extension ✓")
+
+    // Step simulation
+    let initial_y = sys.particles[b].position.y
+    for _ in 0..100 { sys.step(0.01) }
+    assert(sys.steps == 100)
+    assert((sys.time - 1.0).abs() < 0.001)
+    // Mass should have moved under gravity
+    assert(sys.particles[b].position.y != initial_y)
+    print("Simulation ✓")
+
+    // Energy
+    let ke = sys.total_kinetic_energy()
+    let pe = sys.total_potential_energy()
+    assert(ke >= 0.0)
+    assert(pe >= 0.0)
+    print("Energy ✓")
+
+    // Pinned particle doesn't move
+    assert(sys.particles[a].position.x == 0.0)
+    assert(sys.particles[a].position.y == 5.0)
+    print("Pinned ✓")
+
+    // Chain of springs
+    let mut chain = SpringSystem.new()
+    chain.set_gravity(Vec2.new(0.0, -9.81))
+    let anchor = chain.add_particle(Particle.pinned_at(Vec2.zero()))
+    let mut prev = anchor
+    for i in 1..=5 {
+        let p = chain.add_particle(Particle.new(Vec2.new(i as f64, 0.0), 0.5))
+        chain.add_spring(Spring.new(prev, p, 1.0, 100.0))
+        prev = p
+    }
+    assert(chain.particle_count() == 6)
+    assert(chain.spring_count() == 5)
+    for _ in 0..200 { chain.step(0.005) }
+    // Chain should droop under gravity
+    assert(chain.particles[5].position.y < 0.0)
+    print("Chain ✓")
+
+    // Zero gravity
+    let mut zero_g = SpringSystem.new()
+    zero_g.set_gravity(Vec2.zero())
+    let z0 = zero_g.add_particle(Particle.pinned_at(Vec2.zero()))
+    let z1 = zero_g.add_particle(Particle.new(Vec2.new(3.0, 0.0), 1.0))
+    zero_g.add_spring(Spring.new(z0, z1, 2.0, 10.0))
+    // Extended spring should pull mass toward anchor
+    for _ in 0..50 { zero_g.step(0.01) }
+    assert(zero_g.particles[z1].position.x < 3.0)
+    print("Zero-g ✓")
+
+    print("Spring physics complete ✓")
+}
