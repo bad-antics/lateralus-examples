@@ -1,0 +1,159 @@
+// Advent of Code - Day 5 Style Puzzle
+// Supply Stacks: move crates between stacks (CrateMover 9000 and 9001).
+
+use std.collections.HashMap
+
+type Stack = [char]
+
+#[derive(Clone, Debug, PartialEq)]
+struct Move {
+    count: usize,
+    from: usize,
+    to: usize,
+}
+
+fn parse_stacks(input: &str) -> [Stack] {
+    let lines: [&str] = input.lines().collect()
+    // Find the line with stack numbers
+    let num_line_idx = lines.iter().position(|l| l.trim().starts_with('1')).unwrap_or(0)
+    let num_stacks = lines[num_line_idx].split_whitespace().count()
+
+    let mut stacks: [Stack] = (0..num_stacks).map(|_| vec![]).collect()
+
+    // Parse crate lines (above the number line), bottom-up
+    for i in (0..num_line_idx).rev() {
+        let line = lines[i]
+        let chars: [char] = line.chars().collect()
+        for s in 0..num_stacks {
+            let pos = 1 + s * 4
+            if pos < chars.len() && chars[pos] != ' ' {
+                stacks[s].push(chars[pos])
+            }
+        }
+    }
+    stacks
+}
+
+fn parse_moves(input: &str) -> [Move] {
+    input.lines()
+        .filter(|l| l.starts_with("move"))
+        .map(|line| {
+            let parts: [&str] = line.split_whitespace().collect()
+            Move {
+                count: parts[1].parse().unwrap(),
+                from: parts[3].parse::<usize>().unwrap() - 1,
+                to: parts[5].parse::<usize>().unwrap() - 1,
+            }
+        })
+        .collect()
+}
+
+fn execute_9000(stacks: &mut [Stack], moves: &[Move]) {
+    for m in moves {
+        for _ in 0..m.count {
+            if let some(c) = stacks[m.from].pop() {
+                stacks[m.to].push(c)
+            }
+        }
+    }
+}
+
+fn execute_9001(stacks: &mut [Stack], moves: &[Move]) {
+    for m in moves {
+        let from_len = stacks[m.from].len()
+        let start = if from_len >= m.count { from_len - m.count } else { 0 }
+        let moved: [char] = stacks[m.from][start..].to_vec()
+        stacks[m.from].truncate(start)
+        stacks[m.to].extend(moved)
+    }
+}
+
+fn top_crates(stacks: &[Stack]) -> string {
+    stacks.iter()
+        .map(|s| s.last().copied().unwrap_or(' '))
+        .collect()
+}
+
+fn stack_height(stacks: &[Stack]) -> usize {
+    stacks.iter().map(|s| s.len()).max().unwrap_or(0)
+}
+
+fn total_crates(stacks: &[Stack]) -> usize {
+    stacks.iter().map(|s| s.len()).sum()
+}
+
+fn main() {
+    let input = "    [D]    \n[N] [C]    \n[Z] [M] [P]\n 1   2   3 \n\nmove 1 from 2 to 1\nmove 3 from 1 to 3\nmove 2 from 2 to 1\nmove 1 from 1 to 2"
+
+    // Parse stacks
+    let stacks = parse_stacks(input)
+    assert(stacks.len() == 3)
+    assert(stacks[0] == vec!['Z', 'N'])
+    assert(stacks[1] == vec!['M', 'C', 'D'])
+    assert(stacks[2] == vec!['P'])
+    print("Parse stacks ✓")
+
+    // Parse moves
+    let moves = parse_moves(input)
+    assert(moves.len() == 4)
+    assert(moves[0] == Move { count: 1, from: 1, to: 0 })
+    assert(moves[1] == Move { count: 3, from: 0, to: 2 })
+    print("Parse moves ✓")
+
+    // Part 1: CrateMover 9000
+    let mut stacks1 = stacks.clone()
+    execute_9000(&mut stacks1, &moves)
+    let tops1 = top_crates(&stacks1)
+    assert(tops1 == "CMZ")
+    print("Part 1 (9000): " + tops1 + " ✓")
+
+    // Part 2: CrateMover 9001
+    let mut stacks2 = stacks.clone()
+    execute_9001(&mut stacks2, &moves)
+    let tops2 = top_crates(&stacks2)
+    assert(tops2 == "MCD")
+    print("Part 2 (9001): " + tops2 + " ✓")
+
+    // top_crates
+    assert(top_crates(&vec![vec!['A'], vec!['B'], vec!['C']]) == "ABC")
+    assert(top_crates(&vec![vec![]]) == " ")
+    print("top_crates ✓")
+
+    // stack_height
+    assert(stack_height(&stacks) == 3)
+    assert(stack_height(&vec![]) == 0)
+    print("stack_height ✓")
+
+    // total_crates
+    assert(total_crates(&stacks) == 6)
+    print("total_crates ✓")
+
+    // Move struct
+    let m = Move { count: 5, from: 0, to: 2 }
+    assert(m.count == 5)
+    assert(m.from == 0)
+    assert(m.to == 2)
+    print("Move struct ✓")
+
+    // Empty stacks
+    let empty: [Stack] = vec![vec![], vec![], vec![]]
+    assert(top_crates(&empty) == "   ")
+    assert(total_crates(&empty) == 0)
+    print("Empty stacks ✓")
+
+    // Single crate move
+    let mut single = vec![vec!['A', 'B'], vec![]]
+    execute_9000(&mut single, &vec![Move { count: 1, from: 0, to: 1 }])
+    assert(single[0] == vec!['A'])
+    assert(single[1] == vec!['B'])
+    print("Single move ✓")
+
+    // 9001 preserves order
+    let mut ordered = vec![vec!['A', 'B', 'C'], vec![]]
+    execute_9001(&mut ordered, &vec![Move { count: 2, from: 0, to: 1 }])
+    assert(ordered[0] == vec!['A'])
+    assert(ordered[1] == vec!['B', 'C'])  // order preserved
+    print("9001 order ✓")
+
+    print("Supply Stacks complete ✓")
+}
