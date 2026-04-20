@@ -1,0 +1,251 @@
+
+// Shell Interpreter - Simple command-line shell with pipes and redirects
+// Supports built-in commands, pipes, environment variables, and command history.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+enum Token {
+    Word(string),
+    Pipe,
+    RedirectOut(string),
+    RedirectIn(string),
+    RedirectAppend(string),
+    Background,
+    Semicolon,
+}
+
+#[derive(Clone, Debug)]
+struct Command {
+    program: string,
+    args: [string],
+    stdin_file: Option<string>,
+    stdout_file: Option<string>,
+    append: bool,
+}
+
+impl Command {
+    fn new(program: &str) -> Command {
+        Command { program: program.into(), args: [], stdin_file: None, stdout_file: None, append: false }
+    }
+    fn arg(mut self, a: &str) -> Command { self.args.push(a.into()); self }
+    fn redirect_in(mut self, file: &str) -> Command { self.stdin_file = Some(file.into()); self }
+    fn redirect_out(mut self, file: &str) -> Command { self.stdout_file = Some(file.into()); self.append = false; self }
+    fn redirect_append(mut self, file: &str) -> Command { self.stdout_file = Some(file.into()); self.append = true; self }
+}
+
+#[derive(Clone, Debug)]
+struct Pipeline {
+    commands: [Command],
+    background: bool,
+}
+
+impl Pipeline {
+    fn new() -> Pipeline { Pipeline { commands: [], background: false } }
+    fn add(mut self, cmd: Command) -> Pipeline { self.commands.push(cmd); self }
+    fn is_pipe(self) -> bool { self.commands.len() > 1 }
+    fn command_count(self) -> usize { self.commands.len() }
+}
+
+fn tokenize(input: &str) -> [Token] {
+    let mut tokens = []
+    let chars: [char] = input.chars().collect()
+    let mut i = 0
+    while i < chars.len() {
+        match chars[i] {
+            ' ' | '\t' => { i += 1 }
+            '|' => { tokens.push(Token.Pipe); i += 1 }
+            ';' => { tokens.push(Token.Semicolon); i += 1 }
+            '&' => { tokens.push(Token.Background); i += 1 }
+            '>' => {
+                i += 1
+                let append = i < chars.len() && chars[i] == '>'
+                if append { i += 1 }
+                while i < chars.len() && chars[i] == ' ' { i += 1 }
+                let start = i
+                while i < chars.len() && !matches!(chars[i], ' ' | '|' | '>' | '<' | ';') { i += 1 }
+                let file = &input[start..i]
+                if append { tokens.push(Token.RedirectAppend(file.into())) }
+                else { tokens.push(Token.RedirectOut(file.into())) }
+            }
+            '<' => {
+                i += 1
+                while i < chars.len() && chars[i] == ' ' { i += 1 }
+                let start = i
+                while i < chars.len() && !matches!(chars[i], ' ' | '|' | '>' | '<' | ';') { i += 1 }
+                tokens.push(Token.RedirectIn(input[start..i].into()))
+            }
+            '"' => {
+                i += 1
+                let start = i
+                while i < chars.len() && chars[i] != '"' { i += 1 }
+                tokens.push(Token.Word(input[start..i].into()))
+                if i < chars.len() { i += 1 }
+            }
+            _ => {
+                let start = i
+                while i < chars.len() && !matches!(chars[i], ' ' | '|' | '>' | '<' | ';' | '&') { i += 1 }
+                tokens.push(Token.Word(input[start..i].into()))
+            }
+        }
+    }
+    tokens
+}
+
+struct Shell {
+    env: HashMap<string, string>,
+    history: [string],
+    builtins: [string],
+    exit_code: i32,
+    cwd: string,
+}
+
+impl Shell {
+    fn new() -> Shell {
+        Shell {
+            env: HashMap.new(), history: [],
+            builtins: ["cd", "echo", "export", "exit", "history", "pwd", "set"].iter().map(|s| s.to_string()).collect(),
+            exit_code: 0, cwd: "/home/user".into(),
+        }
+    }
+
+    fn is_builtin(self, cmd: &str) -> bool { self.builtins.iter().any(|b| b == cmd) }
+
+    fn set_env(mut self, key: &str, val: &str) { self.env.insert(key.into(), val.into()) }
+    fn get_env(self, key: &str) -> Option<&str> { self.env.get(key).map(|s| s.as_str()) }
+
+    fn expand_vars(self, input: &str) -> string {
+        let mut result = "".into()
+        let chars: [char] = input.chars().collect()
+        let mut i = 0
+        while i < chars.len() {
+            if chars[i] == '$' {
+                i += 1
+                let start = i
+                while i < chars.len() && chars[i].is_alphanumeric() { i += 1 }
+                let var = &input[start..i]
+                result += self.get_env(var).unwrap_or("")
+            } else { result.push(chars[i]); i += 1 }
+        }
+        result
+    }
+
+    fn add_history(mut self, cmd: &str) { self.history.push(cmd.into()) }
+    fn history_count(self) -> usize { self.history.len() }
+    fn last_command(self) -> Option<&str> { self.history.last().map(|s| s.as_str()) }
+
+    fn exec_builtin(mut self, cmd: &Command) -> string {
+        match cmd.program.as_str() {
+            "echo" => cmd.args.join(" "),
+            "pwd" => self.cwd.clone(),
+            "cd" => {
+                if let Some(dir) = cmd.args.first() { self.cwd = dir.clone() }
+                "".into()
+            }
+            "export" => {
+                for arg in &cmd.args {
+                    if let Some(eq) = arg.find('=') {
+                        let key = &arg[..eq]
+                        let val = &arg[eq + 1..]
+                        self.set_env(key, val)
+                    }
+                }
+                "".into()
+            }
+            "history" => self.history.iter().enumerate().map(|(i, h)| format!("  {} {}", i + 1, h)).collect::<[string]>().join("\n"),
+            _ => "".into(),
+        }
+    }
+}
+
+fn main() {
+    // Tokenizer
+    let tokens = tokenize("ls -la | grep foo > output.txt")
+    assert(tokens.len() == 6)
+    assert(matches!(tokens[0], Token.Word(ref s) if s == "ls"))
+    assert(matches!(tokens[2], Token.Pipe))
+    assert(matches!(tokens[5], Token.RedirectOut(_)))
+    print("Tokenize ✓")
+
+    // Quoted strings
+    let tokens2 = tokenize("echo \"hello world\"")
+    assert(tokens2.len() == 2)
+    assert(matches!(tokens2[1], Token.Word(ref s) if s == "hello world"))
+    print("Quoted ✓")
+
+    // Command building
+    let cmd = Command.new("grep").arg("-i").arg("pattern").redirect_out("out.txt")
+    assert(cmd.program == "grep")
+    assert(cmd.args.len() == 2)
+    assert(cmd.stdout_file == Some("out.txt".into()))
+    assert(!cmd.append)
+    print("Command ✓")
+
+    // Append redirect
+    let cmd2 = Command.new("echo").arg("hi").redirect_append("log.txt")
+    assert(cmd2.append)
+    print("Append ✓")
+
+    // Pipeline
+    let pipe = Pipeline.new()
+        .add(Command.new("cat").arg("file.txt"))
+        .add(Command.new("grep").arg("pattern"))
+        .add(Command.new("wc").arg("-l"))
+    assert(pipe.is_pipe())
+    assert(pipe.command_count() == 3)
+    print("Pipeline ✓")
+
+    // Shell
+    let mut sh = Shell.new()
+    assert(sh.cwd == "/home/user")
+    assert(sh.is_builtin("cd"))
+    assert(sh.is_builtin("echo"))
+    assert(!sh.is_builtin("ls"))
+    print("Shell init ✓")
+
+    // Environment
+    sh.set_env("HOME", "/home/user")
+    sh.set_env("PATH", "/usr/bin")
+    assert(sh.get_env("HOME") == Some("/home/user"))
+    assert(sh.get_env("MISSING").is_none())
+    print("Env ✓")
+
+    // Variable expansion
+    sh.set_env("NAME", "world")
+    assert(sh.expand_vars("hello $NAME") == "hello world")
+    assert(sh.expand_vars("no vars") == "no vars")
+    assert(sh.expand_vars("$MISSING") == "")
+    print("Expand ✓")
+
+    // History
+    sh.add_history("ls -la")
+    sh.add_history("cd /tmp")
+    assert(sh.history_count() == 2)
+    assert(sh.last_command() == Some("cd /tmp"))
+    print("History ✓")
+
+    // Builtin: echo
+    let echo_cmd = Command.new("echo").arg("hello").arg("world")
+    let output = sh.exec_builtin(&echo_cmd)
+    assert(output == "hello world")
+    print("Echo ✓")
+
+    // Builtin: pwd
+    let pwd_cmd = Command.new("pwd")
+    assert(sh.exec_builtin(&pwd_cmd) == "/home/user")
+    print("Pwd ✓")
+
+    // Builtin: cd
+    let cd_cmd = Command.new("cd").arg("/tmp")
+    sh.exec_builtin(&cd_cmd)
+    assert(sh.cwd == "/tmp")
+    print("Cd ✓")
+
+    // Builtin: export
+    let exp_cmd = Command.new("export").arg("FOO=bar")
+    sh.exec_builtin(&exp_cmd)
+    assert(sh.get_env("FOO") == Some("bar"))
+    print("Export ✓")
+
+    print("Shell complete ✓")
+}
