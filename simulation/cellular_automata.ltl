@@ -1,0 +1,242 @@
+// Cellular Automata
+// Conway's Game of Life and 1D elementary automata (Wolfram rules).
+
+use std.collections.HashSet
+
+// ─── Game of Life ───
+
+type Cell = (i64, i64)
+
+struct Life {
+    alive: HashSet<Cell>,
+    generation: usize,
+}
+
+impl Life {
+    fn new() -> Life {
+        Life { alive: HashSet.new(), generation: 0 }
+    }
+
+    fn from_cells(cells: [Cell]) -> Life {
+        let mut alive = HashSet.new()
+        for c in cells { alive.insert(c); }
+        Life { alive, generation: 0 }
+    }
+
+    fn set(mut self, x: i64, y: i64) { self.alive.insert((x, y)); }
+    fn clear(mut self, x: i64, y: i64) { self.alive.remove(&(x, y)); }
+    fn is_alive(self, x: i64, y: i64) -> bool { self.alive.contains(&(x, y)) }
+    fn population(self) -> usize { self.alive.len() }
+
+    fn neighbors(x: i64, y: i64) -> [Cell] {
+        vec![
+            (x-1, y-1), (x, y-1), (x+1, y-1),
+            (x-1, y),             (x+1, y),
+            (x-1, y+1), (x, y+1), (x+1, y+1),
+        ]
+    }
+
+    fn neighbor_count(self, x: i64, y: i64) -> usize {
+        Self.neighbors(x, y).iter()
+            .filter(|c| self.alive.contains(c))
+            .count()
+    }
+
+    fn step(mut self) {
+        let mut candidates: HashSet<Cell> = HashSet.new()
+        for &(x, y) in &self.alive {
+            candidates.insert((x, y))
+            for n in Self.neighbors(x, y) { candidates.insert(n); }
+        }
+
+        let mut next = HashSet.new()
+        for &(x, y) in &candidates {
+            let n = self.neighbor_count(x, y)
+            if self.is_alive(x, y) {
+                if n == 2 || n == 3 { next.insert((x, y)); }
+            } else {
+                if n == 3 { next.insert((x, y)); }
+            }
+        }
+
+        self.alive = next
+        self.generation += 1
+    }
+
+    fn step_n(mut self, n: usize) {
+        for _ in 0..n { self.step() }
+    }
+
+    fn bounding_box(self) -> Option<(i64, i64, i64, i64)> {
+        if self.alive.is_empty() { return none }
+        let mut min_x = i64.MAX; let mut max_x = i64.MIN
+        let mut min_y = i64.MAX; let mut max_y = i64.MIN
+        for &(x, y) in &self.alive {
+            if x < min_x { min_x = x }
+            if x > max_x { max_x = x }
+            if y < min_y { min_y = y }
+            if y > max_y { max_y = y }
+        }
+        some((min_x, min_y, max_x, max_y))
+    }
+}
+
+// ─── 1D Elementary Automata ───
+
+struct ElementaryAutomaton {
+    rule: u8,
+    state: [bool],
+    width: usize,
+}
+
+impl ElementaryAutomaton {
+    fn new(rule: u8, width: usize) -> ElementaryAutomaton {
+        let mut state = vec![false; width]
+        state[width / 2] = true  // single cell in center
+        ElementaryAutomaton { rule, state, width }
+    }
+
+    fn from_state(rule: u8, state: [bool]) -> ElementaryAutomaton {
+        let width = state.len()
+        ElementaryAutomaton { rule, state, width }
+    }
+
+    fn get(self, i: usize) -> bool {
+        if i < self.width { self.state[i] } else { false }
+    }
+
+    fn step(mut self) {
+        let mut next = vec![false; self.width]
+        for i in 0..self.width {
+            let left = if i > 0 { self.state[i - 1] } else { false }
+            let center = self.state[i]
+            let right = if i + 1 < self.width { self.state[i + 1] } else { false }
+            let pattern = (left as u8) << 2 | (center as u8) << 1 | (right as u8)
+            next[i] = (self.rule >> pattern) & 1 == 1
+        }
+        self.state = next
+    }
+
+    fn step_n(mut self, n: usize) {
+        for _ in 0..n { self.step() }
+    }
+
+    fn alive_count(self) -> usize {
+        self.state.iter().filter(|b| **b).count()
+    }
+
+    fn to_string(self) -> string {
+        self.state.iter().map(|b| if *b { '#' } else { '.' }).collect()
+    }
+}
+
+fn main() {
+    // Game of Life - Blinker (period 2 oscillator)
+    let mut blinker = Life.from_cells(vec![(0, -1), (0, 0), (0, 1)])
+    assert(blinker.population() == 3)
+    assert(blinker.is_alive(0, 0))
+    assert(!blinker.is_alive(1, 0))
+    print("Blinker init ✓")
+
+    blinker.step()
+    assert(blinker.population() == 3)
+    assert(blinker.is_alive(-1, 0))
+    assert(blinker.is_alive(0, 0))
+    assert(blinker.is_alive(1, 0))
+    assert(!blinker.is_alive(0, 1))
+    print("Blinker step 1 ✓")
+
+    blinker.step()
+    assert(blinker.is_alive(0, -1))
+    assert(blinker.is_alive(0, 0))
+    assert(blinker.is_alive(0, 1))
+    assert(blinker.generation == 2)
+    print("Blinker period 2 ✓")
+
+    // Block (still life)
+    let mut block = Life.from_cells(vec![(0, 0), (1, 0), (0, 1), (1, 1)])
+    let pop_before = block.population()
+    block.step()
+    assert(block.population() == pop_before)
+    assert(block.is_alive(0, 0))
+    print("Block still life ✓")
+
+    // Neighbor count
+    let grid = Life.from_cells(vec![(0, 0), (1, 0), (0, 1)])
+    assert(grid.neighbor_count(0, 0) == 2)
+    assert(grid.neighbor_count(1, 1) == 3)
+    print("Neighbor count ✓")
+
+    // Empty grid
+    let mut empty = Life.new()
+    assert(empty.population() == 0)
+    empty.step()
+    assert(empty.population() == 0)
+    assert(empty.bounding_box().is_none())
+    print("Empty grid ✓")
+
+    // Bounding box
+    let bb = Life.from_cells(vec![(-5, 3), (10, -2)])
+    let (x1, y1, x2, y2) = bb.bounding_box().unwrap()
+    assert(x1 == -5 && y1 == -2 && x2 == 10 && y2 == 3)
+    print("Bounding box ✓")
+
+    // step_n
+    let mut glider = Life.from_cells(vec![(1, 0), (2, 1), (0, 2), (1, 2), (2, 2)])
+    glider.step_n(4)
+    assert(glider.population() == 5)
+    assert(glider.generation == 4)
+    print("Glider 4 steps ✓")
+
+    // Set/clear
+    let mut manual = Life.new()
+    manual.set(5, 5)
+    assert(manual.is_alive(5, 5))
+    manual.clear(5, 5)
+    assert(!manual.is_alive(5, 5))
+    print("Set/clear ✓")
+
+    // ─── Elementary Automata ───
+
+    // Rule 110
+    let mut r110 = ElementaryAutomaton.new(110, 11)
+    assert(r110.get(5))  // center cell alive
+    assert(!r110.get(0))
+    assert(r110.alive_count() == 1)
+    print("Rule 110 init ✓")
+
+    r110.step()
+    assert(r110.alive_count() > 1)
+    print("Rule 110 step ✓")
+
+    // Rule 30
+    let mut r30 = ElementaryAutomaton.new(30, 21)
+    r30.step_n(10)
+    assert(r30.alive_count() > 0)
+    print("Rule 30 ✓")
+
+    // Rule 0 (all die)
+    let mut r0 = ElementaryAutomaton.new(0, 11)
+    r0.step()
+    assert(r0.alive_count() == 0)
+    print("Rule 0 ✓")
+
+    // Rule 255 (all alive)
+    let mut r255 = ElementaryAutomaton.from_state(255, vec![true, false, true])
+    r255.step()
+    assert(r255.alive_count() == 3)  // all become alive
+    print("Rule 255 ✓")
+
+    // to_string
+    let display = ElementaryAutomaton.from_state(0, vec![true, false, true, true])
+    assert(display.to_string() == "#.##")
+    print("to_string ✓")
+
+    // Custom initial state
+    let custom = ElementaryAutomaton.from_state(90, vec![false, false, true, false, false])
+    assert(custom.get(2))
+    assert(!custom.get(0))
+    print("Custom state ✓")
+
+    print("Cellular Automata complete ✓")
+}
