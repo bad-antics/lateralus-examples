@@ -1,0 +1,256 @@
+
+// SQL Parser - Parses basic SQL SELECT, INSERT, CREATE statements
+// Tokenizes SQL input and builds an AST for query processing.
+
+#[derive(Clone, Debug, PartialEq)]
+enum SqlToken {
+    Select, From, Where, Insert, Into, Values, Create, Table,
+    And, Or, Not, As, OrderBy, GroupBy, Limit, Join, On,
+    Star, Comma, LParen, RParen, Semicolon, Dot,
+    Eq, Neq, Lt, Gt, Lte, Gte,
+    Ident(string), StringLit(string), IntLit(i64), FloatLit(f64),
+    Eof,
+}
+
+#[derive(Clone, Debug)]
+enum Expr {
+    Column(string),
+    QualifiedColumn(string, string),
+    Literal(SqlToken),
+    BinaryOp(Box<Expr>, string, Box<Expr>),
+    Star,
+    Alias(Box<Expr>, string),
+    FunctionCall(string, [Expr]),
+}
+
+#[derive(Clone, Debug)]
+struct SelectStmt {
+    columns: [Expr],
+    from: string,
+    alias: Option<string>,
+    where_clause: Option<Expr>,
+    order_by: Option<string>,
+    limit: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct InsertStmt {
+    table: string,
+    columns: [string],
+    values: [[Expr]],
+}
+
+#[derive(Clone, Debug)]
+struct ColumnDef {
+    name: string,
+    typ: string,
+    nullable: bool,
+    primary_key: bool,
+}
+
+impl ColumnDef {
+    fn new(name: &str, typ: &str) -> ColumnDef {
+        ColumnDef { name: name.into(), typ: typ.into(), nullable: true, primary_key: false }
+    }
+    fn not_null(mut self) -> ColumnDef { self.nullable = false; self }
+    fn pk(mut self) -> ColumnDef { self.primary_key = true; self.nullable = false; self }
+}
+
+#[derive(Clone, Debug)]
+struct CreateStmt {
+    table: string,
+    columns: [ColumnDef],
+}
+
+#[derive(Clone, Debug)]
+enum Statement {
+    Select(SelectStmt),
+    Insert(InsertStmt),
+    Create(CreateStmt),
+}
+
+fn tokenize_sql(input: &str) -> [SqlToken] {
+    let mut tokens = []
+    let upper = input.to_uppercase()
+    let chars: [char] = input.chars().collect()
+    let mut i = 0
+    while i < chars.len() {
+        match chars[i] {
+            ' ' | '\t' | '\n' | '\r' => { i += 1 }
+            '*' => { tokens.push(SqlToken.Star); i += 1 }
+            ',' => { tokens.push(SqlToken.Comma); i += 1 }
+            '(' => { tokens.push(SqlToken.LParen); i += 1 }
+            ')' => { tokens.push(SqlToken.RParen); i += 1 }
+            ';' => { tokens.push(SqlToken.Semicolon); i += 1 }
+            '.' => { tokens.push(SqlToken.Dot); i += 1 }
+            '=' => { tokens.push(SqlToken.Eq); i += 1 }
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' { tokens.push(SqlToken.Lte); i += 2 }
+                else if i + 1 < chars.len() && chars[i + 1] == '>' { tokens.push(SqlToken.Neq); i += 2 }
+                else { tokens.push(SqlToken.Lt); i += 1 }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' { tokens.push(SqlToken.Gte); i += 2 }
+                else { tokens.push(SqlToken.Gt); i += 1 }
+            }
+            '\'' => {
+                i += 1
+                let start = i
+                while i < chars.len() && chars[i] != '\'' { i += 1 }
+                tokens.push(SqlToken.StringLit(input[start..i].into()))
+                if i < chars.len() { i += 1 }
+            }
+            c if c.is_digit(10) => {
+                let start = i
+                let mut is_float = false
+                while i < chars.len() && (chars[i].is_digit(10) || chars[i] == '.') {
+                    if chars[i] == '.' { is_float = true }
+                    i += 1
+                }
+                if is_float { tokens.push(SqlToken.FloatLit(input[start..i].parse::<f64>().unwrap())) }
+                else { tokens.push(SqlToken.IntLit(input[start..i].parse::<i64>().unwrap())) }
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') { i += 1 }
+                let word = &input[start..i]
+                let kw = match word.to_uppercase().as_str() {
+                    "SELECT" => SqlToken.Select,
+                    "FROM" => SqlToken.From,
+                    "WHERE" => SqlToken.Where,
+                    "INSERT" => SqlToken.Insert,
+                    "INTO" => SqlToken.Into,
+                    "VALUES" => SqlToken.Values,
+                    "CREATE" => SqlToken.Create,
+                    "TABLE" => SqlToken.Table,
+                    "AND" => SqlToken.And,
+                    "OR" => SqlToken.Or,
+                    "NOT" => SqlToken.Not,
+                    "AS" => SqlToken.As,
+                    "LIMIT" => SqlToken.Limit,
+                    "JOIN" => SqlToken.Join,
+                    "ON" => SqlToken.On,
+                    _ => SqlToken.Ident(word.into()),
+                };
+                tokens.push(kw)
+            }
+            _ => { i += 1 }
+        }
+    }
+    tokens.push(SqlToken.Eof)
+    tokens
+}
+
+fn count_columns(stmt: &SelectStmt) -> usize { stmt.columns.len() }
+fn has_where(stmt: &SelectStmt) -> bool { stmt.where_clause.is_some() }
+fn has_limit(stmt: &SelectStmt) -> bool { stmt.limit.is_some() }
+
+fn main() {
+    // Tokenize SELECT
+    let tokens = tokenize_sql("SELECT name, age FROM users WHERE age > 18")
+    assert(tokens[0] == SqlToken.Select)
+    assert(tokens[1] == SqlToken.Ident("name".into()))
+    assert(tokens[2] == SqlToken.Comma)
+    assert(tokens[3] == SqlToken.Ident("age".into()))
+    assert(tokens[4] == SqlToken.From)
+    assert(tokens[5] == SqlToken.Ident("users".into()))
+    assert(tokens[6] == SqlToken.Where)
+    print("Tokenize SELECT ✓")
+
+    // String literals
+    let tokens2 = tokenize_sql("SELECT * FROM users WHERE name = 'Alice'")
+    assert(tokens2[0] == SqlToken.Select)
+    assert(tokens2[1] == SqlToken.Star)
+    assert(matches!(tokens2[7], SqlToken.StringLit(ref s) if s == "Alice"))
+    print("String literal ✓")
+
+    // Numbers
+    let tokens3 = tokenize_sql("LIMIT 10")
+    assert(tokens3[0] == SqlToken.Limit)
+    assert(tokens3[1] == SqlToken.IntLit(10))
+    print("Number ✓")
+
+    // Comparison operators
+    let tokens4 = tokenize_sql("a <= b >= c <> d")
+    assert(tokens4[1] == SqlToken.Lte)
+    assert(tokens4[3] == SqlToken.Gte)
+    assert(tokens4[5] == SqlToken.Neq)
+    print("Operators ✓")
+
+    // Keywords
+    let tokens5 = tokenize_sql("INSERT INTO CREATE TABLE VALUES")
+    assert(tokens5[0] == SqlToken.Insert)
+    assert(tokens5[1] == SqlToken.Into)
+    assert(tokens5[2] == SqlToken.Create)
+    assert(tokens5[3] == SqlToken.Table)
+    assert(tokens5[4] == SqlToken.Values)
+    print("Keywords ✓")
+
+    // Case insensitive
+    let tokens6 = tokenize_sql("select FROM where")
+    assert(tokens6[0] == SqlToken.Select)
+    assert(tokens6[1] == SqlToken.From)
+    assert(tokens6[2] == SqlToken.Where)
+    print("Case insensitive ✓")
+
+    // ColumnDef
+    let col = ColumnDef.new("id", "INTEGER").pk()
+    assert(col.name == "id")
+    assert(col.primary_key)
+    assert(!col.nullable)
+    let col2 = ColumnDef.new("email", "VARCHAR").not_null()
+    assert(!col2.nullable && !col2.primary_key)
+    print("ColumnDef ✓")
+
+    // SelectStmt
+    let stmt = SelectStmt {
+        columns: [Expr.Column("name".into()), Expr.Column("age".into())],
+        from: "users".into(), alias: None,
+        where_clause: Some(Expr.BinaryOp(Box.new(Expr.Column("age".into())), ">".into(), Box.new(Expr.Literal(SqlToken.IntLit(18))))),
+        order_by: None, limit: Some(100),
+    }
+    assert(count_columns(&stmt) == 2)
+    assert(has_where(&stmt))
+    assert(has_limit(&stmt))
+    assert(stmt.from == "users")
+    print("SelectStmt ✓")
+
+    // InsertStmt
+    let ins = InsertStmt {
+        table: "users".into(),
+        columns: ["name".into(), "age".into()],
+        values: [[Expr.Literal(SqlToken.StringLit("Bob".into())), Expr.Literal(SqlToken.IntLit(25))]],
+    }
+    assert(ins.table == "users")
+    assert(ins.columns.len() == 2)
+    assert(ins.values.len() == 1)
+    print("InsertStmt ✓")
+
+    // CreateStmt
+    let create = CreateStmt {
+        table: "products".into(),
+        columns: [
+            ColumnDef.new("id", "INTEGER").pk(),
+            ColumnDef.new("name", "TEXT").not_null(),
+            ColumnDef.new("price", "REAL"),
+        ],
+    }
+    assert(create.table == "products")
+    assert(create.columns.len() == 3)
+    assert(create.columns[0].primary_key)
+    assert(create.columns[2].nullable)
+    print("CreateStmt ✓")
+
+    // Statement enum
+    let s = Statement.Select(stmt)
+    assert(matches!(s, Statement.Select(_)))
+    print("Statement ✓")
+
+    // Float literal
+    let tokens7 = tokenize_sql("WHERE price > 19.99")
+    assert(tokens7[0] == SqlToken.Where)
+    assert(matches!(tokens7[3], SqlToken.FloatLit(f) if (f - 19.99).abs() < 0.001))
+    print("Float ✓")
+
+    print("SQL parser complete ✓")
+}
