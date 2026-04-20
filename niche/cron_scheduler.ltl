@@ -1,0 +1,327 @@
+// Cron Scheduler
+// Parse cron expressions and calculate next execution times.
+
+use std.collections.HashMap
+use std.time.{Duration, Instant}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CronField {
+    Any,                          // *
+    Value(u8),                    // 5
+    Range(u8, u8),                // 1-5
+    Step(Box<CronField>, u8),    // */15 or 1-30/5
+    List([CronField]),           // 1,5,10
+}
+
+impl CronField {
+    fn matches(self, val: u8) -> bool {
+        match self {
+            CronField.Any => true,
+            CronField.Value(v) => val == v,
+            CronField.Range(lo, hi) => val >= lo && val <= hi,
+            CronField.Step(base, step) => {
+                if !base.matches(val) { return false }
+                let start = match base.as_ref() {
+                    CronField.Any => 0,
+                    CronField.Range(lo, _) => lo,
+                    CronField.Value(v) => v,
+                    _ => 0,
+                }
+                (val - start) % step == 0
+            },
+            CronField.List(items) => items.iter().any(|f| f.matches(val)),
+        }
+    }
+
+    fn expand(self, min: u8, max: u8) -> [u8] {
+        (min..=max).filter(|v| self.matches(*v)).collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CronExpr {
+    minute: CronField,    // 0-59
+    hour: CronField,      // 0-23
+    day: CronField,       // 1-31
+    month: CronField,     // 1-12
+    weekday: CronField,   // 0-6 (Sun=0)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DateTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+}
+
+impl DateTime {
+    fn new(year: u16, month: u8, day: u8, hour: u8, minute: u8) -> DateTime {
+        DateTime { year, month, day, hour, minute }
+    }
+
+    fn weekday(self) -> u8 {
+        // Tomohiko Sakamoto's algorithm
+        let mut y = self.year as i32
+        let m = self.month as i32
+        let d = self.day as i32
+        let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+        if m < 3 { y -= 1 }
+        ((y + y/4 - y/100 + y/400 + t[(m - 1) as usize] + d) % 7) as u8
+    }
+
+    fn days_in_month(self) -> u8 {
+        match self.month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => if self.is_leap_year() { 29 } else { 28 },
+            _ => 30,
+        }
+    }
+
+    fn is_leap_year(self) -> bool {
+        let y = self.year
+        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    }
+
+    fn advance_minute(mut self) {
+        self.minute += 1
+        if self.minute >= 60 {
+            self.minute = 0; self.hour += 1
+            if self.hour >= 24 {
+                self.hour = 0; self.day += 1
+                if self.day > self.days_in_month() {
+                    self.day = 1; self.month += 1
+                    if self.month > 12 {
+                        self.month = 1; self.year += 1
+                    }
+                }
+            }
+        }
+    }
+
+    fn display(self) -> string {
+        format!("{:04}-{:02}-{:02} {:02}:{:02}",
+            self.year, self.month, self.day, self.hour, self.minute)
+    }
+}
+
+impl CronExpr {
+    fn parse(input: &str) -> Result<CronExpr, string> {
+        let parts: [&str] = input.split_whitespace().collect()
+        if parts.len() != 5 {
+            return err("cron expression must have 5 fields".to_string())
+        }
+        ok(CronExpr {
+            minute: Self.parse_field(parts[0], 0, 59)?,
+            hour: Self.parse_field(parts[1], 0, 23)?,
+            day: Self.parse_field(parts[2], 1, 31)?,
+            month: Self.parse_field(parts[3], 1, 12)?,
+            weekday: Self.parse_field(parts[4], 0, 6)?,
+        })
+    }
+
+    fn parse_field(s: &str, min: u8, max: u8) -> Result<CronField, string> {
+        // List: 1,5,10
+        if s.contains(',') {
+            let items: Result<[CronField], string> = s.split(',')
+                .map(|p| Self.parse_field(p, min, max))
+                .collect()
+            return ok(CronField.List(items?))
+        }
+        // Step: */5 or 1-10/2
+        if s.contains('/') {
+            let parts: [&str] = s.splitn(2, '/').collect()
+            let base = Self.parse_field(parts[0], min, max)?
+            let step = parts[1].parse::<u8>().map_err(|_| "invalid step".to_string())?
+            return ok(CronField.Step(Box.new(base), step))
+        }
+        // Range: 1-5
+        if s.contains('-') {
+            let parts: [&str] = s.splitn(2, '-').collect()
+            let lo = parts[0].parse::<u8>().map_err(|_| "invalid range start".to_string())?
+            let hi = parts[1].parse::<u8>().map_err(|_| "invalid range end".to_string())?
+            return ok(CronField.Range(lo, hi))
+        }
+        // Any: *
+        if s == "*" { return ok(CronField.Any) }
+        // Value
+        let v = s.parse::<u8>().map_err(|_| format!("invalid field: {}", s))?
+        ok(CronField.Value(v))
+    }
+
+    fn matches(self, dt: &DateTime) -> bool {
+        self.minute.matches(dt.minute)
+            && self.hour.matches(dt.hour)
+            && self.day.matches(dt.day)
+            && self.month.matches(dt.month)
+            && self.weekday.matches(dt.weekday())
+    }
+
+    fn next_after(self, start: &DateTime) -> DateTime {
+        let mut dt = start.clone()
+        dt.advance_minute()
+        let limit = 525960  // ~1 year in minutes
+        for _ in 0..limit {
+            if self.matches(&dt) { return dt }
+            dt.advance_minute()
+        }
+        dt
+    }
+
+    fn next_n(self, start: &DateTime, n: usize) -> [DateTime] {
+        let mut results = []
+        let mut current = start.clone()
+        for _ in 0..n {
+            current = self.next_after(&current)
+            results.push(current.clone())
+        }
+        results
+    }
+}
+
+struct CronScheduler {
+    jobs: [(string, CronExpr, fn())],
+}
+
+impl CronScheduler {
+    fn new() -> CronScheduler { CronScheduler { jobs: [] } }
+
+    fn add(mut self, name: &str, expr: CronExpr, action: fn()) {
+        self.jobs.push((name.to_string(), expr, action))
+    }
+
+    fn due_jobs(self, dt: &DateTime) -> [&str] {
+        self.jobs.iter()
+            .filter(|(_, expr, _)| expr.matches(dt))
+            .map(|(name, _, _)| name.as_str())
+            .collect()
+    }
+
+    fn job_count(self) -> usize { self.jobs.len() }
+}
+
+fn main() {
+    // CronField.Any
+    assert(CronField.Any.matches(0))
+    assert(CronField.Any.matches(59))
+    print("Any ✓")
+
+    // CronField.Value
+    assert(CronField.Value(5).matches(5))
+    assert(!CronField.Value(5).matches(6))
+    print("Value ✓")
+
+    // CronField.Range
+    assert(CronField.Range(1, 5).matches(3))
+    assert(!CronField.Range(1, 5).matches(6))
+    assert(CronField.Range(1, 5).matches(1))
+    assert(CronField.Range(1, 5).matches(5))
+    print("Range ✓")
+
+    // CronField.Step
+    let every_15 = CronField.Step(Box.new(CronField.Any), 15)
+    assert(every_15.matches(0))
+    assert(every_15.matches(15))
+    assert(every_15.matches(30))
+    assert(!every_15.matches(7))
+    print("Step ✓")
+
+    // CronField.List
+    let list = CronField.List(vec![CronField.Value(1), CronField.Value(15), CronField.Value(30)])
+    assert(list.matches(1))
+    assert(list.matches(15))
+    assert(!list.matches(2))
+    print("List ✓")
+
+    // expand
+    let expanded = CronField.Range(3, 7).expand(0, 10)
+    assert(expanded == vec![3, 4, 5, 6, 7])
+    print("Expand ✓")
+
+    // Parse full cron expression
+    let every_min = CronExpr.parse("* * * * *").unwrap()
+    let dt = DateTime.new(2026, 4, 19, 12, 30)
+    assert(every_min.matches(&dt))
+    print("Parse * * * * * ✓")
+
+    // Parse specific: 30 9 * * 1-5  (9:30 weekdays)
+    let workday = CronExpr.parse("30 9 * * 1-5").unwrap()
+    let monday_930 = DateTime.new(2026, 4, 20, 9, 30)  // Monday
+    assert(workday.matches(&monday_930))
+    let sunday = DateTime.new(2026, 4, 19, 9, 30)  // Sunday
+    assert(!workday.matches(&sunday))
+    print("Weekday cron ✓")
+
+    // next_after
+    let hourly = CronExpr.parse("0 * * * *").unwrap()
+    let now = DateTime.new(2026, 4, 19, 14, 45)
+    let next = hourly.next_after(&now)
+    assert(next.hour == 15)
+    assert(next.minute == 0)
+    print("next_after ✓")
+
+    // next_n
+    let results = hourly.next_n(&now, 3)
+    assert(results.len() == 3)
+    assert(results[0].hour == 15 && results[0].minute == 0)
+    assert(results[1].hour == 16 && results[1].minute == 0)
+    assert(results[2].hour == 17 && results[2].minute == 0)
+    print("next_n ✓")
+
+    // DateTime weekday
+    // April 19, 2026 is a Sunday (0)
+    assert(DateTime.new(2026, 4, 19, 0, 0).weekday() == 0)
+    print("Weekday calc ✓")
+
+    // DateTime leap year
+    assert(DateTime.new(2024, 2, 1, 0, 0).is_leap_year())
+    assert(!DateTime.new(2023, 2, 1, 0, 0).is_leap_year())
+    assert(!DateTime.new(1900, 2, 1, 0, 0).is_leap_year())
+    assert(DateTime.new(2000, 2, 1, 0, 0).is_leap_year())
+    print("Leap year ✓")
+
+    // Days in month
+    assert(DateTime.new(2026, 2, 1, 0, 0).days_in_month() == 28)
+    assert(DateTime.new(2024, 2, 1, 0, 0).days_in_month() == 29)
+    assert(DateTime.new(2026, 1, 1, 0, 0).days_in_month() == 31)
+    assert(DateTime.new(2026, 4, 1, 0, 0).days_in_month() == 30)
+    print("Days in month ✓")
+
+    // advance_minute wraps
+    let mut wrap = DateTime.new(2026, 12, 31, 23, 59)
+    wrap.advance_minute()
+    assert(wrap.year == 2027 && wrap.month == 1 && wrap.day == 1)
+    assert(wrap.hour == 0 && wrap.minute == 0)
+    print("Advance wrap ✓")
+
+    // display
+    assert(DateTime.new(2026, 4, 19, 9, 5).display() == "2026-04-19 09:05")
+    print("Display ✓")
+
+    // Parse errors
+    assert(CronExpr.parse("* * *").is_err())
+    assert(CronExpr.parse("* * * * * *").is_err())
+    print("Parse errors ✓")
+
+    // Step with range: 0-30/10
+    let step_range = CronExpr.parse("0-30/10 * * * *").unwrap()
+    let at0 = DateTime.new(2026, 1, 1, 0, 0); assert(step_range.matches(&at0))
+    let at10 = DateTime.new(2026, 1, 1, 0, 10); assert(step_range.matches(&at10))
+    let at7 = DateTime.new(2026, 1, 1, 0, 7); assert(!step_range.matches(&at7))
+    let at40 = DateTime.new(2026, 1, 1, 0, 40); assert(!step_range.matches(&at40))
+    print("Step+Range ✓")
+
+    // Scheduler
+    let mut sched = CronScheduler.new()
+    sched.add("backup", CronExpr.parse("0 2 * * *").unwrap(), || {})
+    sched.add("report", CronExpr.parse("30 9 * * 1-5").unwrap(), || {})
+    assert(sched.job_count() == 2)
+    let due = sched.due_jobs(&DateTime.new(2026, 4, 20, 9, 30))  // Monday 9:30
+    assert(due.contains(&"report"))
+    assert(!due.contains(&"backup"))
+    print("Scheduler ✓")
+
+    print("Cron Scheduler complete ✓")
+}
