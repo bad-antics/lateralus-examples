@@ -1,0 +1,225 @@
+
+// Advent of Code Day 7 - Directory Size Calculator
+// Parses filesystem commands to build a directory tree, finds directories by size.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+enum FsNode {
+    File { name: string, size: u64 },
+    Dir { name: string, children: [FsNode] },
+}
+
+impl FsNode {
+    fn name(self) -> &str {
+        match self {
+            FsNode.File { name, .. } => name,
+            FsNode.Dir { name, .. } => name,
+        }
+    }
+
+    fn total_size(self) -> u64 {
+        match self {
+            FsNode.File { size, .. } => *size,
+            FsNode.Dir { children, .. } => {
+                children.iter().map(|c| c.total_size()).sum()
+            }
+        }
+    }
+
+    fn is_dir(self) -> bool { matches!(self, FsNode.Dir { .. }) }
+
+    fn child_count(self) -> usize {
+        match self {
+            FsNode.Dir { children, .. } => children.len(),
+            _ => 0,
+        }
+    }
+}
+
+struct FileSystem {
+    root: FsNode,
+}
+
+impl FileSystem {
+    fn new() -> FileSystem {
+        FileSystem { root: FsNode.Dir { name: "/".into(), children: [] } }
+    }
+
+    fn from_commands(lines: &[string]) -> FileSystem {
+        let mut fs = FileSystem.new()
+        let mut path: [string] = []
+        let mut i = 0
+
+        while i < lines.len() {
+            let line = &lines[i]
+            if line.starts_with("$ cd") {
+                let target = &line[5..]
+                match target {
+                    "/" => { path.clear() }
+                    ".." => { path.pop(); }
+                    dir => { path.push(dir.into()) }
+                }
+                i += 1
+            } else if line == "$ ls" {
+                i += 1
+                while i < lines.len() && !lines[i].starts_with("$") {
+                    let entry = &lines[i]
+                    if entry.starts_with("dir ") {
+                        let name = entry[4..].into()
+                        fs.mkdir(&path, &name)
+                    } else {
+                        let parts: [&str] = entry.split(' ').collect()
+                        let size: u64 = parts[0].parse().unwrap()
+                        let name = parts[1].into()
+                        fs.add_file(&path, &name, size)
+                    }
+                    i += 1
+                }
+            } else {
+                i += 1
+            }
+        }
+        fs
+    }
+
+    fn get_dir_mut(mut self, path: &[string]) -> &mut [FsNode] {
+        let mut current = match &mut self.root {
+            FsNode.Dir { children, .. } => children,
+            _ => panic("root not dir"),
+        }
+        for segment in path {
+            let found = current.iter_mut().find(|c| c.name() == segment && c.is_dir())
+            current = match found {
+                Some(FsNode.Dir { children, .. }) => children,
+                _ => panic("dir not found"),
+            }
+        }
+        current
+    }
+
+    fn mkdir(mut self, path: &[string], name: &str) {
+        let children = self.get_dir_mut(path)
+        if !children.iter().any(|c| c.name() == name && c.is_dir()) {
+            children.push(FsNode.Dir { name: name.into(), children: [] })
+        }
+    }
+
+    fn add_file(mut self, path: &[string], name: &str, size: u64) {
+        let children = self.get_dir_mut(path)
+        children.push(FsNode.File { name: name.into(), size })
+    }
+
+    fn total_size(self) -> u64 { self.root.total_size() }
+
+    fn all_dir_sizes(self) -> [(string, u64)] {
+        let mut result = []
+        FileSystem.collect_sizes(&self.root, "/".into(), &mut result)
+        result
+    }
+
+    fn collect_sizes(node: &FsNode, path: string, result: &mut [(string, u64)]) {
+        if let FsNode.Dir { children, name, .. } = node {
+            let size = node.total_size()
+            result.push((path.clone(), size))
+            for child in children {
+                if child.is_dir() {
+                    let child_path = format!("{}{}/", path, child.name())
+                    FileSystem.collect_sizes(child, child_path, result)
+                }
+            }
+        }
+    }
+
+    fn dirs_under_size(self, max_size: u64) -> [(string, u64)] {
+        self.all_dir_sizes().into_iter()
+            .filter(|(_, size)| *size <= max_size)
+            .collect()
+    }
+
+    fn smallest_dir_at_least(self, min_size: u64) -> Option<(string, u64)> {
+        self.all_dir_sizes().into_iter()
+            .filter(|(_, size)| *size >= min_size)
+            .min_by_key(|(_, size)| *size)
+    }
+}
+
+fn main() {
+    let commands = [
+        "$ cd /".into(),
+        "$ ls".into(),
+        "dir a".into(),
+        "14848514 b.txt".into(),
+        "8504156 c.dat".into(),
+        "dir d".into(),
+        "$ cd a".into(),
+        "$ ls".into(),
+        "dir e".into(),
+        "29116 f".into(),
+        "2557 g".into(),
+        "62596 h.lst".into(),
+        "$ cd e".into(),
+        "$ ls".into(),
+        "584 i".into(),
+        "$ cd ..".into(),
+        "$ cd ..".into(),
+        "$ cd d".into(),
+        "$ ls".into(),
+        "4060174 j".into(),
+        "8033020 d.log".into(),
+        "5626152 d.ext".into(),
+        "7214296 k".into(),
+    ]
+
+    let fs = FileSystem.from_commands(&commands)
+
+    // Total size
+    let total = fs.total_size()
+    assert(total == 48381165)
+    print("Total size ✓")
+
+    // Dir sizes
+    let dirs = fs.all_dir_sizes()
+    assert(dirs.len() == 4)  // /, a, e, d
+    print("Dir count ✓")
+
+    // Part 1: Sum of dirs with size <= 100000
+    let small = fs.dirs_under_size(100000)
+    let sum: u64 = small.iter().map(|(_, s)| *s).sum()
+    assert(sum == 95437)
+    print("Part 1 ✓")
+
+    // Part 2: Smallest dir to free space
+    let disk_total: u64 = 70000000
+    let needed: u64 = 30000000
+    let used = fs.total_size()
+    let free = disk_total - used
+    let must_free = needed - free
+    let (name, size) = fs.smallest_dir_at_least(must_free).unwrap()
+    assert(size == 24933642)
+    print("Part 2 ✓")
+
+    // FsNode properties
+    let file = FsNode.File { name: "test.txt".into(), size: 100 }
+    assert(!file.is_dir())
+    assert(file.total_size() == 100)
+    assert(file.child_count() == 0)
+    print("File node ✓")
+
+    let dir = FsNode.Dir { name: "test_dir".into(), children: [
+        FsNode.File { name: "a.txt".into(), size: 50 },
+        FsNode.File { name: "b.txt".into(), size: 75 },
+    ] }
+    assert(dir.is_dir())
+    assert(dir.total_size() == 125)
+    assert(dir.child_count() == 2)
+    print("Dir node ✓")
+
+    // Empty dir
+    let empty = FsNode.Dir { name: "empty".into(), children: [] }
+    assert(empty.total_size() == 0)
+    assert(empty.child_count() == 0)
+    print("Empty dir ✓")
+
+    print("AoC Day 7 complete ✓")
+}
