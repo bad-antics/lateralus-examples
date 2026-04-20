@@ -1,0 +1,224 @@
+
+// Key-Value Store with TTL and Persistence
+// In-memory KV store supporting expiration, snapshots, and basic transactions.
+
+use std.time.{Instant, Duration}
+use std.collections.HashMap
+
+struct Entry {
+    value: string,
+    created_at: u64,
+    expires_at: Option<u64>,
+    version: u64,
+}
+
+impl Entry {
+    fn is_expired(self, now: u64) -> bool {
+        match self.expires_at {
+            Some(t) => now >= t,
+            None => false,
+        }
+    }
+}
+
+struct KvStore {
+    data: HashMap<string, Entry>,
+    snapshots: [(u64, HashMap<string, Entry>)],
+    tx_buffer: Option<HashMap<string, Option<Entry>>>,
+    clock: u64,
+    version_counter: u64,
+}
+
+impl KvStore {
+    fn new() -> KvStore {
+        KvStore {
+            data: HashMap.new(), snapshots: [], tx_buffer: None,
+            clock: 0, version_counter: 0,
+        }
+    }
+
+    fn tick(mut self, dt: u64) { self.clock += dt }
+
+    fn set(mut self, key: &str, value: &str) {
+        self.version_counter += 1
+        let entry = Entry { value: value.into(), created_at: self.clock, expires_at: None, version: self.version_counter }
+        if let Some(ref mut buf) = self.tx_buffer {
+            buf.insert(key.into(), Some(entry))
+        } else {
+            self.data.insert(key.into(), entry)
+        }
+    }
+
+    fn set_with_ttl(mut self, key: &str, value: &str, ttl: u64) {
+        self.version_counter += 1
+        let entry = Entry {
+            value: value.into(), created_at: self.clock,
+            expires_at: Some(self.clock + ttl), version: self.version_counter,
+        }
+        if let Some(ref mut buf) = self.tx_buffer {
+            buf.insert(key.into(), Some(entry))
+        } else {
+            self.data.insert(key.into(), entry)
+        }
+    }
+
+    fn get(self, key: &str) -> Option<&str> {
+        if let Some(entry) = self.data.get(key) {
+            if !entry.is_expired(self.clock) { return Some(&entry.value) }
+        }
+        None
+    }
+
+    fn delete(mut self, key: &str) -> bool {
+        if let Some(ref mut buf) = self.tx_buffer {
+            buf.insert(key.into(), None)
+            return true
+        }
+        self.data.remove(key).is_some()
+    }
+
+    fn exists(self, key: &str) -> bool { self.get(key).is_some() }
+
+    fn keys(self) -> [string] {
+        self.data.iter()
+            .filter(|(_, v)| !v.is_expired(self.clock))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    fn len(self) -> usize { self.keys().len() }
+
+    fn gc(mut self) {
+        let expired: [string] = self.data.iter()
+            .filter(|(_, v)| v.is_expired(self.clock))
+            .map(|(k, _)| k.clone())
+            .collect()
+        for k in expired { self.data.remove(&k) }
+    }
+
+    fn snapshot(mut self) -> u64 {
+        let id = self.snapshots.len() as u64
+        self.snapshots.push((self.clock, self.data.clone()))
+        id
+    }
+
+    fn restore(mut self, id: u64) -> bool {
+        if (id as usize) < self.snapshots.len() {
+            self.data = self.snapshots[id as usize].1.clone()
+            true
+        } else { false }
+    }
+
+    fn begin(mut self) {
+        assert(self.tx_buffer.is_none())
+        self.tx_buffer = Some(HashMap.new())
+    }
+
+    fn commit(mut self) {
+        if let Some(buf) = self.tx_buffer.take() {
+            for (key, entry_opt) in buf {
+                match entry_opt {
+                    Some(entry) => { self.data.insert(key, entry); }
+                    None => { self.data.remove(&key); }
+                }
+            }
+        }
+    }
+
+    fn rollback(mut self) { self.tx_buffer = None }
+
+    fn get_version(self, key: &str) -> Option<u64> {
+        self.data.get(key).map(|e| e.version)
+    }
+
+    fn increment(mut self, key: &str) -> i64 {
+        let current = self.get(key)
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0)
+        let next = current + 1
+        self.set(key, &next.to_string())
+        next
+    }
+}
+
+fn main() {
+    let mut kv = KvStore.new()
+
+    // Basic set/get
+    kv.set("name", "lateralus")
+    assert(kv.get("name") == Some("lateralus"))
+    assert(kv.get("missing").is_none())
+    print("Set/Get ✓")
+
+    // Delete
+    assert(kv.delete("name"))
+    assert(!kv.exists("name"))
+    assert(!kv.delete("missing"))
+    print("Delete ✓")
+
+    // TTL
+    kv.set_with_ttl("temp", "value", 10)
+    assert(kv.get("temp") == Some("value"))
+    kv.tick(11)
+    assert(kv.get("temp").is_none())
+    print("TTL ✓")
+
+    // Keys & len
+    kv.set("a", "1")
+    kv.set("b", "2")
+    assert(kv.len() == 2)
+    let keys = kv.keys()
+    assert(keys.contains(&"a".into()))
+    assert(keys.contains(&"b".into()))
+    print("Keys/Len ✓")
+
+    // GC
+    kv.set_with_ttl("expire_me", "x", 5)
+    kv.tick(6)
+    kv.gc()
+    assert(!kv.data.contains_key("expire_me"))
+    print("GC ✓")
+
+    // Snapshots
+    kv.set("snap_key", "before")
+    let sid = kv.snapshot()
+    kv.set("snap_key", "after")
+    assert(kv.get("snap_key") == Some("after"))
+    kv.restore(sid)
+    assert(kv.get("snap_key") == Some("before"))
+    print("Snapshot ✓")
+
+    // Transactions
+    kv.set("tx_key", "original")
+    kv.begin()
+    kv.set("tx_key", "modified")
+    kv.rollback()
+    assert(kv.get("tx_key") == Some("original"))
+    print("Rollback ✓")
+
+    kv.begin()
+    kv.set("tx_key", "committed")
+    kv.delete("a")
+    kv.commit()
+    assert(kv.get("tx_key") == Some("committed"))
+    assert(!kv.exists("a"))
+    print("Commit ✓")
+
+    // Versioning
+    kv.set("v", "one")
+    let v1 = kv.get_version("v").unwrap()
+    kv.set("v", "two")
+    let v2 = kv.get_version("v").unwrap()
+    assert(v2 > v1)
+    print("Versioning ✓")
+
+    // Increment
+    kv.set("counter", "10")
+    let val = kv.increment("counter")
+    assert(val == 11)
+    let val2 = kv.increment("new_counter")
+    assert(val2 == 1)
+    print("Increment ✓")
+
+    print("Key-value store complete ✓")
+}
