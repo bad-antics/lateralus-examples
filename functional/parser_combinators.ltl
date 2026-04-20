@@ -1,0 +1,318 @@
+
+// Parser Combinators Library
+// Monadic parser combinators for building recursive descent parsers.
+
+#[derive(Clone, Debug)]
+struct ParseState {
+    input: string,
+    pos: usize,
+}
+
+impl ParseState {
+    fn new(input: &str) -> ParseState { ParseState { input: input.into(), pos: 0 } }
+    fn remaining(self) -> &str { &self.input[self.pos..] }
+    fn is_eof(self) -> bool { self.pos >= self.input.len() }
+    fn advance(self, n: usize) -> ParseState { ParseState { input: self.input.clone(), pos: self.pos + n } }
+}
+
+#[derive(Clone, Debug)]
+enum ParseResult<T> {
+    Ok(T, ParseState),
+    Err(string, ParseState),
+}
+
+impl<T> ParseResult<T> {
+    fn is_ok(self) -> bool { matches!(self, ParseResult.Ok(..)) }
+    fn is_err(self) -> bool { matches!(self, ParseResult.Err(..)) }
+    fn unwrap(self) -> (T, ParseState) {
+        match self { ParseResult.Ok(v, s) => (v, s), ParseResult.Err(e, _) => panic(e) }
+    }
+    fn value(self) -> Option<T> {
+        match self { ParseResult.Ok(v, _) => some(v), _ => none }
+    }
+}
+
+// Core parser type: a function from ParseState to ParseResult
+type Parser<T> = fn(ParseState) -> ParseResult<T>
+
+// Primitive parsers
+fn char_p(expected: char) -> Parser<char> {
+    |state| {
+        if state.is_eof() { return ParseResult.Err(format!("expected '{}', got EOF", expected), state) }
+        let ch = state.remaining().chars().next().unwrap()
+        if ch == expected { ParseResult.Ok(ch, state.advance(ch.len_utf8())) }
+        else { ParseResult.Err(format!("expected '{}', got '{}'", expected, ch), state) }
+    }
+}
+
+fn string_p(expected: &str) -> Parser<string> {
+    let exp = expected.to_string()
+    move |state| {
+        if state.remaining().starts_with(&exp) {
+            ParseResult.Ok(exp.clone(), state.advance(exp.len()))
+        } else {
+            ParseResult.Err(format!("expected \"{}\"", exp), state)
+        }
+    }
+}
+
+fn satisfy(pred: fn(char) -> bool, desc: &str) -> Parser<char> {
+    let d = desc.to_string()
+    move |state| {
+        if state.is_eof() { return ParseResult.Err(format!("expected {}, got EOF", d), state) }
+        let ch = state.remaining().chars().next().unwrap()
+        if pred(ch) { ParseResult.Ok(ch, state.advance(ch.len_utf8())) }
+        else { ParseResult.Err(format!("expected {}, got '{}'", d, ch), state) }
+    }
+}
+
+fn digit() -> Parser<char> { satisfy(|c| c.is_ascii_digit(), "digit") }
+fn letter() -> Parser<char> { satisfy(|c| c.is_alphabetic(), "letter") }
+fn whitespace() -> Parser<char> { satisfy(|c| c.is_whitespace(), "whitespace") }
+
+fn any_char() -> Parser<char> {
+    |state| {
+        if state.is_eof() { ParseResult.Err("unexpected EOF".into(), state) }
+        else {
+            let ch = state.remaining().chars().next().unwrap()
+            ParseResult.Ok(ch, state.advance(ch.len_utf8()))
+        }
+    }
+}
+
+fn eof() -> Parser<()> {
+    |state| {
+        if state.is_eof() { ParseResult.Ok((), state) }
+        else { ParseResult.Err("expected EOF".into(), state) }
+    }
+}
+
+// Combinators
+fn map<A, B>(parser: Parser<A>, f: fn(A) -> B) -> Parser<B> {
+    move |state| {
+        match parser(state) {
+            ParseResult.Ok(v, s) => ParseResult.Ok(f(v), s),
+            ParseResult.Err(e, s) => ParseResult.Err(e, s),
+        }
+    }
+}
+
+fn and_then<A, B>(pa: Parser<A>, pb: Parser<B>) -> Parser<(A, B)> {
+    move |state| {
+        match pa(state) {
+            ParseResult.Ok(a, s1) => match pb(s1) {
+                ParseResult.Ok(b, s2) => ParseResult.Ok((a, b), s2),
+                ParseResult.Err(e, s) => ParseResult.Err(e, s),
+            },
+            ParseResult.Err(e, s) => ParseResult.Err(e, s),
+        }
+    }
+}
+
+fn or_else<T>(pa: Parser<T>, pb: Parser<T>) -> Parser<T> {
+    move |state| {
+        match pa(state.clone()) {
+            ParseResult.Ok(v, s) => ParseResult.Ok(v, s),
+            ParseResult.Err(_, _) => pb(state),
+        }
+    }
+}
+
+fn many<T>(parser: Parser<T>) -> Parser<[T]> {
+    move |state| {
+        let mut results: [T] = vec![]
+        let mut current = state
+        loop {
+            match parser(current.clone()) {
+                ParseResult.Ok(v, s) => { results.push(v); current = s },
+                ParseResult.Err(_, _) => break,
+            }
+        }
+        ParseResult.Ok(results, current)
+    }
+}
+
+fn many1<T>(parser: Parser<T>) -> Parser<[T]> {
+    move |state| {
+        match many(parser)(state.clone()) {
+            ParseResult.Ok(v, s) if !v.is_empty() => ParseResult.Ok(v, s),
+            _ => ParseResult.Err("expected at least one".into(), state),
+        }
+    }
+}
+
+fn sep_by<T, S>(parser: Parser<T>, sep: Parser<S>) -> Parser<[T]> {
+    move |state| {
+        match parser(state.clone()) {
+            ParseResult.Err(_, _) => ParseResult.Ok(vec![], state),
+            ParseResult.Ok(first, s1) => {
+                let mut results = vec![first]
+                let mut current = s1
+                loop {
+                    match sep(current.clone()) {
+                        ParseResult.Err(_, _) => break,
+                        ParseResult.Ok(_, s2) => match parser(s2) {
+                            ParseResult.Ok(v, s3) => { results.push(v); current = s3 },
+                            ParseResult.Err(_, _) => break,
+                        },
+                    }
+                }
+                ParseResult.Ok(results, current)
+            },
+        }
+    }
+}
+
+fn between<L, T, R>(left: Parser<L>, inner: Parser<T>, right: Parser<R>) -> Parser<T> {
+    move |state| {
+        match left(state) {
+            ParseResult.Err(e, s) => ParseResult.Err(e, s),
+            ParseResult.Ok(_, s1) => match inner(s1) {
+                ParseResult.Err(e, s) => ParseResult.Err(e, s),
+                ParseResult.Ok(v, s2) => match right(s2) {
+                    ParseResult.Err(e, s) => ParseResult.Err(e, s),
+                    ParseResult.Ok(_, s3) => ParseResult.Ok(v, s3),
+                },
+            },
+        }
+    }
+}
+
+fn skip_many(parser: Parser<impl Any>) -> Parser<()> {
+    move |state| {
+        let mut current = state
+        loop {
+            match parser(current.clone()) {
+                ParseResult.Ok(_, s) => current = s,
+                ParseResult.Err(_, _) => break,
+            }
+        }
+        ParseResult.Ok((), current)
+    }
+}
+
+// Utility: parse a natural number
+fn natural() -> Parser<i64> {
+    map(many1(digit()), |digits| {
+        let s: string = digits.iter().collect()
+        s.parse::<i64>().unwrap()
+    })
+}
+
+// Utility: parse an identifier
+fn identifier() -> Parser<string> {
+    move |state| {
+        let first = or_else(letter(), char_p('_'))
+        let rest = many(or_else(or_else(letter(), digit()), char_p('_')))
+        match and_then(first, rest)(state) {
+            ParseResult.Ok(((f, rs), s)) => {
+                let mut name = String.new()
+                name.push(f)
+                for ch in rs { name.push(ch) }
+                ParseResult.Ok(name, s)
+            },
+            ParseResult.Err(e, s) => ParseResult.Err(e, s),
+        }
+    }
+}
+
+fn main() {
+    // Char parser
+    let state = ParseState.new("abc")
+    let r = char_p('a')(state)
+    assert(r.is_ok())
+    let (ch, s) = r.unwrap()
+    assert(ch == 'a')
+    assert(s.remaining() == "bc")
+    print("char_p ✓")
+
+    // String parser
+    let r2 = string_p("hello")(ParseState.new("hello world"))
+    assert(r2.is_ok())
+    assert(r2.value() == some("hello".into()))
+    print("string_p ✓")
+
+    // Failure
+    let r3 = char_p('x')(ParseState.new("abc"))
+    assert(r3.is_err())
+    print("Failure ✓")
+
+    // Digit
+    let r4 = digit()(ParseState.new("5abc"))
+    assert(r4.is_ok())
+    assert(r4.value() == some('5'))
+    print("digit ✓")
+
+    // Many
+    let r5 = many(digit())(ParseState.new("123abc"))
+    let (digits, s5) = r5.unwrap()
+    assert(digits == vec!['1', '2', '3'])
+    assert(s5.remaining() == "abc")
+    print("many ✓")
+
+    // many1
+    let r6 = many1(digit())(ParseState.new("abc"))
+    assert(r6.is_err())
+    print("many1 fail ✓")
+
+    // Natural number
+    let r7 = natural()(ParseState.new("42rest"))
+    assert(r7.value() == some(42))
+    print("natural ✓")
+
+    // Or
+    let alpha_or_digit = or_else(letter(), digit())
+    assert(alpha_or_digit(ParseState.new("a")).is_ok())
+    assert(alpha_or_digit(ParseState.new("5")).is_ok())
+    assert(alpha_or_digit(ParseState.new("!")).is_err())
+    print("or_else ✓")
+
+    // Between
+    let parens = between(char_p('('), natural(), char_p(')'))
+    let r8 = parens(ParseState.new("(99)"))
+    assert(r8.value() == some(99))
+    print("between ✓")
+
+    // sep_by
+    let csv = sep_by(natural(), char_p(','))
+    let r9 = csv(ParseState.new("1,2,3"))
+    let (nums, _) = r9.unwrap()
+    assert(nums == vec![1, 2, 3])
+    print("sep_by ✓")
+
+    // Identifier
+    let r10 = identifier()(ParseState.new("foo_bar123 rest"))
+    assert(r10.value() == some("foo_bar123".into()))
+    print("identifier ✓")
+
+    // EOF
+    assert(eof()(ParseState.new("")).is_ok())
+    assert(eof()(ParseState.new("a")).is_err())
+    print("eof ✓")
+
+    // Map
+    let upper_a = map(char_p('a'), |_| 'A')
+    assert(upper_a(ParseState.new("a")).value() == some('A'))
+    print("map ✓")
+
+    // And_then
+    let ab = and_then(char_p('a'), char_p('b'))
+    let r11 = ab(ParseState.new("ab"))
+    assert(r11.value() == some(('a', 'b')))
+    print("and_then ✓")
+
+    // ParseState
+    let ps = ParseState.new("hello")
+    assert(ps.remaining() == "hello")
+    assert(!ps.is_eof())
+    let ps2 = ps.advance(5)
+    assert(ps2.is_eof())
+    print("ParseState ✓")
+
+    // Empty sep_by
+    let r12 = csv(ParseState.new("abc"))
+    assert(r12.value() == some(vec![]))
+    print("sep_by empty ✓")
+
+    print("Parser Combinators complete ✓")
+}
