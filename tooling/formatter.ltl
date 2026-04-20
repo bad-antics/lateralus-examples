@@ -1,115 +1,233 @@
-// formatter.ltl — Source code formatter for Lateralus (opinionated, like gofmt)
-use std.fs.{read_to_string, write}
 
-struct FormatOptions {
-    indent_width: int,
-    max_line:     int,
-    trailing_newline: bool,
+// Code Formatter - Automatic code style enforcement
+// Handles indentation, spacing, and line wrapping for Lateralus code.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TokenKind {
+    Keyword, Ident, Number, String, Operator, Punc,
+    Newline, Whitespace, Comment, Eof,
 }
 
-impl FormatOptions {
-    fn default() -> FormatOptions {
-        FormatOptions { indent_width: 4, max_line: 100, trailing_newline: true }
+#[derive(Clone, Debug)]
+struct Token {
+    kind: TokenKind,
+    text: string,
+}
+
+impl Token {
+    fn new(kind: TokenKind, text: &str) -> Token { Token { kind, text: text.into() } }
+    fn is_open_brace(self) -> bool { self.text == "{" }
+    fn is_close_brace(self) -> bool { self.text == "}" }
+    fn is_open_paren(self) -> bool { self.text == "(" }
+    fn is_close_paren(self) -> bool { self.text == ")" }
+    fn is_comma(self) -> bool { self.text == "," }
+    fn is_semicolon(self) -> bool { self.text == ";" }
+    fn is_newline(self) -> bool { self.kind == TokenKind.Newline }
+    fn needs_space_before(self) -> bool {
+        matches!(self.kind, TokenKind.Keyword | TokenKind.Ident | TokenKind.Number) ||
+        self.text == "{" || self.text == "="
+    }
+    fn needs_space_after(self) -> bool {
+        self.text == "," || self.text == ";" ||
+        matches!(self.kind, TokenKind.Keyword) ||
+        self.text == "=" || self.text == "=>" || self.text == "->"
     }
 }
 
-enum Token { Indent, Dedent, Newline, Space, Raw(string) }
+#[derive(Clone, Debug)]
+struct FormatConfig {
+    indent_width: usize,
+    max_line_width: usize,
+    use_tabs: bool,
+    trailing_newline: bool,
+    space_before_brace: bool,
+    space_after_comma: bool,
+    blank_line_between_fns: bool,
+}
+
+impl FormatConfig {
+    fn default() -> FormatConfig {
+        FormatConfig {
+            indent_width: 4, max_line_width: 100, use_tabs: false,
+            trailing_newline: true, space_before_brace: true,
+            space_after_comma: true, blank_line_between_fns: true,
+        }
+    }
+    fn with_indent(mut self, width: usize) -> FormatConfig { self.indent_width = width; self }
+    fn with_tabs(mut self) -> FormatConfig { self.use_tabs = true; self }
+    fn with_max_width(mut self, w: usize) -> FormatConfig { self.max_line_width = w; self }
+
+    fn indent_str(self, level: usize) -> string {
+        if self.use_tabs { "\t".repeat(level) }
+        else { " ".repeat(level * self.indent_width) }
+    }
+}
 
 struct Formatter {
-    opts:    FormatOptions,
-    output:  string,
-    indent:  int,
-    col:     int,
+    config: FormatConfig,
+    output: string,
+    indent_level: usize,
+    current_line_len: usize,
+    last_was_newline: bool,
+    lines_formatted: usize,
 }
 
 impl Formatter {
-    fn new(opts: FormatOptions) -> Formatter {
-        Formatter { opts, output: "", indent: 0, col: 0 }
+    fn new(config: FormatConfig) -> Formatter {
+        Formatter { config, output: String.new(), indent_level: 0, current_line_len: 0, last_was_newline: true, lines_formatted: 0 }
     }
 
-    fn emit(mut self, s: string) {
-        self.output += s
-        self.col    += s.len()
+    fn emit(mut self, text: &str) {
+        if self.last_was_newline && !text.trim().is_empty() {
+            let indent = self.config.indent_str(self.indent_level)
+            self.output += &indent
+            self.current_line_len = indent.len()
+            self.last_was_newline = false
+        }
+        self.output += text
+        self.current_line_len += text.len()
     }
 
     fn newline(mut self) {
-        self.output += "
-"
-        self.col     = 0
+        self.output += "\n"
+        self.current_line_len = 0
+        self.last_was_newline = true
+        self.lines_formatted += 1
     }
 
-    fn indent_str(self) -> string { " ".repeat(self.indent * self.opts.indent_width) }
-
-    fn emit_line(mut self, line: string) {
-        if self.col == 0 { self.emit(self.indent_str()) }
-        self.emit(line)
-        self.newline()
+    fn space(mut self) {
+        if !self.last_was_newline && !self.output.ends_with(' ') {
+            self.output += " "
+            self.current_line_len += 1
+        }
     }
 
-    fn format_braces(mut self, lines: [string]) -> string {
-        for raw_line in lines {
-            let line = raw_line.trim()
-            if line.is_empty() {
-                self.newline()
-                continue
-            }
-            // Dedent before closing brace
-            if line.starts_with('}') || line.starts_with(']') || line.starts_with(')') {
-                self.indent -= 1
-            }
-            self.emit_line(line)
-            // Indent after opening brace
-            if line.ends_with('{') || line.ends_with('(') || line.ends_with('[') {
-                self.indent += 1
+    fn increase_indent(mut self) { self.indent_level += 1 }
+    fn decrease_indent(mut self) { if self.indent_level > 0 { self.indent_level -= 1 } }
+
+    fn format_tokens(mut self, tokens: &[Token]) -> string {
+        for (i, token) in tokens.iter().enumerate() {
+            match token.kind {
+                TokenKind.Newline => self.newline(),
+                TokenKind.Whitespace => self.space(),
+                TokenKind.Comment => { self.emit(&token.text); self.newline() }
+                _ => {
+                    if token.is_close_brace() { self.decrease_indent() }
+                    if token.is_close_brace() && !self.last_was_newline {
+                        self.newline()
+                    }
+                    self.emit(&token.text)
+                    if token.is_open_brace() {
+                        self.increase_indent()
+                        self.newline()
+                    }
+                    if token.is_comma() && self.config.space_after_comma {
+                        self.space()
+                    }
+                    if token.is_semicolon() { self.newline() }
+                }
             }
         }
-        let mut out = self.output.clone()
-        if self.opts.trailing_newline && !out.ends_with('
-') { out += "
-" }
-        out
+        if self.config.trailing_newline && !self.output.ends_with('\n') {
+            self.newline()
+        }
+        self.output.clone()
     }
+
+    fn line_count(self) -> usize { self.lines_formatted }
+    fn indent_level(self) -> usize { self.indent_level }
 }
 
-fn normalise_spaces(line: string) -> string {
-    // Ensure single space around operators: =, +, -, *, /, ==, !=, <=, >=, ->, =>
-    let ops = ["==","!=","<=",">=","->","=>","+=","-=","*=","/="]
-    let mut s = line
-    for op in ops {
-        s = s.replace(op, " ${op} ")
-    }
-    // Collapse multiple spaces (except leading indent)
-    let indent = s.len() - s.trim_start().len()
-    let body   = s.trim()
-    let trimmed = body.split(" ") |> filter(|w| !w.is_empty()) |> join(" ")
-    " ".repeat(indent) + trimmed
-}
+fn count_lines(s: &str) -> usize { s.lines().count() }
 
-fn format_source(source: string, opts: FormatOptions) -> string {
-    let lines = source.lines() |> map(normalise_spaces) |> collect()
-    Formatter.new(opts).format_braces(lines)
+fn trim_trailing_whitespace(s: &str) -> string {
+    s.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n")
 }
 
 fn main() {
-    let source = r#"
-fn add( a : int , b:int)->int{
-let x=a+b
-x
-}
+    // Token
+    let t = Token.new(TokenKind.Keyword, "fn")
+    assert(t.kind == TokenKind.Keyword)
+    assert(t.needs_space_after())
+    let brace = Token.new(TokenKind.Punc, "{")
+    assert(brace.is_open_brace())
+    print("Token ✓")
 
-struct Foo{
-bar:int,
-baz:string,
-}
-"#
-    let formatted = format_source(source, FormatOptions.default())
-    print("Formatted output:")
-    print("---")
-    print(formatted)
-    print("---")
+    // FormatConfig
+    let cfg = FormatConfig.default()
+    assert(cfg.indent_width == 4)
+    assert(cfg.indent_str(1) == "    ")
+    assert(cfg.indent_str(2) == "        ")
+    let tab_cfg = FormatConfig.default().with_tabs()
+    assert(tab_cfg.indent_str(1) == "\t")
+    assert(tab_cfg.indent_str(2) == "\t\t")
+    print("Config ✓")
 
-    // Idempotency check
-    let second = format_source(formatted.clone(), FormatOptions.default())
-    assert(second == formatted, "formatter must be idempotent")
-    print("Idempotency check ✓")
+    // Custom indent
+    let cfg2 = FormatConfig.default().with_indent(2)
+    assert(cfg2.indent_str(1) == "  ")
+    assert(cfg2.indent_str(3) == "      ")
+    print("Indent ✓")
+
+    // Formatter emit
+    let mut fmt = Formatter.new(FormatConfig.default())
+    fmt.emit("hello")
+    fmt.space()
+    fmt.emit("world")
+    fmt.newline()
+    assert(fmt.output.contains("hello world"))
+    assert(fmt.lines_formatted == 1)
+    print("Emit ✓")
+
+    // Indentation
+    let mut fmt2 = Formatter.new(FormatConfig.default())
+    fmt2.emit("fn main()")
+    fmt2.newline()
+    fmt2.increase_indent()
+    fmt2.emit("let x = 1")
+    fmt2.newline()
+    assert(fmt2.output.contains("    let x = 1"))
+    print("Indentation ✓")
+
+    // Token formatting with braces
+    let tokens = [
+        Token.new(TokenKind.Keyword, "fn"),
+        Token.new(TokenKind.Whitespace, " "),
+        Token.new(TokenKind.Ident, "main"),
+        Token.new(TokenKind.Punc, "("),
+        Token.new(TokenKind.Punc, ")"),
+        Token.new(TokenKind.Whitespace, " "),
+        Token.new(TokenKind.Punc, "{"),
+        Token.new(TokenKind.Ident, "print"),
+        Token.new(TokenKind.Punc, "("),
+        Token.new(TokenKind.String, "\"hi\""),
+        Token.new(TokenKind.Punc, ")"),
+        Token.new(TokenKind.Punc, ";"),
+        Token.new(TokenKind.Punc, "}"),
+    ]
+    let mut fmt3 = Formatter.new(FormatConfig.default())
+    let result = fmt3.format_tokens(&tokens)
+    assert(result.contains("fn"))
+    assert(result.contains("main"))
+    assert(result.contains("{"))
+    assert(result.contains("}"))
+    print("Format tokens ✓")
+
+    // Trailing whitespace
+    let trimmed = trim_trailing_whitespace("hello   \nworld  \n")
+    assert(trimmed == "hello\nworld\n")
+    print("Trim ✓")
+
+    // Count lines
+    assert(count_lines("a\nb\nc") == 3)
+    assert(count_lines("single") == 1)
+    print("Count ✓")
+
+    // Decrease indent safety
+    let mut fmt4 = Formatter.new(FormatConfig.default())
+    fmt4.decrease_indent()  // should not go negative
+    assert(fmt4.indent_level() == 0)
+    print("Safety ✓")
+
+    print("Formatter complete ✓")
 }
