@@ -1,0 +1,139 @@
+// Advent of Code - Day 3 Style Puzzle
+// Rucksack reorganization: find common items and compute priorities.
+
+use std.collections.HashSet
+
+fn priority(c: char) -> i64 {
+    if c >= 'a' && c <= 'z' {
+        (c as i64) - ('a' as i64) + 1
+    } else if c >= 'A' && c <= 'Z' {
+        (c as i64) - ('A' as i64) + 27
+    } else {
+        0
+    }
+}
+
+fn find_common_in_halves(line: &str) -> Option<char> {
+    let mid = line.len() / 2
+    let first: HashSet<char> = line[..mid].chars().collect()
+    let second: HashSet<char> = line[mid..].chars().collect()
+    first.intersection(&second).next().copied()
+}
+
+fn part1(input: &str) -> i64 {
+    input.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            match find_common_in_halves(line.trim()) {
+                some(c) => priority(c),
+                none => 0,
+            }
+        })
+        .sum()
+}
+
+fn find_badge(group: &[&str]) -> Option<char> {
+    if group.len() != 3 { return none }
+    let s0: HashSet<char> = group[0].chars().collect()
+    let s1: HashSet<char> = group[1].chars().collect()
+    let s2: HashSet<char> = group[2].chars().collect()
+    s0.iter()
+        .filter(|c| s1.contains(c) && s2.contains(c))
+        .next()
+        .copied()
+}
+
+fn part2(input: &str) -> i64 {
+    let lines: [&str] = input.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim())
+        .collect()
+    lines.chunks(3)
+        .map(|group| {
+            match find_badge(group) {
+                some(c) => priority(c),
+                none => 0,
+            }
+        })
+        .sum()
+}
+
+fn unique_items(s: &str) -> HashSet<char> {
+    s.chars().collect()
+}
+
+fn common_items(a: &str, b: &str) -> HashSet<char> {
+    let sa: HashSet<char> = a.chars().collect()
+    let sb: HashSet<char> = b.chars().collect()
+    sa.intersection(&sb).cloned().collect()
+}
+
+fn main() {
+    // Priority
+    assert(priority('a') == 1)
+    assert(priority('z') == 26)
+    assert(priority('A') == 27)
+    assert(priority('Z') == 52)
+    assert(priority('p') == 16)
+    assert(priority('L') == 38)
+    print("Priority ✓")
+
+    let input = "vJrwpWtwJgWrhcsFMMfFFhFp
+jqHRNqRjqzjGDLGLrsFMfFZSrLrFZsSL
+PmmdzqPrVvPwwTWBwg
+wMqvLMZHhHMvwLHjbvcjnnSBnvTQFn
+ttgJtRGJQctTZtZT
+CrZsJsPPZsGzwwsLwLmpwMDw"
+
+    // Part 1
+    // vJrwpWtwJgWrhcsFMMfFFhFp -> halves: vJrwpWtwJgWr | hcsFMMfFFhFp, common: p (16)
+    assert(find_common_in_halves("vJrwpWtwJgWrhcsFMMfFFhFp") == some('p'))
+    assert(part1(input) == 157)
+    print("Part 1 ✓")
+
+    // Part 2: groups of 3
+    assert(part2(input) == 70)
+    print("Part 2 ✓")
+
+    // find_badge
+    assert(find_badge(&["vJrwpWtwJgWrhcsFMMfFFhFp",
+                        "jqHRNqRjqzjGDLGLrsFMfFZSrLrFZsSL",
+                        "PmmdzqPrVvPwwTWBwg"]) == some('r'))
+    assert(find_badge(&["wMqvLMZHhHMvwLHjbvcjnnSBnvTQFn",
+                        "ttgJtRGJQctTZtZT",
+                        "CrZsJsPPZsGzwwsLwLmpwMDw"]) == some('Z'))
+    print("Badges ✓")
+
+    // Edge cases
+    assert(find_common_in_halves("aabb") == some('a').or(some('b')))
+    assert(priority('0') == 0)
+    print("Edge cases ✓")
+
+    // unique_items
+    let u = unique_items("aabbc")
+    assert(u.len() == 3)
+    assert(u.contains(&'a'))
+    print("Unique items ✓")
+
+    // common_items
+    let c = common_items("abc", "bcd")
+    assert(c.len() == 2)
+    assert(c.contains(&'b'))
+    assert(c.contains(&'c'))
+    print("Common items ✓")
+
+    // Empty
+    assert(part1("") == 0)
+    assert(part2("") == 0)
+    print("Empty ✓")
+
+    // Single rucksack
+    assert(find_common_in_halves("abab") == some('a').or(some('b')))
+    print("Single rucksack ✓")
+
+    // All same
+    assert(find_common_in_halves("aaaa") == some('a'))
+    print("All same ✓")
+
+    print("AoC Day 3 complete ✓")
+}
