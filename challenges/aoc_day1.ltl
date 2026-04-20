@@ -1,0 +1,129 @@
+// Advent of Code - Day 1 Style Puzzle
+// Calorie counting: find elf carrying most calories, and top 3 combined.
+
+use std.collections.BinaryHeap
+
+fn parse_groups(input: &str) -> [[i64]] {
+    let mut groups = []
+    let mut current = []
+
+    for line in input.lines() {
+        let trimmed = line.trim()
+        if trimmed.is_empty() {
+            if !current.is_empty() {
+                groups.push(current.clone())
+                current.clear()
+            }
+        } else {
+            current.push(trimmed.parse::<i64>().unwrap_or(0))
+        }
+    }
+    if !current.is_empty() { groups.push(current) }
+    groups
+}
+
+fn group_sums(groups: &[[i64]]) -> [i64] {
+    groups.iter().map(|g| g.iter().sum()).collect()
+}
+
+fn max_sum(sums: &[i64]) -> i64 {
+    sums.iter().copied().max().unwrap_or(0)
+}
+
+fn top_n_sum(sums: &[i64], n: usize) -> i64 {
+    let mut sorted = sums.to_vec()
+    sorted.sort_by(|a, b| b.cmp(a))
+    sorted.iter().take(n).sum()
+}
+
+// Alternative using BinaryHeap
+fn top_n_heap(sums: &[i64], n: usize) -> i64 {
+    let mut heap = BinaryHeap.new()
+    for s in sums { heap.push(*s) }
+    let mut total: i64 = 0
+    for _ in 0..n {
+        if let some(val) = heap.pop() { total += val }
+    }
+    total
+}
+
+fn find_elf_index(sums: &[i64]) -> usize {
+    let max = max_sum(sums)
+    sums.iter().position(|s| *s == max).unwrap_or(0)
+}
+
+fn count_above_threshold(sums: &[i64], threshold: i64) -> usize {
+    sums.iter().filter(|s| **s >= threshold).count()
+}
+
+fn main() {
+    let input = "1000\n2000\n3000\n\n4000\n\n5000\n6000\n\n7000\n8000\n9000\n\n10000"
+
+    // Parse groups
+    let groups = parse_groups(input)
+    assert(groups.len() == 5)
+    assert(groups[0] == vec![1000, 2000, 3000])
+    assert(groups[1] == vec![4000])
+    assert(groups[3] == vec![7000, 8000, 9000])
+    print("Parse groups ✓")
+
+    // Group sums
+    let sums = group_sums(&groups)
+    assert(sums.len() == 5)
+    assert(sums[0] == 6000)
+    assert(sums[1] == 4000)
+    assert(sums[2] == 11000)
+    assert(sums[3] == 24000)
+    assert(sums[4] == 10000)
+    print("Group sums ✓")
+
+    // Part 1: max
+    assert(max_sum(&sums) == 24000)
+    print("Part 1 (max) ✓")
+
+    // Part 2: top 3
+    let top3 = top_n_sum(&sums, 3)
+    assert(top3 == 45000)  // 24000 + 11000 + 10000
+    print("Part 2 (top 3) ✓")
+
+    // Heap-based top 3
+    assert(top_n_heap(&sums, 3) == 45000)
+    print("Heap top 3 ✓")
+
+    // Find elf index
+    assert(find_elf_index(&sums) == 3)
+    print("Elf index ✓")
+
+    // Count above threshold
+    assert(count_above_threshold(&sums, 10000) == 3)
+    assert(count_above_threshold(&sums, 25000) == 0)
+    assert(count_above_threshold(&sums, 4000) == 4)
+    print("Threshold count ✓")
+
+    // Edge cases
+    let empty_groups = parse_groups("")
+    assert(empty_groups.is_empty())
+    assert(max_sum(&[]) == 0)
+    assert(top_n_sum(&[], 3) == 0)
+    print("Edge cases ✓")
+
+    // Single group
+    let single = parse_groups("100\n200")
+    assert(single.len() == 1)
+    assert(group_sums(&single) == vec![300])
+    print("Single group ✓")
+
+    // Top 1
+    assert(top_n_sum(&sums, 1) == 24000)
+    print("Top 1 ✓")
+
+    // Top 5 (all)
+    assert(top_n_sum(&sums, 5) == 55000)
+    print("Top all ✓")
+
+    // Top N > len
+    assert(top_n_sum(&sums, 100) == 55000)
+    print("Top overflow ✓")
+
+    print("AoC Day 1 complete ✓")
+}
