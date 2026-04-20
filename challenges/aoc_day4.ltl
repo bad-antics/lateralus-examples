@@ -1,0 +1,146 @@
+
+// Advent of Code - Day 4: Camp Cleanup
+// Find overlapping assignment pairs among elf cleaning sections.
+
+use std.collections.HashSet
+
+#[derive(Clone, Debug, PartialEq)]
+struct Range {
+    start: i32,
+    end: i32,
+}
+
+impl Range {
+    fn new(start: i32, end: i32) -> Range { Range { start, end } }
+
+    fn parse(s: &str) -> Range {
+        let parts: [&str] = s.split('-').collect()
+        assert(parts.len() == 2, "invalid range format")
+        Range.new(parts[0].parse().unwrap(), parts[1].parse().unwrap())
+    }
+
+    fn contains(self, other: &Range) -> bool {
+        self.start <= other.start && self.end >= other.end
+    }
+
+    fn overlaps(self, other: &Range) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+
+    fn len(self) -> i32 { self.end - self.start + 1 }
+
+    fn to_set(self) -> HashSet<i32> {
+        (self.start..=self.end).collect()
+    }
+
+    fn intersection(self, other: &Range) -> Option<Range> {
+        let s = max(self.start, other.start)
+        let e = min(self.end, other.end)
+        if s <= e { some(Range.new(s, e)) } else { none }
+    }
+
+    fn union(self, other: &Range) -> Option<Range> {
+        if !self.overlaps(other) && self.end + 1 != other.start && other.end + 1 != self.start {
+            return none
+        }
+        some(Range.new(min(self.start, other.start), max(self.end, other.end)))
+    }
+}
+
+fn parse_pair(line: &str) -> (Range, Range) {
+    let parts: [&str] = line.split(',').collect()
+    assert(parts.len() == 2, "invalid pair format")
+    (Range.parse(parts[0]), Range.parse(parts[1]))
+}
+
+fn count_full_overlaps(input: &str) -> usize {
+    input.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| parse_pair(l))
+        .filter(|(a, b)| a.contains(b) || b.contains(a))
+        .count()
+}
+
+fn count_any_overlaps(input: &str) -> usize {
+    input.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| parse_pair(l))
+        .filter(|(a, b)| a.overlaps(b))
+        .count()
+}
+
+fn main() {
+    let example = "2-4,6-8
+2-3,4-5
+5-7,7-9
+2-8,3-7
+6-6,4-6
+2-6,4-8"
+
+    // Part 1: fully contained pairs
+    let part1 = count_full_overlaps(example)
+    assert(part1 == 2)
+    print("Part 1: " + part1.to_string() + " fully contained pairs")
+
+    // Part 2: any overlap
+    let part2 = count_any_overlaps(example)
+    assert(part2 == 4)
+    print("Part 2: " + part2.to_string() + " overlapping pairs")
+
+    // Range parsing
+    let r = Range.parse("3-7")
+    assert(r.start == 3)
+    assert(r.end == 7)
+    assert(r.len() == 5)
+    print("Range parse ✓")
+
+    // Contains
+    let big = Range.new(2, 8)
+    let small = Range.new(3, 7)
+    assert(big.contains(&small))
+    assert(!small.contains(&big))
+    print("Contains ✓")
+
+    // Overlaps
+    assert(Range.new(5, 7).overlaps(&Range.new(7, 9)))
+    assert(!Range.new(2, 4).overlaps(&Range.new(6, 8)))
+    assert(Range.new(6, 6).overlaps(&Range.new(4, 6)))
+    print("Overlaps ✓")
+
+    // Intersection
+    let inter = Range.new(2, 6).intersection(&Range.new(4, 8))
+    assert(inter == some(Range.new(4, 6)))
+    assert(Range.new(1, 3).intersection(&Range.new(5, 7)).is_none())
+    print("Intersection ✓")
+
+    // Union
+    let u = Range.new(2, 5).union(&Range.new(4, 8))
+    assert(u == some(Range.new(2, 8)))
+    // Adjacent ranges merge
+    let u2 = Range.new(1, 3).union(&Range.new(4, 6))
+    assert(u2 == some(Range.new(1, 6)))
+    // Non-adjacent don't merge
+    assert(Range.new(1, 3).union(&Range.new(5, 7)).is_none())
+    print("Union ✓")
+
+    // to_set
+    let s = Range.new(3, 5).to_set()
+    assert(s.len() == 3)
+    assert(s.contains(&3))
+    assert(s.contains(&4))
+    assert(s.contains(&5))
+    print("to_set ✓")
+
+    // Pair parsing
+    let (a, b) = parse_pair("2-4,6-8")
+    assert(a == Range.new(2, 4))
+    assert(b == Range.new(6, 8))
+    print("parse_pair ✓")
+
+    // Edge: single section
+    assert(Range.new(5, 5).len() == 1)
+    assert(Range.new(5, 5).contains(&Range.new(5, 5)))
+    print("Single section ✓")
+
+    print("Camp Cleanup complete ✓")
+}
