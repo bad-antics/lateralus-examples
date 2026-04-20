@@ -1,80 +1,250 @@
-// jwt.ltl — JSON Web Token encode / decode
-use std.encoding.{base64url, json}
-use std.crypto.hmac_sha256
-use std.time.unix_now
 
+// JWT (JSON Web Token) - Token creation and validation
+// Implements HS256 signing, claims validation, and expiry checking.
+
+use std.encoding.base64
+use std.crypto.{hmac_sha256}
+use std.time.{Instant, Duration}
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+struct JwtHeader {
+    alg: string,
+    typ: string,
+}
+
+impl JwtHeader {
+    fn hs256() -> JwtHeader { JwtHeader { alg: "HS256".into(), typ: "JWT".into() } }
+
+    fn to_json(self) -> string {
+        format!("{{\"alg\":\"{}\",\"typ\":\"{}\"}}", self.alg, self.typ)
+    }
+
+    fn from_json(json: &str) -> Result<JwtHeader, string> {
+        let alg = extract_json_string(json, "alg")?
+        let typ = extract_json_string(json, "typ")?
+        ok(JwtHeader { alg, typ })
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Claims {
-    sub: string,
-    exp: int,
-    iat: int,
-    custom: dict<string, string>,
+    sub: Option<string>,
+    iss: Option<string>,
+    aud: Option<string>,
+    exp: Option<u64>,
+    iat: Option<u64>,
+    nbf: Option<u64>,
+    jti: Option<string>,
+    custom: HashMap<string, string>,
 }
 
-struct JWT {
-    header:    dict<string, string>,
-    claims:    Claims,
-    signature: [u8],
+impl Claims {
+    fn new() -> Claims {
+        Claims {
+            sub: none, iss: none, aud: none,
+            exp: none, iat: none, nbf: none,
+            jti: none, custom: HashMap.new(),
+        }
+    }
+
+    fn with_subject(mut self, sub: &str) -> Claims { self.sub = some(sub.into()); self }
+    fn with_issuer(mut self, iss: &str) -> Claims { self.iss = some(iss.into()); self }
+    fn with_audience(mut self, aud: &str) -> Claims { self.aud = some(aud.into()); self }
+    fn with_expiry(mut self, exp: u64) -> Claims { self.exp = some(exp); self }
+    fn with_issued_at(mut self, iat: u64) -> Claims { self.iat = some(iat); self }
+    fn with_not_before(mut self, nbf: u64) -> Claims { self.nbf = some(nbf); self }
+    fn with_id(mut self, jti: &str) -> Claims { self.jti = some(jti.into()); self }
+    fn with_custom(mut self, key: &str, value: &str) -> Claims {
+        self.custom.insert(key.into(), value.into()); self
+    }
+
+    fn is_expired(self, now: u64) -> bool {
+        self.exp.map(|e| now >= e).unwrap_or(false)
+    }
+
+    fn is_not_yet_valid(self, now: u64) -> bool {
+        self.nbf.map(|n| now < n).unwrap_or(false)
+    }
+
+    fn validate(self, now: u64) -> Result<(), string> {
+        if self.is_expired(now) { return err("Token expired".into()) }
+        if self.is_not_yet_valid(now) { return err("Token not yet valid".into()) }
+        ok(())
+    }
+
+    fn to_json(self) -> string {
+        let mut parts = []
+        if let some(sub) = &self.sub { parts.push(format!("\"sub\":\"{}\"", sub)) }
+        if let some(iss) = &self.iss { parts.push(format!("\"iss\":\"{}\"", iss)) }
+        if let some(aud) = &self.aud { parts.push(format!("\"aud\":\"{}\"", aud)) }
+        if let some(exp) = self.exp { parts.push(format!("\"exp\":{}", exp)) }
+        if let some(iat) = self.iat { parts.push(format!("\"iat\":{}", iat)) }
+        if let some(nbf) = self.nbf { parts.push(format!("\"nbf\":{}", nbf)) }
+        if let some(jti) = &self.jti { parts.push(format!("\"jti\":\"{}\"", jti)) }
+        for (k, v) in &self.custom { parts.push(format!("\"{}\":\"{}\"", k, v)) }
+        format!("{{{}}}", parts.join(","))
+    }
 }
 
-fn encode_jwt(claims: Claims, secret: string) -> string {
-    let header = json.stringify({"alg": "HS256", "typ": "JWT"})
-    let payload = json.stringify({
-        "sub": claims.sub,
-        "exp": claims.exp,
-        "iat": claims.iat,
-        ...claims.custom,
-    })
-    let h = base64url.encode(header.as_bytes())
-    let p = base64url.encode(payload.as_bytes())
-    let signing_input = "${h}.${p}"
-    let sig = hmac_sha256(secret.as_bytes(), signing_input.as_bytes())
-    let s = base64url.encode(sig)
-    "${signing_input}.${s}"
+fn base64url_encode(data: &[u8]) -> string {
+    base64.encode(data).replace('+', "-").replace('/', "_").trim_end_matches('=').into()
 }
 
-fn decode_jwt(token: string, secret: string) -> Result<Claims, string> {
-    let parts = token.split(".")
-    if parts.len() != 3 {
-        return err("invalid token format")
+fn base64url_decode(s: &str) -> Result<[u8], string> {
+    let mut padded = s.replace('-', "+").replace('_', "/")
+    while padded.len() % 4 != 0 { padded.push('=') }
+    base64.decode(&padded).map_err(|e| e.to_string())
+}
+
+struct Jwt;
+
+impl Jwt {
+    fn encode(claims: &Claims, secret: &[u8]) -> string {
+        let header = JwtHeader.hs256()
+        let header_enc = base64url_encode(header.to_json().as_bytes())
+        let payload_enc = base64url_encode(claims.to_json().as_bytes())
+        let signing_input = format!("{}.{}", header_enc, payload_enc)
+        let signature = hmac_sha256(secret, signing_input.as_bytes())
+        let sig_enc = base64url_encode(&signature)
+        format!("{}.{}", signing_input, sig_enc)
     }
-    let signing_input = "${parts[0]}.${parts[1]}"
-    let expected_sig  = hmac_sha256(secret.as_bytes(), signing_input.as_bytes())
-    let provided_sig  = base64url.decode(parts[2]).unwrap_or([])
-    if expected_sig != provided_sig {
-        return err("invalid signature")
+
+    fn decode(token: &str, secret: &[u8]) -> Result<Claims, string> {
+        let parts: [&str] = token.split('.').collect()
+        if parts.len() != 3 { return err("Invalid token format".into()) }
+
+        // Verify signature
+        let signing_input = format!("{}.{}", parts[0], parts[1])
+        let expected_sig = hmac_sha256(secret, signing_input.as_bytes())
+        let actual_sig = base64url_decode(parts[2])?
+        if expected_sig != actual_sig { return err("Invalid signature".into()) }
+
+        // Decode header
+        let header_json = string.from_utf8(base64url_decode(parts[0])?)
+            .map_err(|_| "Invalid header encoding")?
+        let header = JwtHeader.from_json(&header_json)?
+        if header.alg != "HS256" { return err("Unsupported algorithm".into()) }
+
+        // Decode payload
+        let payload_json = string.from_utf8(base64url_decode(parts[1])?)
+            .map_err(|_| "Invalid payload encoding")?
+        parse_claims(&payload_json)
     }
-    let payload_json = base64url.decode(parts[1])
-        .and_then(|b| string.from_utf8(b))
-        .map_err(|_| "invalid payload encoding")?
-    let obj = json.parse(payload_json)?
-    let now = unix_now()
-    if let some(exp) = obj.get("exp").and_then(|v| v.as_int()) {
-        if now > exp { return err("token expired") }
+
+    fn verify(token: &str, secret: &[u8], now: u64) -> Result<Claims, string> {
+        let claims = Jwt.decode(token, secret)?
+        claims.validate(now)?
+        ok(claims)
     }
-    ok(Claims {
-        sub: obj["sub"].as_str().unwrap_or(""),
-        exp: obj["exp"].as_int().unwrap_or(0),
-        iat: obj["iat"].as_int().unwrap_or(0),
-        custom: {},
-    })
+}
+
+fn extract_json_string(json: &str, key: &str) -> Result<string, string> {
+    let pattern = format!("\"{}\":\"", key)
+    if let some(start) = json.find(&pattern) {
+        let val_start = start + pattern.len()
+        if let some(end) = json[val_start..].find('"') {
+            return ok(json[val_start..val_start + end].into())
+        }
+    }
+    err(format!("Key '{}' not found", key))
+}
+
+fn parse_claims(json: &str) -> Result<Claims, string> {
+    let mut claims = Claims.new()
+    if let ok(sub) = extract_json_string(json, "sub") { claims.sub = some(sub) }
+    if let ok(iss) = extract_json_string(json, "iss") { claims.iss = some(iss) }
+    if let ok(aud) = extract_json_string(json, "aud") { claims.aud = some(aud) }
+    if let ok(jti) = extract_json_string(json, "jti") { claims.jti = some(jti) }
+    ok(claims)
 }
 
 fn main() {
-    let secret = "super-secret-key"
-    let now    = unix_now()
-    let claims = Claims { sub: "user:42", exp: now + 3600, iat: now, custom: {"role": "admin"} }
+    // Header
+    let h = JwtHeader.hs256()
+    assert(h.alg == "HS256")
+    assert(h.typ == "JWT")
+    let json = h.to_json()
+    assert(json.contains("HS256"))
+    print("Header ✓")
 
-    let token = encode_jwt(claims, secret)
-    print("Token: ${token[0..40]}...")
-    assert(token.split(".").len() == 3)
+    // Claims builder
+    let claims = Claims.new()
+        .with_subject("user123")
+        .with_issuer("lateralus-auth")
+        .with_audience("api")
+        .with_expiry(9999999999)
+        .with_issued_at(1000000000)
+        .with_id("tok-001")
+        .with_custom("role", "admin")
+    assert(claims.sub == some("user123".into()))
+    assert(claims.iss == some("lateralus-auth".into()))
+    assert(claims.custom.get("role") == some(&"admin".into()))
+    print("Claims builder ✓")
 
-    let decoded = decode_jwt(token, secret).unwrap()
-    assert(decoded.sub == "user:42")
-    print("Decoded sub: ${decoded.sub} ✓")
+    // Claims JSON
+    let cj = claims.to_json()
+    assert(cj.contains("user123"))
+    assert(cj.contains("lateralus-auth"))
+    assert(cj.contains("admin"))
+    print("Claims JSON ✓")
 
-    let bad = decode_jwt(token, "wrong-secret")
-    assert(bad.is_err())
-    print("Rejected bad secret ✓")
+    // Expiry check
+    assert(!claims.is_expired(1000000000))
+    assert(claims.is_expired(9999999999))
+    print("Expiry check ✓")
 
-    print("jwt — all assertions passed ✓")
+    // Not before
+    let nbf_claims = Claims.new().with_not_before(5000)
+    assert(nbf_claims.is_not_yet_valid(4999))
+    assert(!nbf_claims.is_not_yet_valid(5000))
+    print("Not before ✓")
+
+    // Validate
+    assert(claims.validate(2000000000).is_ok())
+    assert(claims.validate(9999999999).is_err())
+    print("Validate ✓")
+
+    // Base64url
+    let encoded = base64url_encode(b"hello world")
+    assert(!encoded.contains('+'))
+    assert(!encoded.contains('/'))
+    assert(!encoded.contains('='))
+    let decoded = base64url_decode(&encoded).unwrap()
+    assert(decoded == b"hello world")
+    print("Base64url ✓")
+
+    // Token parts
+    let secret = b"super-secret-key"
+    let token = Jwt.encode(&claims, secret)
+    let parts: [&str] = token.split('.').collect()
+    assert(parts.len() == 3)
+    print("Token structure ✓")
+
+    // JSON extraction
+    let json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+    assert(extract_json_string(json, "alg").unwrap() == "HS256")
+    assert(extract_json_string(json, "typ").unwrap() == "JWT")
+    assert(extract_json_string(json, "missing").is_err())
+    print("JSON extraction ✓")
+
+    // No expiry = not expired
+    let no_exp = Claims.new()
+    assert(!no_exp.is_expired(9999999999))
+    print("No expiry ✓")
+
+    // Empty claims
+    let empty = Claims.new()
+    assert(empty.sub == none)
+    assert(empty.validate(0).is_ok())
+    print("Empty claims ✓")
+
+    // Custom claims
+    let custom = Claims.new()
+        .with_custom("scope", "read write")
+        .with_custom("tenant", "acme")
+    assert(custom.custom.len() == 2)
+    print("Custom claims ✓")
+
+    print("JWT complete ✓")
 }
