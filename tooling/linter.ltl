@@ -1,0 +1,351 @@
+
+// Static Code Linter
+// Rule-based linter that checks Lateralus source code for common issues.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+impl Severity {
+    fn label(self) -> &str {
+        match self {
+            Severity.Error => "error",
+            Severity.Warning => "warning",
+            Severity.Info => "info",
+            Severity.Hint => "hint",
+        }
+    }
+
+    fn priority(self) -> i32 {
+        match self {
+            Severity.Error => 0,
+            Severity.Warning => 1,
+            Severity.Info => 2,
+            Severity.Hint => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LintDiagnostic {
+    rule: string,
+    message: string,
+    severity: Severity,
+    line: usize,
+    column: usize,
+    suggestion: Option<string>,
+}
+
+impl LintDiagnostic {
+    fn new(rule: &str, msg: &str, sev: Severity, line: usize, col: usize) -> LintDiagnostic {
+        LintDiagnostic {
+            rule: rule.into(), message: msg.into(), severity: sev,
+            line, column: col, suggestion: none,
+        }
+    }
+
+    fn with_suggestion(mut self, s: &str) -> LintDiagnostic {
+        self.suggestion = some(s.into()); self
+    }
+
+    fn display(self) -> string {
+        format!("[{}] {}:{}: {} - {}",
+            self.severity.label(), self.line, self.column, self.rule, self.message)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LintRule {
+    name: string,
+    description: string,
+    severity: Severity,
+    enabled: bool,
+    check: fn(&str, usize) -> [LintDiagnostic],
+}
+
+struct Linter {
+    rules: [LintRule],
+    diagnostics: [LintDiagnostic],
+    suppressed: HashSet<string>,
+    config: LinterConfig,
+}
+
+#[derive(Clone, Debug)]
+struct LinterConfig {
+    max_line_length: usize,
+    max_function_length: usize,
+    tab_width: usize,
+    naming_convention: NamingConvention,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NamingConvention {
+    SnakeCase,
+    CamelCase,
+    Any,
+}
+
+impl LinterConfig {
+    fn default() -> LinterConfig {
+        LinterConfig {
+            max_line_length: 100,
+            max_function_length: 50,
+            tab_width: 4,
+            naming_convention: NamingConvention.SnakeCase,
+        }
+    }
+}
+
+impl Linter {
+    fn new() -> Linter { Linter.with_config(LinterConfig.default()) }
+
+    fn with_config(config: LinterConfig) -> Linter {
+        let mut linter = Linter {
+            rules: vec![], diagnostics: vec![],
+            suppressed: HashSet.new(), config,
+        }
+        linter.register_builtin_rules()
+        linter
+    }
+
+    fn register_builtin_rules(mut self) {
+        // Line length check
+        self.rules.push(LintRule {
+            name: "line-too-long".into(),
+            description: "Line exceeds maximum length".into(),
+            severity: Severity.Warning,
+            enabled: true,
+            check: |line, line_num| {
+                let mut diags = vec![]
+                if line.len() > 100 {
+                    diags.push(LintDiagnostic.new(
+                        "line-too-long",
+                        &format!("Line is {} chars (max 100)", line.len()),
+                        Severity.Warning, line_num, 101,
+                    ))
+                }
+                diags
+            },
+        })
+
+        // Trailing whitespace
+        self.rules.push(LintRule {
+            name: "trailing-whitespace".into(),
+            description: "Line has trailing whitespace".into(),
+            severity: Severity.Warning,
+            enabled: true,
+            check: |line, line_num| {
+                if !line.is_empty() && line.ends_with(' ') || line.ends_with('\t') {
+                    vec![LintDiagnostic.new(
+                        "trailing-whitespace", "Trailing whitespace detected",
+                        Severity.Warning, line_num, line.len(),
+                    ).with_suggestion("Remove trailing whitespace")]
+                } else { vec![] }
+            },
+        })
+
+        // TODO comments
+        self.rules.push(LintRule {
+            name: "todo-comment".into(),
+            description: "TODO comment found".into(),
+            severity: Severity.Info,
+            enabled: true,
+            check: |line, line_num| {
+                if let some(pos) = line.find("TODO") {
+                    vec![LintDiagnostic.new(
+                        "todo-comment", "TODO comment found",
+                        Severity.Info, line_num, pos + 1,
+                    )]
+                } else { vec![] }
+            },
+        })
+
+        // Unused import pattern (simple heuristic)
+        self.rules.push(LintRule {
+            name: "empty-block".into(),
+            description: "Empty block detected".into(),
+            severity: Severity.Hint,
+            enabled: true,
+            check: |line, line_num| {
+                let trimmed = line.trim()
+                if trimmed == "{}" || trimmed == "{ }" {
+                    vec![LintDiagnostic.new(
+                        "empty-block", "Empty block - consider removing or adding content",
+                        Severity.Hint, line_num, 1,
+                    )]
+                } else { vec![] }
+            },
+        })
+    }
+
+    fn suppress_rule(mut self, rule: &str) { self.suppressed.insert(rule.into()); }
+    fn enable_rule(mut self, rule: &str) {
+        for r in &mut self.rules { if r.name == rule { r.enabled = true } }
+    }
+    fn disable_rule(mut self, rule: &str) {
+        for r in &mut self.rules { if r.name == rule { r.enabled = false } }
+    }
+
+    fn lint(mut self, source: &str) -> &[LintDiagnostic] {
+        self.diagnostics.clear()
+
+        for (line_num, line) in source.lines().enumerate() {
+            let ln = line_num + 1
+
+            // Check for inline suppression: // lint:ignore rule-name
+            if line.contains("// lint:ignore") { continue }
+
+            for rule in &self.rules {
+                if !rule.enabled || self.suppressed.contains(&rule.name) { continue }
+                let diags = (rule.check)(line, ln)
+                self.diagnostics.extend(diags)
+            }
+        }
+
+        // Sort by line, then severity priority
+        self.diagnostics.sort_by(|a, b| {
+            a.line.cmp(&b.line).then(a.severity.priority().cmp(&b.severity.priority()))
+        })
+
+        &self.diagnostics
+    }
+
+    fn error_count(self) -> usize {
+        self.diagnostics.iter().filter(|d| d.severity == Severity.Error).count()
+    }
+
+    fn warning_count(self) -> usize {
+        self.diagnostics.iter().filter(|d| d.severity == Severity.Warning).count()
+    }
+
+    fn summary(self) -> string {
+        let errors = self.error_count()
+        let warnings = self.warning_count()
+        let total = self.diagnostics.len()
+        format!("{} diagnostics ({} errors, {} warnings)", total, errors, warnings)
+    }
+}
+
+fn is_snake_case(s: &str) -> bool {
+    s.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
+        && !s.starts_with('_') && !s.ends_with('_') && !s.contains("__")
+}
+
+fn is_camel_case(s: &str) -> bool {
+    !s.is_empty() && s.chars().next().unwrap().is_uppercase()
+        && !s.contains('_') && s.chars().any(|c| c.is_lowercase())
+}
+
+fn main() {
+    // Severity
+    assert(Severity.Error.label() == "error")
+    assert(Severity.Warning.label() == "warning")
+    assert(Severity.Error.priority() < Severity.Warning.priority())
+    print("Severity ✓")
+
+    // Diagnostic
+    let d = LintDiagnostic.new("test-rule", "test msg", Severity.Error, 10, 5)
+    assert(d.rule == "test-rule")
+    assert(d.line == 10)
+    assert(d.suggestion.is_none())
+    let d2 = d.with_suggestion("fix it")
+    assert(d2.suggestion == some("fix it".into()))
+    print("Diagnostic ✓")
+
+    // Display
+    let display = d.display()
+    assert(display.contains("[error]"))
+    assert(display.contains("10:5"))
+    print("Display ✓")
+
+    // Linter basic
+    let mut linter = Linter.new()
+    let source = "fn main() {\n    let x = 1\n    // TODO: fix this\n    let y = 2 \n}"
+    let diags = linter.lint(source)
+    assert(diags.len() >= 2)  // TODO + trailing whitespace on line 4
+    print("Basic lint ✓")
+
+    // Trailing whitespace detected
+    let has_trailing = linter.diagnostics.iter().any(|d| d.rule == "trailing-whitespace")
+    assert(has_trailing)
+    print("Trailing whitespace ✓")
+
+    // TODO detected
+    let has_todo = linter.diagnostics.iter().any(|d| d.rule == "todo-comment")
+    assert(has_todo)
+    print("TODO ✓")
+
+    // Line too long
+    let long_line = "x".repeat(120)
+    let mut linter2 = Linter.new()
+    linter2.lint(&long_line)
+    let has_long = linter2.diagnostics.iter().any(|d| d.rule == "line-too-long")
+    assert(has_long)
+    print("Line too long ✓")
+
+    // Empty block
+    let mut linter3 = Linter.new()
+    linter3.lint("{}")
+    let has_empty = linter3.diagnostics.iter().any(|d| d.rule == "empty-block")
+    assert(has_empty)
+    print("Empty block ✓")
+
+    // Suppress rule
+    let mut linter4 = Linter.new()
+    linter4.suppress_rule("todo-comment")
+    linter4.lint("// TODO: ignored")
+    let has_todo2 = linter4.diagnostics.iter().any(|d| d.rule == "todo-comment")
+    assert(!has_todo2)
+    print("Suppress ✓")
+
+    // Disable rule
+    let mut linter5 = Linter.new()
+    linter5.disable_rule("trailing-whitespace")
+    linter5.lint("hello ")
+    let has_trail = linter5.diagnostics.iter().any(|d| d.rule == "trailing-whitespace")
+    assert(!has_trail)
+    print("Disable ✓")
+
+    // Inline suppression
+    let mut linter6 = Linter.new()
+    linter6.lint("let x = 1 // lint:ignore trailing-whitespace ")
+    assert(linter6.diagnostics.is_empty())
+    print("Inline suppress ✓")
+
+    // Naming helpers
+    assert(is_snake_case("hello_world"))
+    assert(is_snake_case("foo"))
+    assert(!is_snake_case("HelloWorld"))
+    assert(!is_snake_case("__bad"))
+    assert(is_camel_case("HelloWorld"))
+    assert(!is_camel_case("hello_world"))
+    print("Naming ✓")
+
+    // Summary
+    let mut linter7 = Linter.new()
+    linter7.lint("fn test() {\n    // TODO: x\n    let y = 1 \n}")
+    let summary = linter7.summary()
+    assert(summary.contains("diagnostics"))
+    print("Summary: " + summary)
+
+    // Config
+    let cfg = LinterConfig.default()
+    assert(cfg.max_line_length == 100)
+    assert(cfg.tab_width == 4)
+    assert(cfg.naming_convention == NamingConvention.SnakeCase)
+    print("Config ✓")
+
+    // Clean source
+    let mut linter8 = Linter.new()
+    linter8.lint("fn clean() {\n    let x = 1\n}")
+    assert(linter8.diagnostics.is_empty())
+    print("Clean source ✓")
+
+    print("Linter complete ✓")
+}
