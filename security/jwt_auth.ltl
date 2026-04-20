@@ -1,0 +1,118 @@
+// examples/security/jwt_auth.ltl
+//
+// JWT (HS256) issue + verify example.
+// Pure Lateralus, depends only on std::crypto::{hmac, sha256} and std::base64.
+//
+// Batch 76 / gap-fill: authentication.
+
+import std::crypto::{hmac, sha256}
+import std::base64
+import std::json
+import std::time
+import std::collections::Map
+
+pub struct Jwt {
+    header:  Map<String, json::Value>,
+    claims:  Map<String, json::Value>,
+    signing: [Byte],
+}
+
+pub enum JwtError {
+    MalformedToken,
+    InvalidSignature,
+    Expired,
+    NotYetValid,
+    WrongAlgorithm(String),
+}
+
+/// Issue a fresh HS256 token.
+pub fn issue(secret: [Byte], subject: String, ttl_secs: Int,
+             extra: Map<String, json::Value>) -> String {
+    let now = time::unix_now()
+    let claims = extra
+        |> set("sub", json::Str(subject))
+        |> set("iat", json::Int(now))
+        |> set("exp", json::Int(now + ttl_secs))
+
+    let header = Map::empty()
+        |> set("alg", json::Str("HS256"))
+        |> set("typ", json::Str("JWT"))
+
+    let h_b64 = header |> json::to_bytes() |> base64::url_nopad_encode()
+    let c_b64 = claims |> json::to_bytes() |> base64::url_nopad_encode()
+    let signing_input = "{h_b64}.{c_b64}" |> as_bytes()
+    let mac = hmac::hmac(sha256::Hasher, secret, signing_input)
+    let s_b64 = mac |> base64::url_nopad_encode()
+
+    "{h_b64}.{c_b64}.{s_b64}"
+}
+
+/// Verify a token. Returns the decoded claims or a `JwtError`.
+pub fn verify(secret: [Byte], token: String, clock_skew_secs: Int)
+    -> Result<Map<String, json::Value>, JwtError>
+{
+    let parts = token |> split(".")
+    if len(parts) != 3 { return Err(JwtError::MalformedToken) }
+    let (h_b64, c_b64, s_b64) = (parts[0], parts[1], parts[2])
+
+    let header_bytes = base64::url_nopad_decode(h_b64)
+        |> map_err(|_| JwtError::MalformedToken)?
+    let header: Map<String, json::Value> = json::parse(header_bytes)
+        |> map_err(|_| JwtError::MalformedToken)?
+
+    match header |> get("alg") {
+        Some(json::Str("HS256")) => (),
+        Some(json::Str(a))       => return Err(JwtError::WrongAlgorithm(a)),
+        _                        => return Err(JwtError::MalformedToken),
+    }
+
+    let signing_input = "{h_b64}.{c_b64}" |> as_bytes()
+    let expected      = hmac::hmac(sha256::Hasher, secret, signing_input)
+    let provided      = base64::url_nopad_decode(s_b64)
+        |> map_err(|_| JwtError::MalformedToken)?
+
+    if not constant_time_eq(expected, provided) {
+        return Err(JwtError::InvalidSignature)
+    }
+
+    let claims_bytes = base64::url_nopad_decode(c_b64)
+        |> map_err(|_| JwtError::MalformedToken)?
+    let claims: Map<String, json::Value> = json::parse(claims_bytes)
+        |> map_err(|_| JwtError::MalformedToken)?
+
+    let now = time::unix_now()
+    match claims |> get("exp") {
+        Some(json::Int(exp)) if now > exp + clock_skew_secs
+            => return Err(JwtError::Expired),
+        _   => (),
+    }
+    match claims |> get("nbf") {
+        Some(json::Int(nbf)) if now + clock_skew_secs < nbf
+            => return Err(JwtError::NotYetValid),
+        _   => (),
+    }
+
+    Ok(claims)
+}
+
+/// Constant-time byte comparison. Always walks both inputs fully.
+fn constant_time_eq(a: [Byte], b: [Byte]) -> Bool {
+    if len(a) != len(b) { return false }
+    let mut diff: Int = 0
+    for i in 0..len(a) {
+        diff = diff | ((a[i] as Int) ^ (b[i] as Int))
+    }
+    diff == 0
+}
+
+fn main() {
+    let secret = "supersecret-key-rotate-me" |> as_bytes()
+    let token  = issue(secret, "alice", 3600, Map::empty()
+        |> set("role", json::Str("admin")))
+    println("issued: {token}")
+
+    match verify(secret, token, 5) {
+        Ok(claims) => println("ok, role = {claims["role"]}"),
+        Err(e)     => println("bad: {e}"),
+    }
+}
