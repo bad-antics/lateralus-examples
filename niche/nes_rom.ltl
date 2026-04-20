@@ -1,0 +1,160 @@
+// examples/niche/nes_rom.ltl — iNES / NES 2.0 ROM parser.
+//
+// Reads an NES cartridge ROM image (.nes) and extracts everything
+// needed to boot it in an emulator: PRG banks, CHR banks, mapper
+// number, mirroring, battery-backed RAM flag, trainer, the works.
+// Supports both the original iNES header (1996) and the NES 2.0
+// extension (2006) — distinguished by bits 2-3 of byte 7.
+//
+// Usage:
+//   lateralus run nes_rom.ltl -- smb.nes
+
+use std::fs
+use std::io::Bytes
+
+pub struct INesHeader {
+    pub prg_rom_16k:     u8,       // PRG-ROM size in 16 KiB units
+    pub chr_rom_8k:      u8,       // CHR-ROM size in 8 KiB units (0 = CHR-RAM)
+    pub mirroring:       Mirroring,
+    pub battery:         bool,
+    pub trainer:         bool,
+    pub four_screen:     bool,
+    pub mapper:          u16,      // 0..4095 (NES 2.0), 0..255 (iNES)
+    pub submapper:       u8,       // NES 2.0 only
+    pub console:         Console,
+    pub prg_ram_8k:      u16,      // in 8 KiB units
+    pub chr_ram_8k:      u16,
+    pub region:          Region,
+    pub is_nes2:         bool,
+}
+
+pub enum Mirroring  { Horizontal, Vertical, FourScreen }
+pub enum Console    { Nes, VsSystem, Playchoice10, Extended }
+pub enum Region     { Ntsc, Pal, Dual }
+
+pub struct NesRom {
+    pub header:   INesHeader,
+    pub trainer:  Option<Bytes>,   // 512 bytes iff header.trainer
+    pub prg_rom:  Bytes,
+    pub chr_rom:  Bytes,           // empty iff cartridge uses CHR-RAM
+}
+
+pub fn parse(data: &Bytes) -> Result<NesRom, String> {
+    if data.len() < 16            { return Err("short file".into()) }
+    if &data[0..4] != b"NES\x1a"  { return Err("not an iNES file".into()) }
+
+    let flags6 = data[6]
+    let flags7 = data[7]
+    let is_nes2 = (flags7 & 0x0c) == 0x08
+
+    let four_screen = (flags6 & 0x08) != 0
+    let mirroring = if four_screen {
+        Mirroring::FourScreen
+    } else if (flags6 & 0x01) != 0 {
+        Mirroring::Vertical
+    } else {
+        Mirroring::Horizontal
+    }
+
+    let battery = (flags6 & 0x02) != 0
+    let trainer = (flags6 & 0x04) != 0
+
+    let mut prg_rom_16k = data[4]
+    let mut chr_rom_8k  = data[5]
+
+    let (mapper, submapper, prg_ram_8k, chr_ram_8k, console, region) = if is_nes2 {
+        let mapper = ((flags6 >> 4) as u16)
+                   | ((flags7 & 0xf0) as u16)
+                   | (((data[8] & 0x0f) as u16) << 8)
+        let submapper = (data[8] >> 4) & 0x0f
+        prg_rom_16k |= (data[9] & 0x0f) << 4        // MSB
+        chr_rom_8k  |=  data[9] & 0xf0
+        let prg_ram = 64u16 << (data[10] & 0x0f)        // bytes
+        let chr_ram = 64u16 << (data[11] & 0x0f)
+        let console = match flags7 & 0x03 {
+            0 => Console::Nes,
+            1 => Console::VsSystem,
+            2 => Console::Playchoice10,
+            _ => Console::Extended,
+        }
+        let region = match data[12] & 0x03 {
+            0 => Region::Ntsc,
+            1 => Region::Pal,
+            _ => Region::Dual,
+        }
+        (mapper, submapper, prg_ram / 8192, chr_ram / 8192, console, region)
+    } else {
+        let mapper = ((flags6 >> 4) | (flags7 & 0xf0)) as u16
+        (mapper, 0u8, 0u16, 0u16, Console::Nes, Region::Ntsc)
+    }
+
+    let header = INesHeader {
+        prg_rom_16k, chr_rom_8k, mirroring, battery, trainer, four_screen,
+        mapper, submapper, console, prg_ram_8k, chr_ram_8k, region, is_nes2,
+    }
+
+    let mut off = 16usize
+    let trainer_blob = if trainer {
+        let b = data.slice(off..off + 512)
+        off += 512
+        Some(b)
+    } else { None }
+
+    let prg_size = (prg_rom_16k as usize) * 16_384
+    let chr_size = (chr_rom_8k as usize) * 8_192
+    if data.len() < off + prg_size + chr_size {
+        return Err("truncated ROM body".into())
+    }
+    let prg_rom = data.slice(off..off + prg_size)
+    let chr_rom = data.slice(off + prg_size..off + prg_size + chr_size)
+
+    Ok(NesRom { header, trainer: trainer_blob, prg_rom, chr_rom })
+}
+
+pub fn mapper_name(m: u16) -> &'static str {
+    match m {
+        0   => "NROM",
+        1   => "MMC1",
+        2   => "UxROM",
+        3   => "CNROM",
+        4   => "MMC3",
+        5   => "MMC5",
+        7   => "AxROM",
+        9   => "MMC2 (Punch-Out)",
+        10  => "MMC4",
+        11  => "Color Dreams",
+        66  => "GxROM",
+        69  => "Sunsoft FME-7",
+        71  => "Codemasters",
+        119 => "TQROM",
+        155 => "MMC1A",
+        _   => "unknown",
+    }
+}
+
+pub fn dump(rom: &NesRom) {
+    let h = &rom.header
+    println!("=== iNES {}Header ===", if h.is_nes2 { "2.0 " } else { "" })
+    println!("  PRG-ROM:      {} KiB",  h.prg_rom_16k as u32 * 16)
+    println!("  CHR-ROM:      {} KiB",  h.chr_rom_8k  as u32 *  8)
+    println!("  Mapper:       {} ({})", h.mapper, mapper_name(h.mapper))
+    if h.is_nes2 {
+        println!("  Submapper:    {}", h.submapper)
+        println!("  PRG-RAM:      {} KiB", h.prg_ram_8k as u32 * 8)
+        println!("  CHR-RAM:      {} KiB", h.chr_ram_8k as u32 * 8)
+    }
+    println!("  Mirroring:    {:?}", h.mirroring)
+    println!("  Battery:      {}",   h.battery)
+    println!("  Trainer:      {}",   h.trainer)
+    println!("  Console:      {:?}", h.console)
+    println!("  Region:       {:?}", h.region)
+}
+
+fn main() -> Result<(), String> {
+    let args = std::env::args().collect::<Vec<_>>()
+    if args.len() < 2 { return Err("usage: nes_rom <file.nes>".into()) }
+    let data = fs::read(&args[1])?
+    let rom = parse(&data)?
+    dump(&rom)
+    Ok(())
+}
