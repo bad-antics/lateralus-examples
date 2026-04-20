@@ -1,0 +1,198 @@
+
+// Free Monad pattern in Lateralus
+// Separates program description from interpretation.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+enum ConsoleOp<A> {
+    PrintLine(string, A),
+    ReadLine(fn(string) -> A),
+    Exit(i32),
+}
+
+#[derive(Clone, Debug)]
+enum Free<F, A> {
+    Pure(A),
+    Suspend(F),
+}
+
+// DSL instructions for a key-value store
+#[derive(Clone, Debug)]
+enum KvOp<A> {
+    Get(string, fn(Option<string>) -> A),
+    Put(string, string, A),
+    Delete(string, A),
+    ListKeys(fn([string]) -> A),
+}
+
+// Simulated program as a list of operations
+#[derive(Clone, Debug)]
+enum Program {
+    GetAndPrint(string),
+    PutValue(string, string),
+    DeleteKey(string),
+    PrintKeys,
+    Sequence([Program]),
+}
+
+struct KvInterpreter {
+    store: HashMap<string, string>,
+    log: [string],
+}
+
+impl KvInterpreter {
+    fn new() -> KvInterpreter {
+        KvInterpreter { store: HashMap.new(), log: vec![] }
+    }
+
+    fn run(mut self, program: &Program) {
+        match program {
+            Program.GetAndPrint(key) => {
+                let val = self.store.get(key).cloned().unwrap_or("(not found)".into())
+                self.log.push(format!("GET {} => {}", key, val))
+            },
+            Program.PutValue(key, val) => {
+                self.store.insert(key.clone(), val.clone())
+                self.log.push(format!("PUT {} = {}", key, val))
+            },
+            Program.DeleteKey(key) => {
+                self.store.remove(key)
+                self.log.push(format!("DEL {}", key))
+            },
+            Program.PrintKeys => {
+                let mut keys: [string] = self.store.keys().cloned().collect()
+                keys.sort()
+                self.log.push(format!("KEYS: {:?}", keys))
+            },
+            Program.Sequence(ops) => {
+                for op in ops { self.run(op) }
+            },
+        }
+    }
+
+    fn get(self, key: &str) -> Option<&string> { self.store.get(key) }
+    fn log(self) -> &[string] { &self.log }
+    fn log_count(self) -> usize { self.log.len() }
+}
+
+// Effect tracking interpreter — records effects without executing
+struct EffectTracker {
+    effects: [string],
+}
+
+impl EffectTracker {
+    fn new() -> EffectTracker { EffectTracker { effects: vec![] } }
+
+    fn trace(mut self, program: &Program) {
+        match program {
+            Program.GetAndPrint(key) => self.effects.push(format!("read:{}", key)),
+            Program.PutValue(key, _) => self.effects.push(format!("write:{}", key)),
+            Program.DeleteKey(key) => self.effects.push(format!("delete:{}", key)),
+            Program.PrintKeys => self.effects.push("list-keys".into()),
+            Program.Sequence(ops) => {
+                for op in ops { self.trace(op) }
+            },
+        }
+    }
+
+    fn has_writes(self) -> bool {
+        self.effects.iter().any(|e| e.starts_with("write:") || e.starts_with("delete:"))
+    }
+
+    fn read_keys(self) -> [string] {
+        self.effects.iter()
+            .filter(|e| e.starts_with("read:"))
+            .map(|e| e.strip_prefix("read:").unwrap().to_string())
+            .collect()
+    }
+
+    fn effects(self) -> &[string] { &self.effects }
+}
+
+fn main() {
+    // Simple KV operations
+    let mut interp = KvInterpreter.new()
+    interp.run(&Program.PutValue("name".into(), "Alice".into()))
+    interp.run(&Program.PutValue("age".into(), "30".into()))
+    assert(interp.get("name") == some(&"Alice".to_string()))
+    assert(interp.get("age") == some(&"30".to_string()))
+    assert(interp.log_count() == 2)
+    print("Basic KV ✓")
+
+    // Get and print
+    interp.run(&Program.GetAndPrint("name".into()))
+    assert(interp.log().last().unwrap().contains("Alice"))
+    interp.run(&Program.GetAndPrint("missing".into()))
+    assert(interp.log().last().unwrap().contains("not found"))
+    print("Get and print ✓")
+
+    // Delete
+    interp.run(&Program.DeleteKey("age".into()))
+    assert(interp.get("age").is_none())
+    print("Delete ✓")
+
+    // Print keys
+    interp.run(&Program.PrintKeys)
+    assert(interp.log().last().unwrap().contains("name"))
+    print("Print keys ✓")
+
+    // Sequence
+    let prog = Program.Sequence(vec![
+        Program.PutValue("x".into(), "1".into()),
+        Program.PutValue("y".into(), "2".into()),
+        Program.GetAndPrint("x".into()),
+    ])
+    let mut interp2 = KvInterpreter.new()
+    interp2.run(&prog)
+    assert(interp2.get("x") == some(&"1".to_string()))
+    assert(interp2.get("y") == some(&"2".to_string()))
+    assert(interp2.log_count() == 3)
+    print("Sequence ✓")
+
+    // Effect tracker — same program, different interpretation
+    let mut tracker = EffectTracker.new()
+    tracker.trace(&prog)
+    assert(tracker.effects().len() == 3)
+    assert(tracker.has_writes())
+    let reads = tracker.read_keys()
+    assert(reads.len() == 1)
+    assert(reads[0] == "x")
+    print("Effect tracker ✓")
+
+    // Read-only program
+    let read_prog = Program.Sequence(vec![
+        Program.GetAndPrint("a".into()),
+        Program.PrintKeys,
+    ])
+    let mut tracker2 = EffectTracker.new()
+    tracker2.trace(&read_prog)
+    assert(!tracker2.has_writes())
+    assert(tracker2.read_keys().len() == 1)
+    print("Read-only detection ✓")
+
+    // Empty sequence
+    let mut interp3 = KvInterpreter.new()
+    interp3.run(&Program.Sequence(vec![]))
+    assert(interp3.log_count() == 0)
+    print("Empty sequence ✓")
+
+    // Free monad variants
+    let pure_val = Free.Pure::<KvOp<i32>, i32>(42)
+    match &pure_val {
+        Free.Pure(v) => assert(*v == 42),
+        _ => assert(false),
+    }
+    print("Free Pure ✓")
+
+    // ConsoleOp
+    let print_op = ConsoleOp.PrintLine("hello".into(), ())
+    let exit_op = ConsoleOp.Exit::<()>(0)
+    match &exit_op {
+        ConsoleOp.Exit(code) => assert(*code == 0),
+        _ => assert(false),
+    }
+    print("ConsoleOp ✓")
+
+    print("Free monad complete ✓")
+}
