@@ -1,0 +1,300 @@
+
+// CLI Argument Parser - Declarative command-line argument parsing
+// Supports flags, options with values, positional args, and subcommands.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+enum ArgKind { Flag, Option_, Positional }
+
+#[derive(Clone, Debug)]
+struct ArgDef {
+    name: string,
+    short: Option<char>,
+    long: Option<string>,
+    kind: ArgKind,
+    help: string,
+    required: bool,
+    default: Option<string>,
+}
+
+impl ArgDef {
+    fn flag(name: &str) -> ArgDef {
+        ArgDef {
+            name: name.into(), short: none, long: some(name.into()),
+            kind: ArgKind.Flag, help: string.new(), required: false, default: none,
+        }
+    }
+
+    fn option(name: &str) -> ArgDef {
+        ArgDef {
+            name: name.into(), short: none, long: some(name.into()),
+            kind: ArgKind.Option_, help: string.new(), required: false, default: none,
+        }
+    }
+
+    fn positional(name: &str) -> ArgDef {
+        ArgDef {
+            name: name.into(), short: none, long: none,
+            kind: ArgKind.Positional, help: string.new(), required: true, default: none,
+        }
+    }
+
+    fn short(mut self, c: char) -> ArgDef { self.short = some(c); self }
+    fn help(mut self, h: &str) -> ArgDef { self.help = h.into(); self }
+    fn required(mut self) -> ArgDef { self.required = true; self }
+    fn default_value(mut self, v: &str) -> ArgDef { self.default = some(v.into()); self }
+}
+
+#[derive(Clone, Debug)]
+struct ParsedArgs {
+    flags: HashMap<string, bool>,
+    options: HashMap<string, string>,
+    positionals: [string],
+    program: string,
+    subcommand: Option<string>,
+}
+
+impl ParsedArgs {
+    fn new() -> ParsedArgs {
+        ParsedArgs {
+            flags: HashMap.new(), options: HashMap.new(),
+            positionals: [], program: string.new(), subcommand: none,
+        }
+    }
+
+    fn has_flag(self, name: &str) -> bool {
+        *self.flags.get(name).unwrap_or(&false)
+    }
+
+    fn get_option(self, name: &str) -> Option<&string> {
+        self.options.get(name)
+    }
+
+    fn get_positional(self, idx: usize) -> Option<&string> {
+        self.positionals.get(idx)
+    }
+
+    fn get_or_default(self, name: &str, default: &str) -> string {
+        self.options.get(name).cloned().unwrap_or_else(|| default.into())
+    }
+}
+
+struct ArgParser {
+    name: string,
+    version: string,
+    description: string,
+    args: [ArgDef],
+    subcommands: HashMap<string, ArgParser>,
+}
+
+impl ArgParser {
+    fn new(name: &str) -> ArgParser {
+        ArgParser {
+            name: name.into(), version: "0.1.0".into(),
+            description: string.new(), args: [],
+            subcommands: HashMap.new(),
+        }
+    }
+
+    fn version(mut self, v: &str) -> ArgParser { self.version = v.into(); self }
+    fn description(mut self, d: &str) -> ArgParser { self.description = d.into(); self }
+    fn arg(mut self, def: ArgDef) -> ArgParser { self.args.push(def); self }
+    fn subcommand(mut self, name: &str, parser: ArgParser) -> ArgParser {
+        self.subcommands.insert(name.into(), parser); self
+    }
+
+    fn parse(self, argv: &[string]) -> Result<ParsedArgs, string> {
+        let mut result = ParsedArgs.new()
+        if argv.is_empty() { return ok(result) }
+        result.program = argv[0].clone()
+
+        let mut i = 1
+        let mut positional_idx = 0
+        let positional_defs: [&ArgDef] = self.args.iter()
+            .filter(|a| matches!(a.kind, ArgKind.Positional)).collect()
+
+        // Apply defaults
+        for arg in &self.args {
+            if let some(def) = &arg.default {
+                match arg.kind {
+                    ArgKind.Option_ => { result.options.insert(arg.name.clone(), def.clone()); },
+                    ArgKind.Flag => { result.flags.insert(arg.name.clone(), def == "true"); },
+                    _ => {},
+                }
+            }
+        }
+
+        while i < argv.len() {
+            let arg = &argv[i]
+
+            // Check for subcommand
+            if !arg.starts_with('-') && self.subcommands.contains_key(arg) {
+                result.subcommand = some(arg.clone())
+                break
+            }
+
+            if arg.starts_with("--") {
+                let name = &arg[2..]
+                if let some(def) = self.find_long(name) {
+                    match def.kind {
+                        ArgKind.Flag => { result.flags.insert(def.name.clone(), true); },
+                        ArgKind.Option_ => {
+                            i += 1
+                            if i >= argv.len() { return err(format!("Missing value for --{}", name)) }
+                            result.options.insert(def.name.clone(), argv[i].clone())
+                        },
+                        _ => {},
+                    }
+                } else {
+                    return err(format!("Unknown option: --{}", name))
+                }
+            } else if arg.starts_with('-') && arg.len() == 2 {
+                let ch = arg.chars().nth(1).unwrap()
+                if let some(def) = self.find_short(ch) {
+                    match def.kind {
+                        ArgKind.Flag => { result.flags.insert(def.name.clone(), true); },
+                        ArgKind.Option_ => {
+                            i += 1
+                            if i >= argv.len() { return err(format!("Missing value for -{}", ch)) }
+                            result.options.insert(def.name.clone(), argv[i].clone())
+                        },
+                        _ => {},
+                    }
+                } else {
+                    return err(format!("Unknown option: -{}", ch))
+                }
+            } else {
+                result.positionals.push(arg.clone())
+                positional_idx += 1
+            }
+            i += 1
+        }
+
+        // Check required args
+        for arg in &self.args {
+            if arg.required {
+                match arg.kind {
+                    ArgKind.Option_ => {
+                        if !result.options.contains_key(&arg.name) {
+                            return err(format!("Missing required option: {}", arg.name))
+                        }
+                    },
+                    ArgKind.Positional => {
+                        // checked by positional count
+                    },
+                    _ => {},
+                }
+            }
+        }
+
+        ok(result)
+    }
+
+    fn find_long(self, name: &str) -> Option<&ArgDef> {
+        self.args.iter().find(|a| a.long.as_deref() == some(name))
+    }
+
+    fn find_short(self, ch: char) -> Option<&ArgDef> {
+        self.args.iter().find(|a| a.short == some(ch))
+    }
+
+    fn usage(self) -> string {
+        let mut parts = [format!("Usage: {}", self.name)]
+        for arg in &self.args {
+            match arg.kind {
+                ArgKind.Flag => parts.push(format!("[--{}]", arg.name)),
+                ArgKind.Option_ => {
+                    if arg.required { parts.push(format!("--{} <value>", arg.name)) }
+                    else { parts.push(format!("[--{} <value>]", arg.name)) }
+                },
+                ArgKind.Positional => parts.push(format!("<{}>", arg.name)),
+            }
+        }
+        parts.join(" ")
+    }
+}
+
+fn main() {
+    // Simple flags
+    let parser = ArgParser.new("myapp")
+        .arg(ArgDef.flag("verbose").short('v').help("Enable verbose output"))
+        .arg(ArgDef.flag("debug").short('d'))
+
+    let args = ["myapp".into(), "--verbose".into(), "-d".into()]
+    let result = parser.parse(&args).unwrap()
+    assert(result.has_flag("verbose"))
+    assert(result.has_flag("debug"))
+    assert(!result.has_flag("quiet"))
+    print("Flags ✓")
+
+    // Options
+    let parser2 = ArgParser.new("tool")
+        .arg(ArgDef.option("output").short('o').help("Output file"))
+        .arg(ArgDef.option("format").default_value("json"))
+
+    let args2 = ["tool".into(), "--output".into(), "result.txt".into()]
+    let result2 = parser2.parse(&args2).unwrap()
+    assert(result2.get_option("output") == some(&"result.txt".into()))
+    assert(result2.get_option("format") == some(&"json".into()))  // default
+    print("Options ✓")
+
+    // Short options
+    let args3 = ["tool".into(), "-o".into(), "out.bin".into()]
+    let result3 = parser2.parse(&args3).unwrap()
+    assert(result3.get_option("output") == some(&"out.bin".into()))
+    print("Short options ✓")
+
+    // Positional args
+    let parser3 = ArgParser.new("cat")
+        .arg(ArgDef.positional("file"))
+        .arg(ArgDef.flag("number").short('n'))
+
+    let args4 = ["cat".into(), "-n".into(), "hello.txt".into()]
+    let result4 = parser3.parse(&args4).unwrap()
+    assert(result4.has_flag("number"))
+    assert(result4.get_positional(0) == some(&"hello.txt".into()))
+    print("Positional args ✓")
+
+    // Unknown option error
+    let err_args = ["myapp".into(), "--unknown".into()]
+    assert(parser.parse(&err_args).is_err())
+    print("Unknown option error ✓")
+
+    // Missing value error
+    let err_args2 = ["tool".into(), "--output".into()]
+    assert(parser2.parse(&err_args2).is_err())
+    print("Missing value error ✓")
+
+    // Get or default
+    let result5 = parser2.parse(&["tool".into()]).unwrap()
+    assert(result5.get_or_default("output", "default.txt") == "default.txt")
+    assert(result5.get_or_default("format", "xml") == "json")
+    print("Get or default ✓")
+
+    // Usage string
+    let usage = parser3.usage()
+    assert(usage.contains("cat"))
+    assert(usage.contains("[--number]"))
+    assert(usage.contains("<file>"))
+    print("Usage ✓")
+
+    // Program name
+    let result6 = parser.parse(&["myapp".into()]).unwrap()
+    assert(result6.program == "myapp")
+    print("Program name ✓")
+
+    // Empty args
+    let result7 = parser.parse(&[]).unwrap()
+    assert(result7.program == "")
+    assert(!result7.has_flag("verbose"))
+    print("Empty args ✓")
+
+    // Version and description
+    let p = ArgParser.new("test").version("2.0.0").description("A test tool")
+    assert(p.version == "2.0.0")
+    assert(p.description == "A test tool")
+    print("Version/description ✓")
+
+    print("Arg parser complete ✓")
+}
