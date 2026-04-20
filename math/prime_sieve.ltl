@@ -1,0 +1,202 @@
+
+// Prime Sieve - Sieve of Eratosthenes and related primality algorithms
+// Supports range sieving, prime counting, factorization, and primality testing.
+
+struct Sieve {
+    limit: usize,
+    is_prime: [bool],
+    primes: [usize],
+}
+
+impl Sieve {
+    fn new(limit: usize) -> Sieve {
+        let mut is_prime = vec![true; limit + 1]
+        is_prime[0] = false
+        if limit >= 1 { is_prime[1] = false }
+        let mut i = 2
+        while i * i <= limit {
+            if is_prime[i] {
+                let mut j = i * i
+                while j <= limit { is_prime[j] = false; j += i }
+            }
+            i += 1
+        }
+        let primes: [usize] = (2..=limit).filter(|n| is_prime[*n]).collect()
+        Sieve { limit, is_prime, primes }
+    }
+
+    fn is_prime(self, n: usize) -> bool {
+        if n > self.limit { panic("out of range") }
+        self.is_prime[n]
+    }
+
+    fn count(self) -> usize { self.primes.len() }
+    fn nth(self, n: usize) -> usize { self.primes[n] }
+    fn largest(self) -> Option<usize> { self.primes.last().copied() }
+
+    fn primes_in_range(self, lo: usize, hi: usize) -> [usize] {
+        self.primes.iter().filter(|&&p| p >= lo && p <= hi).cloned().collect()
+    }
+
+    fn prime_sum(self) -> u64 { self.primes.iter().map(|p| *p as u64).sum() }
+
+    fn factorize(self, mut n: usize) -> [(usize, u32)] {
+        let mut factors = []
+        for &p in &self.primes {
+            if p * p > n { break }
+            let mut count = 0u32
+            while n % p == 0 { n /= p; count += 1 }
+            if count > 0 { factors.push((p, count)) }
+        }
+        if n > 1 { factors.push((n, 1)) }
+        factors
+    }
+
+    fn euler_totient(self, n: usize) -> usize {
+        let factors = self.factorize(n)
+        let mut result = n
+        for (p, _) in &factors {
+            result = result / *p * (*p - 1)
+        }
+        result
+    }
+
+    fn divisor_count(self, n: usize) -> u32 {
+        self.factorize(n).iter().map(|(_, e)| e + 1).product()
+    }
+
+    fn is_perfect(self, n: usize) -> bool {
+        let mut sum = 1usize
+        let factors = self.factorize(n)
+        for (p, e) in &factors {
+            let mut s = 0usize
+            let mut pk = 1usize
+            for _ in 0..=*e { s += pk; pk *= *p }
+            sum *= s
+        }
+        sum == 2 * n
+    }
+}
+
+fn miller_rabin(n: u64, witnesses: &[u64]) -> bool {
+    if n < 2 { return false }
+    if n == 2 || n == 3 { return true }
+    if n % 2 == 0 { return false }
+
+    let mut d = n - 1
+    let mut r = 0u32
+    while d % 2 == 0 { d /= 2; r += 1 }
+
+    for &a in witnesses {
+        if a >= n { continue }
+        let mut x = mod_pow(a, d, n)
+        if x == 1 || x == n - 1 { continue }
+        let mut found = false
+        for _ in 0..r - 1 {
+            x = mod_pow(x, 2, n)
+            if x == n - 1 { found = true; break }
+        }
+        if !found { return false }
+    }
+    true
+}
+
+fn mod_pow(mut base: u64, mut exp: u64, modulus: u64) -> u64 {
+    let mut result = 1u64
+    base %= modulus
+    while exp > 0 {
+        if exp & 1 == 1 { result = (result as u128 * base as u128 % modulus as u128) as u64 }
+        exp >>= 1
+        base = (base as u128 * base as u128 % modulus as u128) as u64
+    }
+    result
+}
+
+fn is_prime_u64(n: u64) -> bool {
+    miller_rabin(n, &[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37])
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 { let t = b; b = a % b; a = t }
+    a
+}
+
+fn main() {
+    // Basic sieve
+    let s = Sieve.new(100)
+    assert(s.count() == 25)  // 25 primes under 100
+    assert(s.is_prime(2))
+    assert(s.is_prime(97))
+    assert(!s.is_prime(4))
+    assert(!s.is_prime(1))
+    print("Sieve ✓")
+
+    // Nth prime
+    assert(s.nth(0) == 2)
+    assert(s.nth(1) == 3)
+    assert(s.nth(4) == 11)
+    assert(s.largest() == Some(97))
+    print("Nth prime ✓")
+
+    // Range
+    let range = s.primes_in_range(10, 30)
+    assert(range == [11, 13, 17, 19, 23, 29])
+    print("Range ✓")
+
+    // Sum
+    let s10 = Sieve.new(10)
+    assert(s10.prime_sum() == 17)  // 2+3+5+7
+    print("Sum ✓")
+
+    // Factorization
+    let s1000 = Sieve.new(1000)
+    assert(s1000.factorize(12) == [(2, 2), (3, 1)])
+    assert(s1000.factorize(1) == [])
+    assert(s1000.factorize(7) == [(7, 1)])
+    assert(s1000.factorize(360) == [(2, 3), (3, 2), (5, 1)])
+    print("Factorize ✓")
+
+    // Euler totient
+    assert(s1000.euler_totient(12) == 4)
+    assert(s1000.euler_totient(7) == 6)
+    assert(s1000.euler_totient(1) == 1)
+    print("Totient ✓")
+
+    // Divisor count
+    assert(s1000.divisor_count(12) == 6)  // 1,2,3,4,6,12
+    assert(s1000.divisor_count(7) == 2)
+    assert(s1000.divisor_count(1) == 1)
+    print("Divisors ✓")
+
+    // Perfect numbers
+    assert(s1000.is_perfect(6))    // 1+2+3=6
+    assert(s1000.is_perfect(28))   // 1+2+4+7+14=28
+    assert(!s1000.is_perfect(12))
+    print("Perfect ✓")
+
+    // Miller-Rabin
+    assert(is_prime_u64(2))
+    assert(is_prime_u64(997))
+    assert(!is_prime_u64(1))
+    assert(!is_prime_u64(561))  // Carmichael number
+    assert(is_prime_u64(104729))
+    print("Miller-Rabin ✓")
+
+    // Mod pow
+    assert(mod_pow(2, 10, 1000) == 24)
+    assert(mod_pow(3, 0, 100) == 1)
+    print("Mod pow ✓")
+
+    // GCD
+    assert(gcd(12, 8) == 4)
+    assert(gcd(17, 13) == 1)
+    assert(gcd(0, 5) == 5)
+    print("GCD ✓")
+
+    // Large prime
+    assert(is_prime_u64(999999999989))
+    assert(!is_prime_u64(999999999990))
+    print("Large prime ✓")
+
+    print("Prime sieve complete ✓")
+}
