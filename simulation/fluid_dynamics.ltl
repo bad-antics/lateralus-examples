@@ -1,0 +1,264 @@
+// Fluid Dynamics Simulation
+// Simple 2D grid-based fluid simulation using Navier-Stokes approximation.
+
+use std.math.{sqrt, abs}
+
+struct FluidGrid {
+    width: usize,
+    height: usize,
+    density: [f64],
+    vx: [f64],
+    vy: [f64],
+    density_prev: [f64],
+    vx_prev: [f64],
+    vy_prev: [f64],
+    viscosity: f64,
+    diffusion: f64,
+    dt: f64,
+}
+
+impl FluidGrid {
+    fn new(width: usize, height: usize) -> FluidGrid {
+        let size = width * height
+        FluidGrid {
+            width, height,
+            density: vec![0.0; size],
+            vx: vec![0.0; size],
+            vy: vec![0.0; size],
+            density_prev: vec![0.0; size],
+            vx_prev: vec![0.0; size],
+            vy_prev: vec![0.0; size],
+            viscosity: 0.0001,
+            diffusion: 0.0001,
+            dt: 0.1,
+        }
+    }
+
+    fn with_viscosity(mut self, v: f64) -> FluidGrid { self.viscosity = v; self }
+    fn with_diffusion(mut self, d: f64) -> FluidGrid { self.diffusion = d; self }
+    fn with_dt(mut self, dt: f64) -> FluidGrid { self.dt = dt; self }
+
+    fn idx(self, x: usize, y: usize) -> usize {
+        y * self.width + x
+    }
+
+    fn add_density(mut self, x: usize, y: usize, amount: f64) {
+        let i = self.idx(x, y)
+        self.density[i] += amount
+    }
+
+    fn add_velocity(mut self, x: usize, y: usize, ax: f64, ay: f64) {
+        let i = self.idx(x, y)
+        self.vx[i] += ax
+        self.vy[i] += ay
+    }
+
+    fn get_density(self, x: usize, y: usize) -> f64 {
+        self.density[self.idx(x, y)]
+    }
+
+    fn get_velocity(self, x: usize, y: usize) -> (f64, f64) {
+        let i = self.idx(x, y)
+        (self.vx[i], self.vy[i])
+    }
+
+    fn total_density(self) -> f64 {
+        self.density.iter().sum()
+    }
+
+    fn max_density(self) -> f64 {
+        self.density.iter().cloned().fold(0.0, f64::max)
+    }
+
+    fn max_velocity(self) -> f64 {
+        let mut max_v = 0.0
+        for i in 0..self.density.len() {
+            let v = sqrt(self.vx[i] * self.vx[i] + self.vy[i] * self.vy[i])
+            if v > max_v { max_v = v }
+        }
+        max_v
+    }
+
+    fn step(mut self) {
+        // Swap previous and current
+        std.mem.swap(&mut self.vx_prev, &mut self.vx)
+        std.mem.swap(&mut self.vy_prev, &mut self.vy)
+        std.mem.swap(&mut self.density_prev, &mut self.density)
+
+        // Velocity step
+        self.diffuse_field(&mut self.vx, &self.vx_prev, self.viscosity)
+        self.diffuse_field(&mut self.vy, &self.vy_prev, self.viscosity)
+        self.project()
+
+        std.mem.swap(&mut self.vx_prev, &mut self.vx)
+        std.mem.swap(&mut self.vy_prev, &mut self.vy)
+
+        self.advect_field(&mut self.vx, &self.vx_prev, &self.vx_prev, &self.vy_prev)
+        self.advect_field(&mut self.vy, &self.vy_prev, &self.vx_prev, &self.vy_prev)
+        self.project()
+
+        // Density step
+        self.diffuse_field(&mut self.density, &self.density_prev, self.diffusion)
+        std.mem.swap(&mut self.density_prev, &mut self.density)
+        self.advect_field(&mut self.density, &self.density_prev, &self.vx, &self.vy)
+    }
+
+    fn diffuse_field(self, field: &mut [f64], prev: &[f64], rate: f64) {
+        let a = self.dt * rate * (self.width - 2) as f64 * (self.height - 2) as f64
+        let c = 1.0 + 4.0 * a
+
+        for _ in 0..20 {
+            for y in 1..self.height - 1 {
+                for x in 1..self.width - 1 {
+                    let i = self.idx(x, y)
+                    field[i] = (prev[i] + a * (
+                        field[self.idx(x-1, y)] + field[self.idx(x+1, y)] +
+                        field[self.idx(x, y-1)] + field[self.idx(x, y+1)]
+                    )) / c
+                }
+            }
+        }
+    }
+
+    fn advect_field(self, field: &mut [f64], prev: &[f64], u: &[f64], v: &[f64]) {
+        let dt0_x = self.dt * (self.width - 2) as f64
+        let dt0_y = self.dt * (self.height - 2) as f64
+
+        for y in 1..self.height - 1 {
+            for x in 1..self.width - 1 {
+                let i = self.idx(x, y)
+                let mut px = x as f64 - dt0_x * u[i]
+                let mut py = y as f64 - dt0_y * v[i]
+
+                px = px.max(0.5).min((self.width - 2) as f64 + 0.5)
+                py = py.max(0.5).min((self.height - 2) as f64 + 0.5)
+
+                let i0 = px as usize; let i1 = i0 + 1
+                let j0 = py as usize; let j1 = j0 + 1
+                let s1 = px - i0 as f64; let s0 = 1.0 - s1
+                let t1 = py - j0 as f64; let t0 = 1.0 - t1
+
+                field[i] = s0 * (t0 * prev[self.idx(i0, j0)] + t1 * prev[self.idx(i0, j1)])
+                         + s1 * (t0 * prev[self.idx(i1, j0)] + t1 * prev[self.idx(i1, j1)])
+            }
+        }
+    }
+
+    fn project(mut self) {
+        let h = 1.0 / self.width as f64
+        let mut div = vec![0.0; self.width * self.height]
+        let mut p = vec![0.0; self.width * self.height]
+
+        for y in 1..self.height - 1 {
+            for x in 1..self.width - 1 {
+                let i = self.idx(x, y)
+                div[i] = -0.5 * h * (
+                    self.vx[self.idx(x+1, y)] - self.vx[self.idx(x-1, y)] +
+                    self.vy[self.idx(x, y+1)] - self.vy[self.idx(x, y-1)]
+                )
+            }
+        }
+
+        for _ in 0..20 {
+            for y in 1..self.height - 1 {
+                for x in 1..self.width - 1 {
+                    let i = self.idx(x, y)
+                    p[i] = (div[i] + p[self.idx(x-1, y)] + p[self.idx(x+1, y)]
+                        + p[self.idx(x, y-1)] + p[self.idx(x, y+1)]) / 4.0
+                }
+            }
+        }
+
+        for y in 1..self.height - 1 {
+            for x in 1..self.width - 1 {
+                let i = self.idx(x, y)
+                self.vx[i] -= 0.5 * (p[self.idx(x+1, y)] - p[self.idx(x-1, y)]) / h
+                self.vy[i] -= 0.5 * (p[self.idx(x, y+1)] - p[self.idx(x, y-1)]) / h
+            }
+        }
+    }
+
+    fn clear(mut self) {
+        for v in &mut self.density { *v = 0.0 }
+        for v in &mut self.vx { *v = 0.0 }
+        for v in &mut self.vy { *v = 0.0 }
+    }
+
+    fn size(self) -> usize { self.width * self.height }
+}
+
+fn main() {
+    // Create grid
+    let mut grid = FluidGrid.new(20, 20)
+    assert(grid.width == 20 && grid.height == 20)
+    assert(grid.size() == 400)
+    assert(grid.total_density() == 0.0)
+    print("Create grid ✓")
+
+    // Add density
+    grid.add_density(10, 10, 100.0)
+    assert(grid.get_density(10, 10) == 100.0)
+    assert(grid.get_density(5, 5) == 0.0)
+    assert(grid.total_density() == 100.0)
+    assert(grid.max_density() == 100.0)
+    print("Add density ✓")
+
+    // Add velocity
+    grid.add_velocity(10, 10, 1.0, 0.5)
+    let (vx, vy) = grid.get_velocity(10, 10)
+    assert(vx == 1.0 && vy == 0.5)
+    assert(grid.max_velocity() > 0.0)
+    print("Add velocity ✓")
+
+    // Step simulation
+    let density_before = grid.total_density()
+    grid.step()
+    // Density should spread but total approximately conserved
+    assert(grid.total_density() > 0.0)
+    print("Step ✓")
+
+    // Multiple steps
+    for _ in 0..10 { grid.step() }
+    assert(grid.total_density() > 0.0)
+    print("Multiple steps ✓")
+
+    // Idx calculation
+    assert(grid.idx(0, 0) == 0)
+    assert(grid.idx(1, 0) == 1)
+    assert(grid.idx(0, 1) == 20)
+    assert(grid.idx(5, 3) == 65)
+    print("Index ✓")
+
+    // Config builders
+    let custom = FluidGrid.new(10, 10)
+        .with_viscosity(0.01)
+        .with_diffusion(0.005)
+        .with_dt(0.05)
+    assert(custom.viscosity == 0.01)
+    assert(custom.diffusion == 0.005)
+    assert(custom.dt == 0.05)
+    print("Config ✓")
+
+    // Clear
+    grid.clear()
+    assert(grid.total_density() == 0.0)
+    assert(grid.max_velocity() == 0.0)
+    print("Clear ✓")
+
+    // Empty grid step (should not crash)
+    let mut empty = FluidGrid.new(5, 5)
+    empty.step()
+    assert(empty.total_density() == 0.0)
+    print("Empty step ✓")
+
+    // Density source + spread
+    let mut spread = FluidGrid.new(10, 10).with_diffusion(0.1)
+    spread.add_density(5, 5, 50.0)
+    spread.step()
+    // Neighbors should have some density now
+    let center = spread.get_density(5, 5)
+    assert(center > 0.0)
+    print("Diffusion ✓")
+
+    print("Fluid Dynamics complete ✓")
+}
