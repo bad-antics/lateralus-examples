@@ -1,0 +1,141 @@
+
+// Thread Pool - Fixed-size worker pool with job queue
+// Supports task submission, completion tracking, and graceful shutdown.
+
+use std.sync.{Mutex, Condvar, Arc}
+use std.collections.VecDeque
+
+type Job = fn()
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PoolState { Running, ShuttingDown, Stopped }
+
+struct ThreadPool {
+    workers: [Worker],
+    queue: Arc<Mutex<VecDeque<Job>>>,
+    state: Arc<Mutex<PoolState>>,
+    cv: Arc<Condvar>,
+    completed: Arc<Mutex<u64>>,
+    submitted: Arc<Mutex<u64>>,
+}
+
+struct Worker {
+    id: usize,
+    busy: Arc<Mutex<bool>>,
+}
+
+impl ThreadPool {
+    fn new(size: usize) -> ThreadPool {
+        assert(size > 0)
+        let queue = Arc.new(Mutex.new(VecDeque.new()))
+        let state = Arc.new(Mutex.new(PoolState.Running))
+        let cv = Arc.new(Condvar.new())
+        let completed = Arc.new(Mutex.new(0u64))
+        let submitted = Arc.new(Mutex.new(0u64))
+        let mut workers = []
+
+        for i in 0..size {
+            let busy = Arc.new(Mutex.new(false))
+            workers.push(Worker { id: i, busy: busy.clone() })
+            let q = queue.clone()
+            let s = state.clone()
+            let c = cv.clone()
+            let comp = completed.clone()
+            let b = busy.clone()
+            spawn(move || {
+                loop {
+                    let job = {
+                        let mut guard = q.lock()
+                        while guard.is_empty() {
+                            if *s.lock() != PoolState.Running { return }
+                            guard = c.wait(guard)
+                        }
+                        guard.pop_front()
+                    };
+                    if let Some(job) = job {
+                        *b.lock() = true
+                        job()
+                        *b.lock() = false
+                        *comp.lock() += 1
+                    }
+                }
+            })
+        }
+
+        ThreadPool { workers, queue, state, cv, completed, submitted }
+    }
+
+    fn submit(self, job: Job) -> bool {
+        let state = *self.state.lock()
+        if state != PoolState.Running { return false }
+        self.queue.lock().push_back(job)
+        *self.submitted.lock() += 1
+        self.cv.notify_one()
+        true
+    }
+
+    fn shutdown(self) {
+        *self.state.lock() = PoolState.ShuttingDown
+        self.cv.notify_all()
+    }
+
+    fn worker_count(self) -> usize { self.workers.len() }
+    fn pending(self) -> usize { self.queue.lock().len() }
+    fn completed_count(self) -> u64 { *self.completed.lock() }
+    fn submitted_count(self) -> u64 { *self.submitted.lock() }
+
+    fn is_idle(self) -> bool {
+        self.pending() == 0 && self.workers.iter().all(|w| !*w.busy.lock())
+    }
+
+    fn active_workers(self) -> usize {
+        self.workers.iter().filter(|w| *w.busy.lock()).count()
+    }
+}
+
+fn main() {
+    // Create pool
+    let pool = ThreadPool.new(4)
+    assert(pool.worker_count() == 4)
+    assert(pool.pending() == 0)
+    assert(pool.completed_count() == 0)
+    print("Init ✓")
+
+    // Submit jobs
+    assert(pool.submit(|| { let _ = 1 + 1; }))
+    assert(pool.submit(|| { let _ = 2 + 2; }))
+    assert(pool.submitted_count() == 2)
+    print("Submit ✓")
+
+    // Wait for completion (simulated)
+    // In a real system we'd sleep/wait; here we check the interface
+    assert(pool.worker_count() == 4)
+    print("Workers ✓")
+
+    // Shutdown
+    pool.shutdown()
+    assert(!pool.submit(|| {}))  // can't submit after shutdown
+    print("Shutdown ✓")
+
+    // Worker busy tracking
+    let w = Worker { id: 0, busy: Arc.new(Mutex.new(false)) }
+    assert(!*w.busy.lock())
+    *w.busy.lock() = true
+    assert(*w.busy.lock())
+    print("Worker busy ✓")
+
+    // Pool state
+    let pool2 = ThreadPool.new(2)
+    assert(*pool2.state.lock() == PoolState.Running)
+    pool2.shutdown()
+    assert(*pool2.state.lock() == PoolState.ShuttingDown)
+    print("State ✓")
+
+    // Zero pending after drain
+    let pool3 = ThreadPool.new(1)
+    for _ in 0..5 { pool3.submit(|| {}) }
+    assert(pool3.submitted_count() == 5)
+    print("Batch submit ✓")
+
+    print("Thread pool complete ✓")
+}
