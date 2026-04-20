@@ -1,0 +1,217 @@
+
+// SPI Bus Simulator - Serial Peripheral Interface communication
+// Models master-slave full-duplex SPI with configurable modes.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SpiMode {
+    Mode0,  // CPOL=0, CPHA=0
+    Mode1,  // CPOL=0, CPHA=1
+    Mode2,  // CPOL=1, CPHA=0
+    Mode3,  // CPOL=1, CPHA=1
+}
+
+impl SpiMode {
+    fn cpol(self) -> bool { matches!(self, SpiMode.Mode2 | SpiMode.Mode3) }
+    fn cpha(self) -> bool { matches!(self, SpiMode.Mode1 | SpiMode.Mode3) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BitOrder { MsbFirst, LsbFirst }
+
+#[derive(Clone, Debug)]
+struct SpiConfig {
+    mode: SpiMode,
+    bit_order: BitOrder,
+    clock_hz: u32,
+    word_size: u8,
+    cs_active_low: bool,
+}
+
+impl SpiConfig {
+    fn default() -> SpiConfig {
+        SpiConfig { mode: SpiMode.Mode0, bit_order: BitOrder.MsbFirst, clock_hz: 1_000_000, word_size: 8, cs_active_low: true }
+    }
+    fn with_mode(mut self, mode: SpiMode) -> SpiConfig { self.mode = mode; self }
+    fn with_clock(mut self, hz: u32) -> SpiConfig { self.clock_hz = hz; self }
+    fn with_word_size(mut self, bits: u8) -> SpiConfig { self.word_size = bits; self }
+    fn with_bit_order(mut self, order: BitOrder) -> SpiConfig { self.bit_order = order; self }
+}
+
+struct SpiSlave {
+    name: string,
+    rx_buffer: [u8],
+    tx_buffer: [u8],
+    registers: [u8],
+    selected: bool,
+}
+
+impl SpiSlave {
+    fn new(name: &str, reg_count: usize) -> SpiSlave {
+        SpiSlave { name: name.into(), rx_buffer: [], tx_buffer: [], registers: vec![0u8; reg_count], selected: false }
+    }
+    fn select(mut self) { self.selected = true }
+    fn deselect(mut self) { self.selected = false }
+    fn is_selected(self) -> bool { self.selected }
+    fn write_register(mut self, addr: usize, val: u8) { if addr < self.registers.len() { self.registers[addr] = val } }
+    fn read_register(self, addr: usize) -> u8 { if addr < self.registers.len() { self.registers[addr] } else { 0xFF } }
+    fn queue_response(mut self, data: &[u8]) { for b in data { self.tx_buffer.push(*b) } }
+    fn next_byte(mut self) -> u8 { if self.tx_buffer.is_empty() { 0xFF } else { self.tx_buffer.remove(0) } }
+    fn receive(mut self, byte: u8) { self.rx_buffer.push(byte) }
+    fn received_count(self) -> usize { self.rx_buffer.len() }
+    fn last_received(self) -> Option<u8> { self.rx_buffer.last().copied() }
+}
+
+struct SpiBus {
+    config: SpiConfig,
+    slaves: [SpiSlave],
+    active_slave: Option<usize>,
+    transfers: u64,
+    bytes_transferred: u64,
+}
+
+impl SpiBus {
+    fn new(config: SpiConfig) -> SpiBus {
+        SpiBus { config, slaves: [], active_slave: None, transfers: 0, bytes_transferred: 0 }
+    }
+
+    fn add_slave(mut self, slave: SpiSlave) -> usize {
+        let idx = self.slaves.len()
+        self.slaves.push(slave)
+        idx
+    }
+
+    fn select(mut self, idx: usize) {
+        if let Some(prev) = self.active_slave { self.slaves[prev].deselect() }
+        self.slaves[idx].select()
+        self.active_slave = Some(idx)
+    }
+
+    fn deselect(mut self) {
+        if let Some(idx) = self.active_slave { self.slaves[idx].deselect() }
+        self.active_slave = None
+    }
+
+    fn transfer_byte(mut self, tx: u8) -> u8 {
+        let rx = match self.active_slave {
+            Some(idx) => {
+                self.slaves[idx].receive(tx)
+                self.slaves[idx].next_byte()
+            }
+            None => 0xFF,
+        };
+        self.transfers += 1
+        self.bytes_transferred += 1
+        rx
+    }
+
+    fn transfer(mut self, tx_data: &[u8]) -> [u8] {
+        let mut rx_data = []
+        for byte in tx_data { rx_data.push(self.transfer_byte(*byte)) }
+        rx_data
+    }
+
+    fn write_register(mut self, slave: usize, addr: u8, value: u8) {
+        self.select(slave)
+        self.transfer_byte(addr | 0x80)  // write bit
+        self.transfer_byte(value)
+        self.deselect()
+    }
+
+    fn read_register(mut self, slave: usize, addr: u8) -> u8 {
+        self.select(slave)
+        self.transfer_byte(addr & 0x7F)  // read bit
+        let val = self.transfer_byte(0x00)  // dummy byte
+        self.deselect()
+        val
+    }
+
+    fn slave_count(self) -> usize { self.slaves.len() }
+    fn total_transfers(self) -> u64 { self.transfers }
+    fn total_bytes(self) -> u64 { self.bytes_transferred }
+    fn has_active(self) -> bool { self.active_slave.is_some() }
+}
+
+fn main() {
+    // SpiMode
+    assert(!SpiMode.Mode0.cpol() && !SpiMode.Mode0.cpha())
+    assert(!SpiMode.Mode1.cpol() && SpiMode.Mode1.cpha())
+    assert(SpiMode.Mode2.cpol() && !SpiMode.Mode2.cpha())
+    assert(SpiMode.Mode3.cpol() && SpiMode.Mode3.cpha())
+    print("SpiMode ✓")
+
+    // SpiConfig
+    let cfg = SpiConfig.default().with_mode(SpiMode.Mode3).with_clock(4_000_000)
+    assert(cfg.mode == SpiMode.Mode3)
+    assert(cfg.clock_hz == 4_000_000)
+    assert(cfg.word_size == 8)
+    print("Config ✓")
+
+    // SpiSlave
+    let mut slave = SpiSlave.new("sensor", 16)
+    assert(!slave.is_selected())
+    slave.select()
+    assert(slave.is_selected())
+    slave.deselect()
+    assert(!slave.is_selected())
+    print("Slave select ✓")
+
+    // Slave registers
+    slave.write_register(0, 0x42)
+    assert(slave.read_register(0) == 0x42)
+    assert(slave.read_register(15) == 0)
+    assert(slave.read_register(100) == 0xFF)  // out of bounds
+    print("Registers ✓")
+
+    // Slave response queue
+    slave.queue_response(&[0xAA, 0xBB])
+    assert(slave.next_byte() == 0xAA)
+    assert(slave.next_byte() == 0xBB)
+    assert(slave.next_byte() == 0xFF)  // empty
+    print("Response ✓")
+
+    // Slave receive
+    slave.receive(0x10)
+    slave.receive(0x20)
+    assert(slave.received_count() == 2)
+    assert(slave.last_received() == Some(0x20))
+    print("Receive ✓")
+
+    // SpiBus
+    let mut bus = SpiBus.new(SpiConfig.default())
+    let s0 = bus.add_slave(SpiSlave.new("accel", 32))
+    let s1 = bus.add_slave(SpiSlave.new("flash", 256))
+    assert(bus.slave_count() == 2)
+    assert(!bus.has_active())
+    print("Bus ✓")
+
+    // Select/Deselect
+    bus.select(s0)
+    assert(bus.has_active())
+    assert(bus.slaves[s0].is_selected())
+    assert(!bus.slaves[s1].is_selected())
+    bus.deselect()
+    assert(!bus.has_active())
+    print("Bus select ✓")
+
+    // Transfer
+    bus.slaves[s0].queue_response(&[0xDE, 0xAD])
+    bus.select(s0)
+    let rx = bus.transfer(&[0x01, 0x02])
+    assert(rx.len() == 2)
+    assert(rx[0] == 0xDE)
+    assert(rx[1] == 0xAD)
+    assert(bus.total_transfers() == 2)
+    assert(bus.total_bytes() == 2)
+    bus.deselect()
+    print("Transfer ✓")
+
+    // Single byte transfer
+    bus.slaves[s1].queue_response(&[0x55])
+    bus.select(s1)
+    let r = bus.transfer_byte(0xFF)
+    assert(r == 0x55)
+    bus.deselect()
+    print("Single transfer ✓")
+
+    print("SPI bus complete ✓")
+}
