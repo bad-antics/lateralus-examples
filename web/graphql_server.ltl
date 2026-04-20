@@ -1,0 +1,182 @@
+// examples/web/graphql_server.ltl
+//
+// A minimal GraphQL server in Lateralus. Pipeline-first resolvers,
+// schema defined as ordinary Lateralus ADTs, transport via std::http.
+//
+// Batch 77 / web.
+
+import std::http
+import std::json
+import std::collections::{Map, List}
+import std::time
+
+// -- Schema ----------------------------------------------------------------
+
+enum Role { Admin, Member, Guest }
+
+struct User {
+    id:    Int,
+    name:  String,
+    email: String,
+    role:  Role,
+    joined_at: time::UnixTime,
+}
+
+struct Post {
+    id:      Int,
+    author:  Int,        // User.id
+    title:   String,
+    body:    String,
+    created: time::UnixTime,
+    tags:    [String],
+}
+
+// -- GraphQL query AST (hand-rolled, tiny) ---------------------------------
+
+enum QueryNode {
+    Field(String, Map<String, json::Value>, [QueryNode]),
+    Fragment(String),
+}
+
+struct Query {
+    name:      Option<String>,
+    variables: Map<String, json::Value>,
+    selection: [QueryNode],
+}
+
+// -- Resolvers -------------------------------------------------------------
+
+fn resolve_user(db: Db, args: Map<String, json::Value>) -> Result<User, String> {
+    let id = args |> get("id") |> and_then(json::as_int) |> ok_or("id required")?
+    db |> users_find(id) |> ok_or("user not found: {id}")
+}
+
+fn resolve_posts_by_user(db: Db, args: Map<String, json::Value>) -> Result<[Post], String> {
+    let uid   = args |> get("user_id") |> and_then(json::as_int) |> ok_or("user_id required")?
+    let limit = args |> get("limit")   |> and_then(json::as_int) |> unwrap_or(20)
+    Ok(db
+        |> posts_all()
+        |> filter(|p| p.author == uid)
+        |> sort_by(|p| 0 - p.created.secs)   // newest first
+        |> take(limit))
+}
+
+fn resolve_search(db: Db, args: Map<String, json::Value>) -> Result<[Post], String> {
+    let q = args |> get("q") |> and_then(json::as_string) |> ok_or("q required")?
+    Ok(db
+        |> posts_all()
+        |> filter(|p| p.title |> contains_ignore_case(q)
+                   || p.body  |> contains_ignore_case(q))
+        |> take(50))
+}
+
+// -- Selection -> JSON projection ------------------------------------------
+
+fn project_user(u: User, sel: [QueryNode]) -> json::Value {
+    let mut obj: Map<String, json::Value> = Map::empty()
+    for node in sel {
+        match node {
+            QueryNode::Field("id",         _, _) => obj |> set_mut("id",    json::Int(u.id)),
+            QueryNode::Field("name",       _, _) => obj |> set_mut("name",  json::Str(u.name)),
+            QueryNode::Field("email",      _, _) => obj |> set_mut("email", json::Str(u.email)),
+            QueryNode::Field("role",       _, _) => obj |> set_mut("role",  json::Str(role_str(u.role))),
+            QueryNode::Field("joined_at",  _, _) => obj |> set_mut("joined_at", json::Int(u.joined_at.secs)),
+            _ => (),
+        }
+    }
+    json::Obj(obj)
+}
+
+fn project_post(p: Post, sel: [QueryNode], db: Db) -> json::Value {
+    let mut obj: Map<String, json::Value> = Map::empty()
+    for node in sel {
+        match node {
+            QueryNode::Field("id",      _, _) => obj |> set_mut("id",    json::Int(p.id)),
+            QueryNode::Field("title",   _, _) => obj |> set_mut("title", json::Str(p.title)),
+            QueryNode::Field("body",    _, _) => obj |> set_mut("body",  json::Str(p.body)),
+            QueryNode::Field("tags",    _, _) => obj |> set_mut("tags",
+                json::Arr(p.tags |> map(json::Str))),
+            QueryNode::Field("created", _, _) => obj |> set_mut("created", json::Int(p.created.secs)),
+            QueryNode::Field("author",  _, sub) => {
+                // Nested selection — recursively resolve.
+                match db |> users_find(p.author) {
+                    Some(u) => obj |> set_mut("author", project_user(u, sub)),
+                    None    => obj |> set_mut("author", json::Null),
+                }
+            },
+            _ => (),
+        }
+    }
+    json::Obj(obj)
+}
+
+fn role_str(r: Role) -> String {
+    match r { Role::Admin => "ADMIN", Role::Member => "MEMBER", Role::Guest => "GUEST" }
+}
+
+// -- Dispatcher ------------------------------------------------------------
+
+fn execute(db: Db, q: Query) -> json::Value {
+    let mut data: Map<String, json::Value> = Map::empty()
+    let mut errs: [json::Value] = []
+
+    for node in q.selection {
+        match node {
+            QueryNode::Field("user", args, sub) => {
+                match resolve_user(db, args) {
+                    Ok(u)  => data |> set_mut("user", project_user(u, sub)),
+                    Err(e) => errs |> push(gql_error(e, "user")),
+                }
+            },
+            QueryNode::Field("postsByUser", args, sub) => {
+                match resolve_posts_by_user(db, args) {
+                    Ok(ps) => data |> set_mut("postsByUser",
+                        json::Arr(ps |> map(|p| project_post(p, sub, db)))),
+                    Err(e) => errs |> push(gql_error(e, "postsByUser")),
+                }
+            },
+            QueryNode::Field("search", args, sub) => {
+                match resolve_search(db, args) {
+                    Ok(ps) => data |> set_mut("search",
+                        json::Arr(ps |> map(|p| project_post(p, sub, db)))),
+                    Err(e) => errs |> push(gql_error(e, "search")),
+                }
+            },
+            _ => (),
+        }
+    }
+
+    json::Obj(Map::empty()
+        |> set("data",   json::Obj(data))
+        |> set("errors", json::Arr(errs)))
+}
+
+fn gql_error(message: String, path: String) -> json::Value {
+    json::Obj(Map::empty()
+        |> set("message", json::Str(message))
+        |> set("path",    json::Arr([json::Str(path)])))
+}
+
+// -- HTTP surface ----------------------------------------------------------
+
+pub fn serve(db: Db, port: Int) -> Result<(), String> {
+    http::serve(port, |req| {
+        match req.method {
+            "POST" => {
+                let body: Map<String, json::Value> = json::parse(req.body)?
+                let q = parse_query(body)?
+                let out = execute(db, q)
+                http::json_response(200, out)
+            },
+            "GET" if req.path == "/graphiql" => http::ok_html(GRAPHIQL_HTML),
+            _ => http::response(405, "method not allowed"),
+        }
+    })
+}
+
+// Parser and Db type left as extension points.
+type Db = Map<String, json::Value>
+fn parse_query(_body: Map<String, json::Value>) -> Result<Query, String> {
+    Err("parser omitted in example")
+}
+let GRAPHIQL_HTML: String = "<html><body>GraphiQL here</body></html>"
