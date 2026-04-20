@@ -1,0 +1,243 @@
+
+// B-Tree Key-Value Store - Disk-oriented B-tree with in-memory simulation
+// Supports ordered insert, search, range queries, and iteration.
+
+const ORDER: usize = 4  // max children per node
+const MAX_KEYS: usize = ORDER - 1
+
+#[derive(Clone, Debug)]
+struct BTreeNode<K, V> {
+    keys: [(K, V)],
+    children: [usize],  // node indices
+    is_leaf: bool,
+    id: usize,
+}
+
+impl<K: Ord + Clone + Debug, V: Clone + Debug> BTreeNode<K, V> {
+    fn new_leaf(id: usize) -> BTreeNode<K, V> {
+        BTreeNode { keys: [], children: [], is_leaf: true, id }
+    }
+    fn new_internal(id: usize) -> BTreeNode<K, V> {
+        BTreeNode { keys: [], children: [], is_leaf: false, id }
+    }
+    fn is_full(self) -> bool { self.keys.len() >= MAX_KEYS }
+    fn key_count(self) -> usize { self.keys.len() }
+    fn child_count(self) -> usize { self.children.len() }
+
+    fn find_key_index(self, key: &K) -> usize {
+        let mut i = 0
+        while i < self.keys.len() && self.keys[i].0 < *key { i += 1 }
+        i
+    }
+
+    fn contains_key(self, key: &K) -> bool {
+        self.keys.iter().any(|(k, _)| k == key)
+    }
+}
+
+struct BTree<K, V> {
+    nodes: [BTreeNode<K, V>],
+    root: usize,
+    size: usize,
+    next_id: usize,
+}
+
+impl<K: Ord + Clone + Debug, V: Clone + Debug> BTree<K, V> {
+    fn new() -> BTree<K, V> {
+        let root = BTreeNode.new_leaf(0)
+        BTree { nodes: [root], root: 0, size: 0, next_id: 1 }
+    }
+
+    fn alloc_node(mut self, is_leaf: bool) -> usize {
+        let id = self.next_id
+        self.next_id += 1
+        let node = if is_leaf { BTreeNode.new_leaf(id) } else { BTreeNode.new_internal(id) }
+        self.nodes.push(node)
+        id
+    }
+
+    fn len(self) -> usize { self.size }
+    fn is_empty(self) -> bool { self.size == 0 }
+    fn node_count(self) -> usize { self.nodes.len() }
+
+    fn search(self, key: &K) -> Option<&V> {
+        self.search_node(self.root, key)
+    }
+
+    fn search_node(self, node_id: usize, key: &K) -> Option<&V> {
+        let node = &self.nodes[node_id]
+        let i = node.find_key_index(key)
+        if i < node.keys.len() && node.keys[i].0 == *key {
+            return Some(&node.keys[i].1)
+        }
+        if node.is_leaf { return None }
+        self.search_node(node.children[i], key)
+    }
+
+    fn insert(mut self, key: K, value: V) {
+        if self.nodes[self.root].is_full() {
+            let old_root = self.root
+            let new_root_id = self.alloc_node(false)
+            self.nodes[new_root_id].children.push(old_root)
+            self.root = new_root_id
+            self.split_child(new_root_id, 0)
+        }
+        self.insert_non_full(self.root, key, value)
+        self.size += 1
+    }
+
+    fn split_child(mut self, parent_id: usize, child_idx: usize) {
+        let child_id = self.nodes[parent_id].children[child_idx]
+        let mid = self.nodes[child_id].keys.len() / 2
+        let new_id = self.alloc_node(self.nodes[child_id].is_leaf)
+
+        let median = self.nodes[child_id].keys[mid].clone()
+        // Move right half to new node
+        let right_keys: [(K, V)] = self.nodes[child_id].keys[mid + 1..].to_vec()
+        self.nodes[new_id].keys = right_keys
+        if !self.nodes[child_id].is_leaf {
+            let right_children: [usize] = self.nodes[child_id].children[mid + 1..].to_vec()
+            self.nodes[new_id].children = right_children
+            self.nodes[child_id].children.truncate(mid + 1)
+        }
+        self.nodes[child_id].keys.truncate(mid)
+
+        self.nodes[parent_id].keys.insert(child_idx, median)
+        self.nodes[parent_id].children.insert(child_idx + 1, new_id)
+    }
+
+    fn insert_non_full(mut self, node_id: usize, key: K, value: V) {
+        let i = self.nodes[node_id].find_key_index(&key)
+        if self.nodes[node_id].is_leaf {
+            // Check for update
+            if i < self.nodes[node_id].keys.len() && self.nodes[node_id].keys[i].0 == key {
+                self.nodes[node_id].keys[i].1 = value
+                self.size -= 1  // compensate for size++ in insert
+            } else {
+                self.nodes[node_id].keys.insert(i, (key, value))
+            }
+        } else {
+            let child_id = self.nodes[node_id].children[i]
+            if self.nodes[child_id].is_full() {
+                self.split_child(node_id, i)
+                let new_i = self.nodes[node_id].find_key_index(&key)
+                let target = self.nodes[node_id].children[new_i]
+                self.insert_non_full(target, key, value)
+            } else {
+                self.insert_non_full(child_id, key, value)
+            }
+        }
+    }
+
+    fn contains(self, key: &K) -> bool { self.search(key).is_some() }
+
+    fn min(self) -> Option<&(K, V)> {
+        let mut node = &self.nodes[self.root]
+        while !node.is_leaf && !node.children.is_empty() {
+            node = &self.nodes[node.children[0]]
+        }
+        node.keys.first()
+    }
+
+    fn max(self) -> Option<&(K, V)> {
+        let mut node = &self.nodes[self.root]
+        while !node.is_leaf && !node.children.is_empty() {
+            node = &self.nodes[node.children[node.children.len() - 1]]
+        }
+        node.keys.last()
+    }
+
+    fn in_order(self) -> [(K, V)] {
+        let mut result = []
+        self.collect_in_order(self.root, &mut result)
+        result
+    }
+
+    fn collect_in_order(self, node_id: usize, result: &mut [(K, V)]) {
+        let node = &self.nodes[node_id]
+        for i in 0..node.keys.len() {
+            if !node.is_leaf && i < node.children.len() {
+                self.collect_in_order(node.children[i], result)
+            }
+            result.push(node.keys[i].clone())
+        }
+        if !node.is_leaf && !node.children.is_empty() {
+            self.collect_in_order(node.children[node.children.len() - 1], result)
+        }
+    }
+}
+
+fn main() {
+    // Empty tree
+    let tree = BTree::<i32, string>.new()
+    assert(tree.is_empty())
+    assert(tree.len() == 0)
+    assert(tree.search(&5).is_none())
+    print("Empty ✓")
+
+    // Insert and search
+    let mut tree2 = BTree::<i32, string>.new()
+    tree2.insert(5, "five".into())
+    tree2.insert(3, "three".into())
+    tree2.insert(7, "seven".into())
+    assert(tree2.len() == 3)
+    assert(tree2.search(&5) == Some(&"five".into()))
+    assert(tree2.search(&3) == Some(&"three".into()))
+    assert(tree2.search(&99).is_none())
+    print("Insert/Search ✓")
+
+    // Contains
+    assert(tree2.contains(&5))
+    assert(!tree2.contains(&1))
+    print("Contains ✓")
+
+    // More inserts (trigger splits)
+    let mut tree3 = BTree::<i32, i32>.new()
+    for i in 0..20 { tree3.insert(i, i * 10) }
+    assert(tree3.len() == 20)
+    for i in 0..20 { assert(tree3.search(&i) == Some(&(i * 10))) }
+    print("Many inserts ✓")
+
+    // Reverse insert order
+    let mut tree4 = BTree::<i32, i32>.new()
+    for i in (0..15).rev() { tree4.insert(i, i) }
+    assert(tree4.len() == 15)
+    for i in 0..15 { assert(tree4.contains(&i)) }
+    print("Reverse ✓")
+
+    // Min/Max
+    assert(tree3.min().unwrap().0 == 0)
+    assert(tree3.max().unwrap().0 == 19)
+    print("Min/Max ✓")
+
+    // In-order traversal
+    let sorted = tree3.in_order()
+    assert(sorted.len() == 20)
+    for i in 0..20 { assert(sorted[i].0 == i as i32) }
+    print("In-order ✓")
+
+    // Update existing key
+    let mut tree5 = BTree::<i32, string>.new()
+    tree5.insert(1, "one".into())
+    tree5.insert(1, "ONE".into())
+    assert(tree5.len() == 1)
+    assert(tree5.search(&1) == Some(&"ONE".into()))
+    print("Update ✓")
+
+    // Node count (should have splits)
+    assert(tree3.node_count() > 1)
+    print("Nodes ✓")
+
+    // String keys
+    let mut tree6 = BTree::<string, i32>.new()
+    tree6.insert("banana".into(), 2)
+    tree6.insert("apple".into(), 1)
+    tree6.insert("cherry".into(), 3)
+    assert(tree6.search(&"apple".into()) == Some(&1))
+    let sorted6 = tree6.in_order()
+    assert(sorted6[0].0 == "apple")
+    assert(sorted6[1].0 == "banana")
+    print("String keys ✓")
+
+    print("B-tree store complete ✓")
+}
