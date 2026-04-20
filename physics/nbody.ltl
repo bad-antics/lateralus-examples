@@ -1,0 +1,179 @@
+
+// N-Body Gravitational Simulation
+// Simulates gravitational interactions between point masses using Verlet integration.
+
+use std.math.{sqrt, PI}
+
+const G: f64 = 6.674e-11
+const SOFTENING: f64 = 1e-9
+
+#[derive(Clone, Copy, Debug)]
+struct Vec3 { x: f64, y: f64, z: f64 }
+
+impl Vec3 {
+    fn new(x: f64, y: f64, z: f64) -> Vec3 { Vec3 { x, y, z } }
+    fn zero() -> Vec3 { Vec3 { x: 0.0, y: 0.0, z: 0.0 } }
+    fn add(self, o: Vec3) -> Vec3 { Vec3 { x: self.x + o.x, y: self.y + o.y, z: self.z + o.z } }
+    fn sub(self, o: Vec3) -> Vec3 { Vec3 { x: self.x - o.x, y: self.y - o.y, z: self.z - o.z } }
+    fn scale(self, s: f64) -> Vec3 { Vec3 { x: self.x * s, y: self.y * s, z: self.z * s } }
+    fn dot(self, o: Vec3) -> f64 { self.x * o.x + self.y * o.y + self.z * o.z }
+    fn length_sq(self) -> f64 { self.dot(self) }
+    fn length(self) -> f64 { self.length_sq().sqrt() }
+    fn normalize(self) -> Vec3 { let l = self.length(); self.scale(1.0 / l) }
+    fn distance(self, o: Vec3) -> f64 { self.sub(o).length() }
+    fn cross(self, o: Vec3) -> Vec3 {
+        Vec3 { x: self.y * o.z - self.z * o.y, y: self.z * o.x - self.x * o.z, z: self.x * o.y - self.y * o.x }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Body {
+    pos: Vec3,
+    vel: Vec3,
+    acc: Vec3,
+    mass: f64,
+    name: string,
+}
+
+impl Body {
+    fn new(name: &str, mass: f64, pos: Vec3, vel: Vec3) -> Body {
+        Body { pos, vel, acc: Vec3.zero(), mass, name: name.into() }
+    }
+    fn kinetic_energy(self) -> f64 { 0.5 * self.mass * self.vel.length_sq() }
+    fn momentum(self) -> Vec3 { self.vel.scale(self.mass) }
+    fn angular_momentum(self) -> Vec3 { self.pos.cross(self.momentum()) }
+}
+
+struct Simulation {
+    bodies: [Body],
+    time: f64,
+    dt: f64,
+    steps: u64,
+}
+
+impl Simulation {
+    fn new(dt: f64) -> Simulation { Simulation { bodies: [], time: 0.0, dt, steps: 0 } }
+
+    fn add_body(mut self, body: Body) { self.bodies.push(body) }
+    fn body_count(self) -> usize { self.bodies.len() }
+
+    fn compute_accelerations(mut self) {
+        let n = self.bodies.len()
+        for i in 0..n { self.bodies[i].acc = Vec3.zero() }
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let r = self.bodies[j].pos.sub(self.bodies[i].pos)
+                let dist_sq = r.length_sq() + SOFTENING
+                let dist = dist_sq.sqrt()
+                let force_mag = G * self.bodies[i].mass * self.bodies[j].mass / dist_sq
+                let force_dir = r.scale(1.0 / dist)
+                let ai = force_dir.scale(force_mag / self.bodies[i].mass)
+                let aj = force_dir.scale(-force_mag / self.bodies[j].mass)
+                self.bodies[i].acc = self.bodies[i].acc.add(ai)
+                self.bodies[j].acc = self.bodies[j].acc.add(aj)
+            }
+        }
+    }
+
+    fn step(mut self) {
+        // Velocity Verlet
+        let dt = self.dt
+        for body in &mut self.bodies {
+            body.pos = body.pos.add(body.vel.scale(dt)).add(body.acc.scale(0.5 * dt * dt))
+        }
+        let old_acc: [Vec3] = self.bodies.iter().map(|b| b.acc).collect()
+        self.compute_accelerations()
+        for (i, body) in self.bodies.iter_mut().enumerate() {
+            body.vel = body.vel.add(old_acc[i].add(body.acc).scale(0.5 * dt))
+        }
+        self.time += dt
+        self.steps += 1
+    }
+
+    fn step_n(mut self, n: u64) { for _ in 0..n { self.step() } }
+
+    fn total_energy(self) -> f64 {
+        let mut ke = 0.0
+        let mut pe = 0.0
+        for body in &self.bodies { ke += body.kinetic_energy() }
+        for i in 0..self.bodies.len() {
+            for j in (i + 1)..self.bodies.len() {
+                let r = self.bodies[i].pos.distance(self.bodies[j].pos)
+                pe -= G * self.bodies[i].mass * self.bodies[j].mass / r
+            }
+        }
+        ke + pe
+    }
+
+    fn total_momentum(self) -> Vec3 {
+        self.bodies.iter().fold(Vec3.zero(), |acc, b| acc.add(b.momentum()))
+    }
+
+    fn center_of_mass(self) -> Vec3 {
+        let total_mass: f64 = self.bodies.iter().map(|b| b.mass).sum()
+        let weighted = self.bodies.iter().fold(Vec3.zero(), |acc, b| acc.add(b.pos.scale(b.mass)))
+        weighted.scale(1.0 / total_mass)
+    }
+}
+
+fn main() {
+    // Vec3
+    let v = Vec3.new(1.0, 2.0, 3.0)
+    assert((v.length() - 3.7416).abs() < 0.001)
+    let v2 = Vec3.new(4.0, 5.0, 6.0)
+    assert((v.dot(v2) - 32.0).abs() < 0.001)
+    print("Vec3 ✓")
+
+    // Cross product
+    let cx = Vec3.new(1.0, 0.0, 0.0).cross(Vec3.new(0.0, 1.0, 0.0))
+    assert((cx.z - 1.0).abs() < 0.001)
+    print("Cross ✓")
+
+    // Body
+    let sun = Body.new("Sun", 1.989e30, Vec3.zero(), Vec3.zero())
+    assert(sun.mass == 1.989e30)
+    assert(sun.kinetic_energy() == 0.0)
+    print("Body ✓")
+
+    // Simple two-body
+    let mut sim = Simulation.new(1.0)
+    sim.add_body(Body.new("A", 1e10, Vec3.new(0.0, 0.0, 0.0), Vec3.new(0.0, 0.0, 0.0)))
+    sim.add_body(Body.new("B", 1e10, Vec3.new(1.0, 0.0, 0.0), Vec3.new(0.0, 0.0, 0.0)))
+    assert(sim.body_count() == 2)
+    print("Sim init ✓")
+
+    // Energy conservation (approximate)
+    sim.compute_accelerations()
+    let e0 = sim.total_energy()
+    sim.step_n(10)
+    let e1 = sim.total_energy()
+    // Energy should be approximately conserved
+    let energy_drift = ((e1 - e0) / e0).abs()
+    assert(energy_drift < 0.1)  // within 10% for coarse dt
+    print("Energy ✓")
+
+    // Momentum conservation
+    let p0 = sim.total_momentum()
+    assert(p0.length() < 1e-5)  // zero initial momentum
+    sim.step_n(5)
+    let p1 = sim.total_momentum()
+    assert(p1.length() < 1e-5)  // still zero
+    print("Momentum ✓")
+
+    // Center of mass
+    let com = sim.center_of_mass()
+    assert((com.x - 0.5).abs() < 0.1)  // should be near midpoint
+    print("CoM ✓")
+
+    // Distance
+    let d = Vec3.new(3.0, 4.0, 0.0).distance(Vec3.zero())
+    assert((d - 5.0).abs() < 0.001)
+    print("Distance ✓")
+
+    // Steps counter
+    assert(sim.steps > 0)
+    assert(sim.time > 0.0)
+    print("Steps ✓")
+
+    print("N-body complete ✓")
+}
