@@ -1,256 +1,255 @@
-// Code Profiler
-// Hierarchical timer-based profiler for measuring function execution times.
+
+// Performance Profiler
+// Hierarchical timer with call stacks, flame graph data, and statistical summaries.
 
 use std.collections.HashMap
-use std.time.{Instant, Duration}
-use std.fmt.{Display, Formatter}
 
-#[derive(Clone, Debug)]
-struct ProfileEntry {
+struct TimerEntry {
     name: string,
-    total_time: Duration,
-    call_count: usize,
-    min_time: Duration,
-    max_time: Duration,
-    children: [string],
+    start_ns: u64,
+    end_ns: Option<u64>,
+    parent: Option<usize>,
+    children: [usize],
+    call_count: u64,
+    total_ns: u64,
 }
 
-impl ProfileEntry {
-    fn new(name: &str) -> ProfileEntry {
-        ProfileEntry {
-            name: name.to_string(),
-            total_time: Duration.ZERO,
-            call_count: 0,
-            min_time: Duration.from_secs(999999),
-            max_time: Duration.ZERO,
-            children: [],
+impl TimerEntry {
+    fn duration_ns(self) -> u64 {
+        match self.end_ns {
+            Some(end) => end - self.start_ns,
+            None => 0,
         }
     }
 
-    fn avg_time(self) -> Duration {
-        if self.call_count == 0 { Duration.ZERO }
-        else { self.total_time / self.call_count as u32 }
+    fn self_time_ns(self, entries: &[TimerEntry]) -> u64 {
+        let child_time: u64 = self.children.iter()
+            .map(|&idx| entries[idx].duration_ns())
+            .sum()
+        self.duration_ns().saturating_sub(child_time)
     }
-
-    fn record(mut self, elapsed: Duration) {
-        self.total_time = self.total_time + elapsed
-        self.call_count += 1
-        if elapsed < self.min_time { self.min_time = elapsed }
-        if elapsed > self.max_time { self.max_time = elapsed }
-    }
-}
-
-struct ProfileScope {
-    name: string,
-    start: Instant,
 }
 
 struct Profiler {
-    entries: HashMap<string, ProfileEntry>,
-    stack: [ProfileScope],
-    enabled: bool,
+    entries: [TimerEntry],
+    name_index: HashMap<string, [usize]>,
+    stack: [usize],
+    clock: u64,
+    overhead_ns: u64,
 }
 
 impl Profiler {
     fn new() -> Profiler {
-        Profiler { entries: HashMap.new(), stack: [], enabled: true }
+        Profiler {
+            entries: [], name_index: HashMap.new(),
+            stack: [], clock: 0, overhead_ns: 0,
+        }
     }
-
-    fn enable(mut self) { self.enabled = true }
-    fn disable(mut self) { self.enabled = false }
-    fn is_enabled(self) -> bool { self.enabled }
 
     fn begin(mut self, name: &str) {
-        if !self.enabled { return }
-        // Track parent-child relationship
-        if let some(parent) = self.stack.last() {
-            let parent_name = parent.name.clone()
-            let entry = self.entries.entry(parent_name).or_insert(ProfileEntry.new(&parent.name))
-            if !entry.children.contains(&name.to_string()) {
-                entry.children.push(name.to_string())
-            }
+        let idx = self.entries.len()
+        let parent = self.stack.last().copied()
+        self.entries.push(TimerEntry {
+            name: name.into(), start_ns: self.clock, end_ns: None,
+            parent, children: [], call_count: 1, total_ns: 0,
+        })
+        if let Some(p) = parent {
+            self.entries[p].children.push(idx)
         }
-        self.stack.push(ProfileScope { name: name.to_string(), start: Instant.now() })
+        self.name_index.entry(name.into()).or_insert_with(|| []).push(idx)
+        self.stack.push(idx)
     }
 
-    fn end(mut self) -> Option<Duration> {
-        if !self.enabled { return none }
-        let scope = self.stack.pop()?
-        let elapsed = scope.start.elapsed()
-        self.entries.entry(scope.name.clone())
-            .or_insert(ProfileEntry.new(&scope.name))
-            .record(elapsed)
-        some(elapsed)
+    fn end(mut self) {
+        if let Some(idx) = self.stack.pop() {
+            self.entries[idx].end_ns = Some(self.clock)
+            self.entries[idx].total_ns = self.entries[idx].duration_ns()
+        }
     }
 
-    fn get(self, name: &str) -> Option<&ProfileEntry> {
-        self.entries.get(&name.to_string())
-    }
+    fn advance(mut self, ns: u64) { self.clock += ns }
 
-    fn total_time(self) -> Duration {
-        // Sum only root-level entries (those not appearing as children)
-        let all_children: Vec<&string> = self.entries.values()
-            .flat_map(|e| e.children.iter())
-            .collect();
+    fn total_time_ns(self) -> u64 {
         self.entries.iter()
-            .filter(|(name, _)| !all_children.contains(&name))
-            .map(|(_, e)| e.total_time)
+            .filter(|e| e.parent.is_none())
+            .map(|e| e.duration_ns())
             .sum()
-    }
-
-    fn reset(mut self) {
-        self.entries.clear()
-        self.stack.clear()
     }
 
     fn entry_count(self) -> usize { self.entries.len() }
 
-    fn sorted_by_total(self) -> [&ProfileEntry] {
-        let mut entries: [&ProfileEntry] = self.entries.values().collect()
-        entries.sort_by(|a, b| b.total_time.cmp(&a.total_time))
-        entries
+    fn stats_for(self, name: &str) -> Option<ProfileStats> {
+        let indices = self.name_index.get(name)?
+        if indices.is_empty() { return None }
+        let mut total = 0u64
+        let mut self_total = 0u64
+        let mut min = u64.MAX
+        let mut max = 0u64
+        let count = indices.len() as u64
+        for &idx in indices {
+            let dur = self.entries[idx].duration_ns()
+            total += dur
+            self_total += self.entries[idx].self_time_ns(&self.entries)
+            min = min.min(dur)
+            max = max.max(dur)
+        }
+        Some(ProfileStats {
+            name: name.into(), call_count: count,
+            total_ns: total, self_ns: self_total,
+            avg_ns: total / count, min_ns: min, max_ns: max,
+        })
     }
 
-    fn report(self) -> string {
-        let mut out = String.new()
-        out.push_str("Profile Report\n")
-        out.push_str("==============\n")
-        for entry in self.sorted_by_total() {
-            out.push_str(&format!(
-                "{}: calls={} total={:?} avg={:?} min={:?} max={:?}\n",
-                entry.name, entry.call_count, entry.total_time,
-                entry.avg_time(), entry.min_time, entry.max_time,
-            ))
+    fn hotspots(self, top_n: usize) -> [ProfileStats] {
+        let mut all: [ProfileStats] = self.name_index.keys()
+            .filter_map(|name| self.stats_for(name))
+            .collect()
+        all.sort_by(|a, b| b.self_ns.cmp(&a.self_ns))
+        all.truncate(top_n)
+        all
+    }
+
+    fn flame_data(self) -> [FlameEntry] {
+        let mut result = []
+        for (i, entry) in self.entries.iter().enumerate() {
+            let depth = self.depth(i)
+            result.push(FlameEntry {
+                name: entry.name.clone(),
+                depth,
+                start_ns: entry.start_ns,
+                duration_ns: entry.duration_ns(),
+            })
         }
-        out
+        result
+    }
+
+    fn depth(self, idx: usize) -> usize {
+        let mut d = 0
+        let mut current = self.entries[idx].parent
+        while let Some(p) = current {
+            d += 1
+            current = self.entries[p].parent
+        }
+        d
     }
 }
 
-// Simulated profiling data for testing
-fn create_test_profiler() -> Profiler {
-    let mut p = Profiler.new()
+struct ProfileStats {
+    name: string,
+    call_count: u64,
+    total_ns: u64,
+    self_ns: u64,
+    avg_ns: u64,
+    min_ns: u64,
+    max_ns: u64,
+}
 
-    // Manually add entries for deterministic tests
-    let mut render = ProfileEntry.new("render")
-    render.record(Duration.from_millis(16))
-    render.record(Duration.from_millis(18))
-    render.record(Duration.from_millis(14))
-    render.children = vec!["draw_sprites".into(), "draw_ui".into()]
-
-    let mut draw_sprites = ProfileEntry.new("draw_sprites")
-    draw_sprites.record(Duration.from_millis(8))
-    draw_sprites.record(Duration.from_millis(10))
-    draw_sprites.record(Duration.from_millis(6))
-
-    let mut draw_ui = ProfileEntry.new("draw_ui")
-    draw_ui.record(Duration.from_millis(4))
-    draw_ui.record(Duration.from_millis(5))
-    draw_ui.record(Duration.from_millis(3))
-
-    let mut update = ProfileEntry.new("update")
-    update.record(Duration.from_millis(5))
-    update.record(Duration.from_millis(7))
-
-    p.entries.insert("render".into(), render)
-    p.entries.insert("draw_sprites".into(), draw_sprites)
-    p.entries.insert("draw_ui".into(), draw_ui)
-    p.entries.insert("update".into(), update)
-    p
+struct FlameEntry {
+    name: string,
+    depth: usize,
+    start_ns: u64,
+    duration_ns: u64,
 }
 
 fn main() {
-    // ProfileEntry basics
-    let mut e = ProfileEntry.new("test")
-    assert(e.call_count == 0)
-    assert(e.total_time == Duration.ZERO)
-    e.record(Duration.from_millis(10))
-    e.record(Duration.from_millis(20))
-    assert(e.call_count == 2)
-    assert(e.total_time == Duration.from_millis(30))
-    assert(e.avg_time() == Duration.from_millis(15))
-    assert(e.min_time == Duration.from_millis(10))
-    assert(e.max_time == Duration.from_millis(20))
-    print("ProfileEntry ✓")
-
-    // Zero call avg
-    assert(ProfileEntry.new("empty").avg_time() == Duration.ZERO)
-    print("Zero avg ✓")
-
-    // Profiler creation
     let mut p = Profiler.new()
-    assert(p.is_enabled())
-    assert(p.entry_count() == 0)
-    print("Profiler create ✓")
 
-    // Begin/end
-    p.begin("work")
-    let elapsed = p.end().unwrap()
-    assert(elapsed >= Duration.ZERO)
-    assert(p.entry_count() == 1)
-    assert(p.get("work").unwrap().call_count == 1)
-    print("Begin/end ✓")
-
-    // Multiple calls
-    p.begin("work")
+    // Basic timing
+    p.begin("main")
+    p.advance(100)
     p.end()
-    assert(p.get("work").unwrap().call_count == 2)
-    print("Multiple calls ✓")
+    assert(p.entry_count() == 1)
+    assert(p.total_time_ns() == 100)
+    print("Basic timing ✓")
 
-    // Nested scopes
+    // Nested timing
     let mut p2 = Profiler.new()
     p2.begin("outer")
+    p2.advance(10)
     p2.begin("inner")
+    p2.advance(50)
     p2.end()
+    p2.advance(10)
     p2.end()
     assert(p2.entry_count() == 2)
-    assert(p2.get("outer").unwrap().children.contains(&"inner".to_string()))
-    print("Nested scopes ✓")
+    assert(p2.total_time_ns() == 70)
+    print("Nested ✓")
 
-    // Disabled profiler
+    // Self time
+    let stats = p2.stats_for("outer").unwrap()
+    assert(stats.total_ns == 70)
+    assert(stats.self_ns == 20)  // 70 - 50 inner
+    print("Self time ✓")
+
+    // Inner stats
+    let inner_stats = p2.stats_for("inner").unwrap()
+    assert(inner_stats.total_ns == 50)
+    assert(inner_stats.self_ns == 50)
+    assert(inner_stats.call_count == 1)
+    print("Inner stats ✓")
+
+    // Multiple calls
     let mut p3 = Profiler.new()
-    p3.disable()
-    assert(!p3.is_enabled())
-    p3.begin("skip")
-    assert(p3.end().is_none())
-    assert(p3.entry_count() == 0)
-    p3.enable()
-    p3.begin("counted")
+    p3.begin("func")
+    p3.advance(10)
     p3.end()
-    assert(p3.entry_count() == 1)
-    print("Enable/disable ✓")
+    p3.begin("func")
+    p3.advance(30)
+    p3.end()
+    p3.begin("func")
+    p3.advance(20)
+    p3.end()
+    let fs = p3.stats_for("func").unwrap()
+    assert(fs.call_count == 3)
+    assert(fs.total_ns == 60)
+    assert(fs.avg_ns == 20)
+    assert(fs.min_ns == 10)
+    assert(fs.max_ns == 30)
+    print("Multiple calls ✓")
 
-    // Reset
-    p.reset()
-    assert(p.entry_count() == 0)
-    print("Reset ✓")
-
-    // Test profiler with known data
-    let tp = create_test_profiler()
-    assert(tp.entry_count() == 4)
-
-    let render = tp.get("render").unwrap()
-    assert(render.call_count == 3)
-    assert(render.total_time == Duration.from_millis(48))
-    assert(render.min_time == Duration.from_millis(14))
-    assert(render.max_time == Duration.from_millis(18))
-    print("Test data ✓")
-
-    // Sorted by total
-    let sorted = tp.sorted_by_total()
-    assert(sorted[0].name == "render")
-    print("Sorted ✓")
-
-    // Report
-    let report = tp.report()
-    assert(report.contains("render"))
-    assert(report.contains("draw_sprites"))
-    assert(report.contains("update"))
-    print("Report ✓")
-
-    // Empty end returns none
+    // Hotspots
     let mut p4 = Profiler.new()
-    assert(p4.end().is_none())
-    print("Empty end ✓")
+    p4.begin("fast")
+    p4.advance(5)
+    p4.end()
+    p4.begin("slow")
+    p4.advance(100)
+    p4.end()
+    p4.begin("medium")
+    p4.advance(50)
+    p4.end()
+    let hot = p4.hotspots(2)
+    assert(hot.len() == 2)
+    assert(hot[0].name == "slow")
+    assert(hot[1].name == "medium")
+    print("Hotspots ✓")
+
+    // Flame data
+    let flame = p2.flame_data()
+    assert(flame.len() == 2)
+    assert(flame[0].depth == 0)
+    assert(flame[0].name == "outer")
+    assert(flame[1].depth == 1)
+    assert(flame[1].name == "inner")
+    print("Flame data ✓")
+
+    // Depth calculation
+    let mut p5 = Profiler.new()
+    p5.begin("a")
+    p5.begin("b")
+    p5.begin("c")
+    p5.advance(10)
+    p5.end()
+    p5.end()
+    p5.end()
+    assert(p5.depth(0) == 0)
+    assert(p5.depth(1) == 1)
+    assert(p5.depth(2) == 2)
+    print("Depth ✓")
+
+    // Missing name
+    assert(p5.stats_for("nonexistent").is_none())
+    print("Missing name ✓")
 
     print("Profiler complete ✓")
 }
