@@ -1,0 +1,185 @@
+// Advent of Code - Day 2 Style Puzzle
+// Rock Paper Scissors tournament scoring.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shape {
+    Rock,
+    Paper,
+    Scissors,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Outcome {
+    Win,
+    Draw,
+    Loss,
+}
+
+impl Shape {
+    fn score(self) -> i64 {
+        match self { Shape.Rock => 1, Shape.Paper => 2, Shape.Scissors => 3 }
+    }
+
+    fn beats(self) -> Shape {
+        match self { Shape.Rock => Shape.Scissors, Shape.Paper => Shape.Rock, Shape.Scissors => Shape.Paper }
+    }
+
+    fn loses_to(self) -> Shape {
+        match self { Shape.Rock => Shape.Paper, Shape.Paper => Shape.Scissors, Shape.Scissors => Shape.Rock }
+    }
+
+    fn play(self, other: Shape) -> Outcome {
+        if self == other { Outcome.Draw }
+        else if self.beats() == other { Outcome.Win }
+        else { Outcome.Loss }
+    }
+
+    fn from_char(c: char) -> Option<Shape> {
+        match c {
+            'A' | 'X' => some(Shape.Rock),
+            'B' | 'Y' => some(Shape.Paper),
+            'C' | 'Z' => some(Shape.Scissors),
+            _ => none,
+        }
+    }
+}
+
+impl Outcome {
+    fn score(self) -> i64 {
+        match self { Outcome.Loss => 0, Outcome.Draw => 3, Outcome.Win => 6 }
+    }
+
+    fn from_char(c: char) -> Option<Outcome> {
+        match c {
+            'X' => some(Outcome.Loss),
+            'Y' => some(Outcome.Draw),
+            'Z' => some(Outcome.Win),
+            _ => none,
+        }
+    }
+
+    fn choose_shape(self, opponent: Shape) -> Shape {
+        match self {
+            Outcome.Draw => opponent,
+            Outcome.Win => opponent.loses_to(),
+            Outcome.Loss => opponent.beats(),
+        }
+    }
+}
+
+fn round_score(mine: Shape, opponent: Shape) -> i64 {
+    mine.play(opponent).score() + mine.score()
+}
+
+fn parse_rounds(input: &str) -> [(char, char)] {
+    input.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let chars: [char] = line.trim().chars().collect()
+            (chars[0], chars[2])
+        })
+        .collect()
+}
+
+fn part1(input: &str) -> i64 {
+    parse_rounds(input).iter().map(|(opp, mine)| {
+        let o = Shape.from_char(*opp).unwrap()
+        let m = Shape.from_char(*mine).unwrap()
+        round_score(m, o)
+    }).sum()
+}
+
+fn part2(input: &str) -> i64 {
+    parse_rounds(input).iter().map(|(opp, outcome)| {
+        let o = Shape.from_char(*opp).unwrap()
+        let target = Outcome.from_char(*outcome).unwrap()
+        let m = target.choose_shape(o)
+        round_score(m, o)
+    }).sum()
+}
+
+fn main() {
+    let input = "A Y\nB X\nC Z"
+
+    // Shape basics
+    assert(Shape.Rock.score() == 1)
+    assert(Shape.Paper.score() == 2)
+    assert(Shape.Scissors.score() == 3)
+    print("Shape scores ✓")
+
+    // Beats
+    assert(Shape.Rock.beats() == Shape.Scissors)
+    assert(Shape.Paper.beats() == Shape.Rock)
+    assert(Shape.Scissors.beats() == Shape.Paper)
+    print("Beats ✓")
+
+    // Play
+    assert(Shape.Rock.play(Shape.Scissors) == Outcome.Win)
+    assert(Shape.Rock.play(Shape.Rock) == Outcome.Draw)
+    assert(Shape.Rock.play(Shape.Paper) == Outcome.Loss)
+    print("Play ✓")
+
+    // Outcome scores
+    assert(Outcome.Win.score() == 6)
+    assert(Outcome.Draw.score() == 3)
+    assert(Outcome.Loss.score() == 0)
+    print("Outcome scores ✓")
+
+    // Round scoring
+    assert(round_score(Shape.Paper, Shape.Rock) == 8)     // 2 + 6
+    assert(round_score(Shape.Rock, Shape.Paper) == 1)     // 1 + 0
+    assert(round_score(Shape.Scissors, Shape.Scissors) == 6) // 3 + 3
+    print("Round score ✓")
+
+    // Part 1
+    assert(part1(input) == 15)
+    print("Part 1 ✓")
+
+    // Part 2 (X=lose, Y=draw, Z=win)
+    // A Y -> Rock Draw -> Rock: 1+3=4
+    // B X -> Paper Lose -> Rock: 1+0=1
+    // C Z -> Scissors Win -> Rock: 1+6=7
+    assert(part2(input) == 12)
+    print("Part 2 ✓")
+
+    // choose_shape
+    assert(Outcome.Draw.choose_shape(Shape.Rock) == Shape.Rock)
+    assert(Outcome.Win.choose_shape(Shape.Rock) == Shape.Paper)
+    assert(Outcome.Loss.choose_shape(Shape.Rock) == Shape.Scissors)
+    print("Choose shape ✓")
+
+    // Parse rounds
+    let rounds = parse_rounds(input)
+    assert(rounds.len() == 3)
+    assert(rounds[0] == ('A', 'Y'))
+    print("Parse rounds ✓")
+
+    // from_char
+    assert(Shape.from_char('A') == some(Shape.Rock))
+    assert(Shape.from_char('Z') == some(Shape.Scissors))
+    assert(Shape.from_char('Q').is_none())
+    assert(Outcome.from_char('X') == some(Outcome.Loss))
+    assert(Outcome.from_char('?').is_none())
+    print("from_char ✓")
+
+    // loses_to
+    assert(Shape.Rock.loses_to() == Shape.Paper)
+    assert(Shape.Paper.loses_to() == Shape.Scissors)
+    print("loses_to ✓")
+
+    // All matchups
+    let shapes = vec![Shape.Rock, Shape.Paper, Shape.Scissors]
+    for s in &shapes {
+        assert(s.play(*s) == Outcome.Draw)
+        assert(s.play(s.beats()) == Outcome.Win)
+        assert(s.play(s.loses_to()) == Outcome.Loss)
+    }
+    print("All matchups ✓")
+
+    // Empty input
+    assert(part1("") == 0)
+    assert(part2("") == 0)
+    print("Empty input ✓")
+
+    print("AoC Day 2 complete ✓")
+}
