@@ -1,0 +1,244 @@
+
+// HTTP/2 Frame Parser - Binary framing layer for HTTP/2
+// Parses and constructs HTTP/2 frames per RFC 7540.
+
+const FRAME_HEADER_SIZE: usize = 9
+const MAX_FRAME_SIZE: u32 = 16384
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FrameType {
+    Data,       // 0x0
+    Headers,    // 0x1
+    Priority,   // 0x2
+    RstStream,  // 0x3
+    Settings,   // 0x4
+    PushPromise,// 0x5
+    Ping,       // 0x6
+    GoAway,     // 0x7
+    WindowUpdate,// 0x8
+    Continuation,// 0x9
+    Unknown(u8),
+}
+
+impl FrameType {
+    fn from_byte(b: u8) -> FrameType {
+        match b {
+            0 => FrameType.Data, 1 => FrameType.Headers, 2 => FrameType.Priority,
+            3 => FrameType.RstStream, 4 => FrameType.Settings, 5 => FrameType.PushPromise,
+            6 => FrameType.Ping, 7 => FrameType.GoAway, 8 => FrameType.WindowUpdate,
+            9 => FrameType.Continuation, other => FrameType.Unknown(other),
+        }
+    }
+    fn to_byte(self) -> u8 {
+        match self {
+            FrameType.Data => 0, FrameType.Headers => 1, FrameType.Priority => 2,
+            FrameType.RstStream => 3, FrameType.Settings => 4, FrameType.PushPromise => 5,
+            FrameType.Ping => 6, FrameType.GoAway => 7, FrameType.WindowUpdate => 8,
+            FrameType.Continuation => 9, FrameType.Unknown(b) => b,
+        }
+    }
+    fn name(self) -> &str {
+        match self {
+            FrameType.Data => "DATA", FrameType.Headers => "HEADERS",
+            FrameType.Priority => "PRIORITY", FrameType.RstStream => "RST_STREAM",
+            FrameType.Settings => "SETTINGS", FrameType.PushPromise => "PUSH_PROMISE",
+            FrameType.Ping => "PING", FrameType.GoAway => "GOAWAY",
+            FrameType.WindowUpdate => "WINDOW_UPDATE", FrameType.Continuation => "CONTINUATION",
+            FrameType.Unknown(_) => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameFlags(u8);
+
+impl FrameFlags {
+    fn empty() -> FrameFlags { FrameFlags(0) }
+    fn new(bits: u8) -> FrameFlags { FrameFlags(bits) }
+    fn has(self, flag: u8) -> bool { self.0 & flag != 0 }
+    fn set(self, flag: u8) -> FrameFlags { FrameFlags(self.0 | flag) }
+    fn end_stream() -> u8 { 0x1 }
+    fn end_headers() -> u8 { 0x4 }
+    fn padded() -> u8 { 0x8 }
+    fn priority_flag() -> u8 { 0x20 }
+    fn ack() -> u8 { 0x1 }
+    fn is_end_stream(self) -> bool { self.has(FrameFlags.end_stream()) }
+    fn is_end_headers(self) -> bool { self.has(FrameFlags.end_headers()) }
+    fn is_ack(self) -> bool { self.has(FrameFlags.ack()) }
+    fn is_padded(self) -> bool { self.has(FrameFlags.padded()) }
+}
+
+#[derive(Clone, Debug)]
+struct Frame {
+    length: u32,
+    frame_type: FrameType,
+    flags: FrameFlags,
+    stream_id: u32,
+    payload: [u8],
+}
+
+impl Frame {
+    fn new(frame_type: FrameType, stream_id: u32, payload: &[u8]) -> Frame {
+        Frame { length: payload.len() as u32, frame_type, flags: FrameFlags.empty(), stream_id, payload: payload.to_vec() }
+    }
+    fn with_flags(mut self, flags: FrameFlags) -> Frame { self.flags = flags; self }
+
+    fn encode(self) -> [u8] {
+        let mut buf = []
+        buf.push((self.length >> 16) as u8)
+        buf.push((self.length >> 8) as u8)
+        buf.push(self.length as u8)
+        buf.push(self.frame_type.to_byte())
+        buf.push(self.flags.0)
+        buf.push((self.stream_id >> 24) as u8 & 0x7F)
+        buf.push((self.stream_id >> 16) as u8)
+        buf.push((self.stream_id >> 8) as u8)
+        buf.push(self.stream_id as u8)
+        buf.extend_from_slice(&self.payload)
+        buf
+    }
+
+    fn decode(data: &[u8]) -> Option<Frame> {
+        if data.len() < FRAME_HEADER_SIZE { return None }
+        let length = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32)
+        let frame_type = FrameType.from_byte(data[3])
+        let flags = FrameFlags.new(data[4])
+        let stream_id = ((data[5] as u32 & 0x7F) << 24) | ((data[6] as u32) << 16) | ((data[7] as u32) << 8) | (data[8] as u32)
+        if data.len() < FRAME_HEADER_SIZE + length as usize { return None }
+        let payload = data[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + length as usize].to_vec()
+        Some(Frame { length, frame_type, flags, stream_id, payload })
+    }
+
+    fn is_valid_size(self) -> bool { self.length <= MAX_FRAME_SIZE }
+}
+
+#[derive(Clone, Debug)]
+struct SettingsEntry {
+    id: u16,
+    value: u32,
+}
+
+impl SettingsEntry {
+    fn header_table_size(val: u32) -> SettingsEntry { SettingsEntry { id: 0x1, value: val } }
+    fn enable_push(val: bool) -> SettingsEntry { SettingsEntry { id: 0x2, value: if val { 1 } else { 0 } } }
+    fn max_concurrent(val: u32) -> SettingsEntry { SettingsEntry { id: 0x3, value: val } }
+    fn initial_window_size(val: u32) -> SettingsEntry { SettingsEntry { id: 0x4, value: val } }
+    fn max_frame_size(val: u32) -> SettingsEntry { SettingsEntry { id: 0x5, value: val } }
+    fn max_header_list_size(val: u32) -> SettingsEntry { SettingsEntry { id: 0x6, value: val } }
+
+    fn encode(self) -> [u8] {
+        let mut buf = []
+        buf.push((self.id >> 8) as u8)
+        buf.push(self.id as u8)
+        buf.push((self.value >> 24) as u8)
+        buf.push((self.value >> 16) as u8)
+        buf.push((self.value >> 8) as u8)
+        buf.push(self.value as u8)
+        buf
+    }
+}
+
+fn build_settings_frame(settings: &[SettingsEntry]) -> Frame {
+    let mut payload = []
+    for s in settings { payload.extend_from_slice(&s.encode()) }
+    Frame.new(FrameType.Settings, 0, &payload)
+}
+
+fn build_data_frame(stream_id: u32, data: &[u8], end: bool) -> Frame {
+    let mut f = Frame.new(FrameType.Data, stream_id, data)
+    if end { f = f.with_flags(FrameFlags.new(FrameFlags.end_stream())) }
+    f
+}
+
+fn build_ping_frame(opaque: &[u8; 8], ack: bool) -> Frame {
+    let mut f = Frame.new(FrameType.Ping, 0, opaque)
+    if ack { f = f.with_flags(FrameFlags.new(FrameFlags.ack())) }
+    f
+}
+
+fn main() {
+    // FrameType
+    assert(FrameType.from_byte(0) == FrameType.Data)
+    assert(FrameType.from_byte(1) == FrameType.Headers)
+    assert(FrameType.from_byte(4) == FrameType.Settings)
+    assert(FrameType.Data.to_byte() == 0)
+    assert(FrameType.Headers.name() == "HEADERS")
+    print("FrameType ✓")
+
+    // FrameFlags
+    let flags = FrameFlags.empty().set(FrameFlags.end_stream()).set(FrameFlags.end_headers())
+    assert(flags.is_end_stream())
+    assert(flags.is_end_headers())
+    assert(!flags.is_padded())
+    let ack_flags = FrameFlags.new(FrameFlags.ack())
+    assert(ack_flags.is_ack())
+    print("Flags ✓")
+
+    // Frame encode/decode
+    let payload = [0x48, 0x65, 0x6C, 0x6C, 0x6F]  // "Hello"
+    let frame = Frame.new(FrameType.Data, 1, &payload)
+        .with_flags(FrameFlags.new(FrameFlags.end_stream()))
+    let encoded = frame.encode()
+    assert(encoded.len() == FRAME_HEADER_SIZE + 5)
+    assert(encoded[3] == 0)  // DATA type
+    assert(encoded[4] == 1)  // END_STREAM flag
+    print("Encode ✓")
+
+    // Decode
+    let decoded = Frame.decode(&encoded).unwrap()
+    assert(decoded.length == 5)
+    assert(decoded.frame_type == FrameType.Data)
+    assert(decoded.stream_id == 1)
+    assert(decoded.flags.is_end_stream())
+    assert(decoded.payload == payload)
+    print("Decode ✓")
+
+    // Invalid decode
+    assert(Frame.decode(&[0, 0]).is_none())  // too short
+    print("Invalid ✓")
+
+    // Settings
+    let settings = [
+        SettingsEntry.max_concurrent(100),
+        SettingsEntry.initial_window_size(65535),
+        SettingsEntry.max_frame_size(16384),
+    ]
+    let sf = build_settings_frame(&settings)
+    assert(sf.frame_type == FrameType.Settings)
+    assert(sf.stream_id == 0)
+    assert(sf.payload.len() == 18)  // 3 entries * 6 bytes
+    print("Settings ✓")
+
+    // Data frame
+    let df = build_data_frame(3, &[1, 2, 3], true)
+    assert(df.stream_id == 3)
+    assert(df.flags.is_end_stream())
+    assert(df.payload.len() == 3)
+    print("Data frame ✓")
+
+    // Ping
+    let ping_data: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1]
+    let ping = build_ping_frame(&ping_data, false)
+    assert(ping.frame_type == FrameType.Ping)
+    assert(!ping.flags.is_ack())
+    let pong = build_ping_frame(&ping_data, true)
+    assert(pong.flags.is_ack())
+    print("Ping ✓")
+
+    // Round-trip
+    let original = Frame.new(FrameType.Headers, 5, &[10, 20, 30, 40])
+        .with_flags(FrameFlags.new(FrameFlags.end_headers()))
+    let bytes = original.encode()
+    let restored = Frame.decode(&bytes).unwrap()
+    assert(restored.frame_type == FrameType.Headers)
+    assert(restored.stream_id == 5)
+    assert(restored.flags.is_end_headers())
+    assert(restored.payload == [10, 20, 30, 40])
+    print("Round-trip ✓")
+
+    // Size validation
+    assert(Frame.new(FrameType.Data, 1, &[0u8; 100]).is_valid_size())
+    print("Size ✓")
+
+    print("HTTP/2 parser complete ✓")
+}
