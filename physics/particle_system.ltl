@@ -1,0 +1,260 @@
+// Particle System Simulation
+// Simple 2D particle physics with gravity, drag, and collision.
+
+use std.math.{sqrt, PI}
+
+#[derive(Clone, Debug)]
+struct Vec2 {
+    x: f64,
+    y: f64,
+}
+
+impl Vec2 {
+    fn zero() -> Vec2 { Vec2 { x: 0.0, y: 0.0 } }
+    fn new(x: f64, y: f64) -> Vec2 { Vec2 { x, y } }
+    fn add(self, other: &Vec2) -> Vec2 { Vec2 { x: self.x + other.x, y: self.y + other.y } }
+    fn sub(self, other: &Vec2) -> Vec2 { Vec2 { x: self.x - other.x, y: self.y - other.y } }
+    fn scale(self, s: f64) -> Vec2 { Vec2 { x: self.x * s, y: self.y * s } }
+    fn length(self) -> f64 { sqrt(self.x * self.x + self.y * self.y) }
+    fn length_sq(self) -> f64 { self.x * self.x + self.y * self.y }
+    fn normalize(self) -> Vec2 {
+        let l = self.length()
+        if l < 1e-10 { Vec2.zero() } else { self.scale(1.0 / l) }
+    }
+    fn dot(self, other: &Vec2) -> f64 { self.x * other.x + self.y * other.y }
+    fn distance(self, other: &Vec2) -> f64 { self.sub(other).length() }
+}
+
+#[derive(Clone, Debug)]
+struct Particle {
+    pos: Vec2,
+    vel: Vec2,
+    acc: Vec2,
+    mass: f64,
+    radius: f64,
+    life: f64,       // remaining life in seconds
+    max_life: f64,
+    alive: bool,
+    color: (f64, f64, f64),  // RGB 0-1
+}
+
+impl Particle {
+    fn new(pos: Vec2, vel: Vec2, mass: f64, life: f64) -> Particle {
+        Particle {
+            pos, vel, acc: Vec2.zero(),
+            mass, radius: mass.sqrt() * 2.0,
+            life, max_life: life, alive: true,
+            color: (1.0, 1.0, 1.0),
+        }
+    }
+
+    fn apply_force(mut self, force: Vec2) {
+        let a = force.scale(1.0 / self.mass)
+        self.acc = self.acc.add(&a)
+    }
+
+    fn update(mut self, dt: f64) {
+        if !self.alive { return }
+        self.vel = self.vel.add(&self.acc.scale(dt))
+        self.pos = self.pos.add(&self.vel.scale(dt))
+        self.acc = Vec2.zero()
+        self.life -= dt
+        if self.life <= 0.0 { self.alive = false }
+    }
+
+    fn life_ratio(self) -> f64 {
+        if self.max_life <= 0.0 { 0.0 }
+        else { (self.life / self.max_life).max(0.0) }
+    }
+
+    fn kinetic_energy(self) -> f64 {
+        0.5 * self.mass * self.vel.length_sq()
+    }
+}
+
+struct ParticleSystem {
+    particles: [Particle],
+    gravity: Vec2,
+    drag: f64,
+    bounds: Option<(f64, f64, f64, f64)>,  // min_x, min_y, max_x, max_y
+}
+
+impl ParticleSystem {
+    fn new() -> ParticleSystem {
+        ParticleSystem {
+            particles: [],
+            gravity: Vec2.new(0.0, -9.81),
+            drag: 0.01,
+            bounds: none,
+        }
+    }
+
+    fn with_gravity(mut self, g: Vec2) -> ParticleSystem { self.gravity = g; self }
+    fn with_drag(mut self, d: f64) -> ParticleSystem { self.drag = d; self }
+    fn with_bounds(mut self, min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> ParticleSystem {
+        self.bounds = some((min_x, min_y, max_x, max_y)); self
+    }
+
+    fn emit(mut self, p: Particle) { self.particles.push(p) }
+
+    fn emit_burst(mut self, origin: Vec2, count: usize, speed: f64, life: f64, mass: f64) {
+        for i in 0..count {
+            let angle = 2.0 * PI * (i as f64) / (count as f64)
+            let vel = Vec2.new(speed * angle.cos(), speed * angle.sin())
+            self.emit(Particle.new(origin.clone(), vel, mass, life))
+        }
+    }
+
+    fn update(mut self, dt: f64) {
+        for p in &mut self.particles {
+            if !p.alive { continue }
+            // Gravity
+            p.apply_force(self.gravity.scale(p.mass))
+            // Drag
+            let drag_force = p.vel.scale(-self.drag * p.vel.length())
+            p.apply_force(drag_force)
+            p.update(dt)
+            // Bounds
+            if let some((min_x, min_y, max_x, max_y)) = self.bounds {
+                if p.pos.x < min_x { p.pos.x = min_x; p.vel.x = -p.vel.x * 0.8 }
+                if p.pos.x > max_x { p.pos.x = max_x; p.vel.x = -p.vel.x * 0.8 }
+                if p.pos.y < min_y { p.pos.y = min_y; p.vel.y = -p.vel.y * 0.8 }
+                if p.pos.y > max_y { p.pos.y = max_y; p.vel.y = -p.vel.y * 0.8 }
+            }
+        }
+    }
+
+    fn remove_dead(mut self) {
+        self.particles.retain(|p| p.alive)
+    }
+
+    fn alive_count(self) -> usize {
+        self.particles.iter().filter(|p| p.alive).count()
+    }
+
+    fn total_count(self) -> usize { self.particles.len() }
+
+    fn total_kinetic_energy(self) -> f64 {
+        self.particles.iter()
+            .filter(|p| p.alive)
+            .map(|p| p.kinetic_energy())
+            .sum()
+    }
+
+    fn center_of_mass(self) -> Vec2 {
+        let alive: [&Particle] = self.particles.iter().filter(|p| p.alive).collect()
+        if alive.is_empty() { return Vec2.zero() }
+        let total_mass: f64 = alive.iter().map(|p| p.mass).sum()
+        let wx: f64 = alive.iter().map(|p| p.pos.x * p.mass).sum()
+        let wy: f64 = alive.iter().map(|p| p.pos.y * p.mass).sum()
+        Vec2.new(wx / total_mass, wy / total_mass)
+    }
+}
+
+fn main() {
+    let eps = 1e-6
+
+    // Vec2 basics
+    let v = Vec2.new(3.0, 4.0)
+    assert((v.length() - 5.0).abs() < eps)
+    assert(v.dot(&v) == 25.0)
+    let n = v.normalize()
+    assert((n.length() - 1.0).abs() < eps)
+    print("Vec2 ✓")
+
+    // Vec2 arithmetic
+    let a = Vec2.new(1.0, 2.0)
+    let b = Vec2.new(3.0, 1.0)
+    assert(a.add(&b).x == 4.0)
+    assert(a.sub(&b).y == 1.0)
+    assert(a.scale(3.0).x == 3.0)
+    assert((a.distance(&b) - sqrt(5.0)).abs() < eps)
+    print("Vec2 arithmetic ✓")
+
+    // Particle creation
+    let p = Particle.new(Vec2.zero(), Vec2.new(10.0, 0.0), 1.0, 5.0)
+    assert(p.alive)
+    assert(p.life == 5.0)
+    assert(p.life_ratio() == 1.0)
+    print("Particle create ✓")
+
+    // Particle update
+    let mut p2 = Particle.new(Vec2.zero(), Vec2.new(10.0, 0.0), 1.0, 5.0)
+    p2.update(1.0)
+    assert((p2.pos.x - 10.0).abs() < eps)
+    assert(p2.life == 4.0)
+    print("Particle update ✓")
+
+    // Particle death
+    let mut p3 = Particle.new(Vec2.zero(), Vec2.zero(), 1.0, 0.5)
+    p3.update(1.0)
+    assert(!p3.alive)
+    assert(p3.life_ratio() == 0.0)
+    print("Particle death ✓")
+
+    // Kinetic energy
+    let p4 = Particle.new(Vec2.zero(), Vec2.new(3.0, 4.0), 2.0, 10.0)
+    assert((p4.kinetic_energy() - 25.0).abs() < eps)  // 0.5 * 2 * 25
+    print("Kinetic energy ✓")
+
+    // Force application
+    let mut p5 = Particle.new(Vec2.zero(), Vec2.zero(), 2.0, 10.0)
+    p5.apply_force(Vec2.new(10.0, 0.0))
+    p5.update(1.0)
+    assert((p5.vel.x - 5.0).abs() < eps)  // F/m = 10/2 = 5
+    print("Force ✓")
+
+    // Particle system
+    let mut sys = ParticleSystem.new()
+        .with_gravity(Vec2.new(0.0, -10.0))
+        .with_drag(0.0)
+    sys.emit(Particle.new(Vec2.new(0.0, 100.0), Vec2.zero(), 1.0, 10.0))
+    assert(sys.alive_count() == 1)
+    sys.update(1.0)
+    // After 1s of gravity: vel.y = -10, pos.y = 100 + (-10)*1 = 90
+    let p = &sys.particles[0]
+    assert((p.vel.y - (-10.0)).abs() < 1.0)
+    print("System gravity ✓")
+
+    // Burst emission
+    let mut sys2 = ParticleSystem.new().with_gravity(Vec2.zero()).with_drag(0.0)
+    sys2.emit_burst(Vec2.zero(), 8, 5.0, 3.0, 1.0)
+    assert(sys2.total_count() == 8)
+    assert(sys2.alive_count() == 8)
+    print("Burst emit ✓")
+
+    // Center of mass
+    let com = sys2.center_of_mass()
+    assert(com.x.abs() < eps && com.y.abs() < eps)  // symmetric burst
+    print("Center of mass ✓")
+
+    // Remove dead
+    let mut sys3 = ParticleSystem.new().with_gravity(Vec2.zero())
+    sys3.emit(Particle.new(Vec2.zero(), Vec2.zero(), 1.0, 0.1))
+    sys3.emit(Particle.new(Vec2.zero(), Vec2.zero(), 1.0, 10.0))
+    sys3.update(0.5)
+    assert(sys3.alive_count() == 1)
+    sys3.remove_dead()
+    assert(sys3.total_count() == 1)
+    print("Remove dead ✓")
+
+    // Bounds bouncing
+    let mut sys4 = ParticleSystem.new()
+        .with_gravity(Vec2.zero())
+        .with_drag(0.0)
+        .with_bounds(0.0, 0.0, 100.0, 100.0)
+    sys4.emit(Particle.new(Vec2.new(99.0, 50.0), Vec2.new(20.0, 0.0), 1.0, 10.0))
+    sys4.update(1.0)
+    assert(sys4.particles[0].pos.x <= 100.0)
+    assert(sys4.particles[0].vel.x < 0.0)  // bounced
+    print("Bounds ✓")
+
+    // Empty system
+    let empty = ParticleSystem.new()
+    assert(empty.alive_count() == 0)
+    assert(empty.total_kinetic_energy() == 0.0)
+    assert(empty.center_of_mass().length() < eps)
+    print("Empty system ✓")
+
+    print("Particle System complete ✓")
+}
