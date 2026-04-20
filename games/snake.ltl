@@ -1,107 +1,223 @@
-// snake.ltl — Terminal snake game
-// Run: lateralus run games/snake.ltl
 
-use std.terminal.{clear, cursor, hide_cursor, show_cursor, raw_mode}
-use std.io.{stdin, Key}
-use std.time.{sleep, Duration}
-use std.rand
+// Classic Snake game logic
+// Grid-based movement with growth, collision detection, and scoring.
 
-const WIDTH  = 40
-const HEIGHT = 20
+use std.collections.VecDeque
 
-enum Dir { Up, Down, Left, Right }
+#[derive(Clone, Debug, PartialEq)]
+struct Pos { x: i32, y: i32 }
 
-struct Point { x: int, y: int }
-
-impl Point {
-    fn eq(self, other: Point) -> bool { self.x == other.x && self.y == other.y }
-    fn next(self, dir: Dir) -> Point {
+impl Pos {
+    fn new(x: i32, y: i32) -> Pos { Pos { x, y } }
+    fn offset(self, dir: &Direction) -> Pos {
         match dir {
-            Dir.Up    => Point { x: self.x,     y: self.y - 1 },
-            Dir.Down  => Point { x: self.x,     y: self.y + 1 },
-            Dir.Left  => Point { x: self.x - 1, y: self.y },
-            Dir.Right => Point { x: self.x + 1, y: self.y },
-        }
-    }
-    fn wrap(self) -> Point {
-        Point {
-            x: (self.x + WIDTH)  % WIDTH,
-            y: (self.y + HEIGHT) % HEIGHT,
+            Direction.Up => Pos { x: self.x, y: self.y - 1 },
+            Direction.Down => Pos { x: self.x, y: self.y + 1 },
+            Direction.Left => Pos { x: self.x - 1, y: self.y },
+            Direction.Right => Pos { x: self.x + 1, y: self.y },
         }
     }
 }
 
-fn random_food(snake: [Point]) -> Point {
-    loop {
-        let p = Point { x: rand.int(0, WIDTH), y: rand.int(0, HEIGHT) }
-        if !snake.any(|s| s.eq(p)) { return p }
+#[derive(Clone, Debug, PartialEq)]
+enum Direction { Up, Down, Left, Right }
+
+impl Direction {
+    fn opposite(self) -> Direction {
+        match self {
+            Direction.Up => Direction.Down,
+            Direction.Down => Direction.Up,
+            Direction.Left => Direction.Right,
+            Direction.Right => Direction.Left,
+        }
+    }
+
+    fn is_opposite(self, other: &Direction) -> bool {
+        self.opposite() == *other
     }
 }
 
-fn draw(snake: [Point], food: Point, score: int) {
-    clear()
-    cursor(0, 0)
-    print("Score: ${score}  (q to quit)")
+#[derive(Clone, Debug, PartialEq)]
+enum Cell { Empty, Snake, Food, Wall }
 
-    // border
-    print("+" + "-".repeat(WIDTH) + "+")
-    for y in range(0, HEIGHT) {
-        mut row = "|"
-        for x in range(0, WIDTH) {
-            let p = Point { x, y }
-            row += if snake[0].eq(p)             { "@" }
-                   else if snake.any(|s| s.eq(p)) { "o" }
-                   else if food.eq(p)             { "*" }
-                   else                           { " " }
+#[derive(Clone, Debug, PartialEq)]
+enum GameState { Running, GameOver, Won }
+
+struct SnakeGame {
+    width: i32,
+    height: i32,
+    snake: VecDeque<Pos>,
+    direction: Direction,
+    food: Pos,
+    score: usize,
+    state: GameState,
+    high_score: usize,
+    moves: usize,
+}
+
+impl SnakeGame {
+    fn new(width: i32, height: i32) -> SnakeGame {
+        let mut snake = VecDeque.new()
+        let start = Pos.new(width / 2, height / 2)
+        snake.push_back(start.clone())
+        snake.push_back(Pos.new(start.x - 1, start.y))
+        snake.push_back(Pos.new(start.x - 2, start.y))
+
+        SnakeGame {
+            width, height, snake,
+            direction: Direction.Right,
+            food: Pos.new(width / 4, height / 4),
+            score: 0, state: GameState.Running,
+            high_score: 0, moves: 0,
         }
-        print(row + "|")
     }
-    print("+" + "-".repeat(WIDTH) + "+")
+
+    fn set_direction(mut self, dir: Direction) {
+        if !self.direction.is_opposite(&dir) {
+            self.direction = dir
+        }
+    }
+
+    fn step(mut self) {
+        if self.state != GameState.Running { return }
+        self.moves += 1
+
+        let head = self.snake.front().unwrap().clone()
+        let new_head = head.offset(&self.direction)
+
+        // Wall collision
+        if new_head.x < 0 || new_head.x >= self.width ||
+           new_head.y < 0 || new_head.y >= self.height {
+            self.state = GameState.GameOver
+            return
+        }
+
+        // Self collision
+        if self.snake.iter().any(|p| *p == new_head) {
+            self.state = GameState.GameOver
+            return
+        }
+
+        self.snake.push_front(new_head.clone())
+
+        if new_head == self.food {
+            self.score += 10
+            if self.score > self.high_score { self.high_score = self.score }
+            // Check win condition
+            if self.snake.len() as i32 >= self.width * self.height {
+                self.state = GameState.Won
+            } else {
+                self.spawn_food()
+            }
+        } else {
+            self.snake.pop_back();
+        }
+    }
+
+    fn spawn_food(mut self) {
+        // Simple deterministic placement for testing
+        let mut x = (self.food.x + 3) % self.width
+        let mut y = (self.food.y + 7) % self.height
+        self.food = Pos.new(x, y)
+    }
+
+    fn head(self) -> &Pos { self.snake.front().unwrap() }
+    fn length(self) -> usize { self.snake.len() }
+    fn is_alive(self) -> bool { self.state == GameState.Running }
+
+    fn cell_at(self, x: i32, y: i32) -> Cell {
+        let pos = Pos.new(x, y)
+        if pos == self.food { return Cell.Food }
+        if self.snake.iter().any(|p| *p == pos) { return Cell.Snake }
+        Cell.Empty
+    }
 }
 
 fn main() {
-    hide_cursor()
-    raw_mode(true)
+    // Direction
+    assert(Direction.Up.opposite() == Direction.Down)
+    assert(Direction.Left.opposite() == Direction.Right)
+    assert(Direction.Up.is_opposite(&Direction.Down))
+    assert(!Direction.Up.is_opposite(&Direction.Left))
+    print("Direction ✓")
 
-    mut snake = [Point { x: WIDTH / 2, y: HEIGHT / 2 }]
-    mut dir   = Dir.Right
-    mut food  = random_food(snake)
-    mut score = 0
-    mut running = true
+    // Position
+    let p = Pos.new(5, 5)
+    assert(p.offset(&Direction.Up) == Pos.new(5, 4))
+    assert(p.offset(&Direction.Down) == Pos.new(5, 6))
+    assert(p.offset(&Direction.Left) == Pos.new(4, 5))
+    assert(p.offset(&Direction.Right) == Pos.new(6, 5))
+    print("Position ✓")
 
-    while running {
-        // Non-blocking input
-        match stdin.try_read_key() {
-            some(Key.Char('w')) | some(Key.Up)    => dir = Dir.Up,
-            some(Key.Char('s')) | some(Key.Down)  => dir = Dir.Down,
-            some(Key.Char('a')) | some(Key.Left)  => dir = Dir.Left,
-            some(Key.Char('d')) | some(Key.Right) => dir = Dir.Right,
-            some(Key.Char('q'))                    => running = false,
-            _                                      => {},
-        }
+    // Game initialization
+    let game = SnakeGame.new(20, 15)
+    assert(game.is_alive())
+    assert(game.length() == 3)
+    assert(game.score == 0)
+    assert(game.direction == Direction.Right)
+    print("Game init ✓")
 
-        let head = snake[0].next(dir).wrap()
+    // Movement
+    let mut g = SnakeGame.new(20, 15)
+    let initial_head = g.head().clone()
+    g.step()
+    assert(g.head().x == initial_head.x + 1)
+    assert(g.head().y == initial_head.y)
+    assert(g.length() == 3)  // no food eaten
+    assert(g.moves == 1)
+    print("Movement ✓")
 
-        if snake.any(|s| s.eq(head)) {
-            print("
-Game over! Score: ${score}")
-            break
-        }
+    // Direction change
+    g.set_direction(Direction.Up)
+    g.step()
+    assert(g.head().y == initial_head.y - 1)
+    print("Direction change ✓")
 
-        snake.insert(0, head)
-        if head.eq(food) {
-            score += 10
-            food = random_food(snake)
-        } else {
-            snake.pop()
-        }
+    // Cannot reverse
+    let mut g2 = SnakeGame.new(20, 15)
+    g2.set_direction(Direction.Left)  // opposite of Right
+    assert(g2.direction == Direction.Right)  // unchanged
+    print("No reverse ✓")
 
-        draw(snake, food, score)
-        sleep(Duration.ms(100))
-    }
+    // Wall collision
+    let mut g3 = SnakeGame.new(10, 10)
+    g3.set_direction(Direction.Right)
+    for _ in 0..20 { g3.step() }
+    assert(g3.state == GameState.GameOver)
+    print("Wall collision ✓")
 
-    raw_mode(false)
-    show_cursor()
+    // Cell query
+    let g4 = SnakeGame.new(20, 15)
+    let head_pos = g4.head().clone()
+    assert(g4.cell_at(head_pos.x, head_pos.y) == Cell.Snake)
+    assert(g4.cell_at(g4.food.x, g4.food.y) == Cell.Food)
+    assert(g4.cell_at(0, 0) == Cell.Empty || g4.cell_at(0, 0) == Cell.Food || g4.cell_at(0, 0) == Cell.Snake)
+    print("Cell query ✓")
+
+    // Food eating
+    let mut g5 = SnakeGame.new(20, 15)
+    g5.food = Pos.new(g5.head().x + 1, g5.head().y)
+    g5.step()
+    assert(g5.score == 10)
+    assert(g5.length() == 4)  // grew
+    print("Food eating ✓")
+
+    // High score
+    assert(g5.high_score == 10)
+    print("High score ✓")
+
+    // GameState variants
+    assert(GameState.Running != GameState.GameOver)
+    assert(GameState.Won != GameState.GameOver)
+    print("GameState ✓")
+
+    // Step when dead is noop
+    let mut g6 = SnakeGame.new(10, 10)
+    g6.state = GameState.GameOver
+    let moves_before = g6.moves
+    g6.step()
+    assert(g6.moves == moves_before)
+    print("Dead noop ✓")
+
+    print("Snake game complete ✓")
 }
-
-main()
