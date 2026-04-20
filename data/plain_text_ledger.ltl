@@ -1,0 +1,85 @@
+// examples/data/plain_text_ledger.ltl — plaintext double-entry ledger.
+//
+// Parses the "ledger-cli" file format: one transaction per entry, each
+// consisting of a date line and >=2 posting lines, every transaction
+// balancing to zero across accounts. Produces an account-balance report
+// and (given a currency via ISO4217) formatted summaries.
+//
+//     2026-04-20 * Groceries
+//         Expenses:Food           $42.19
+//         Assets:Checking        -$42.19
+
+use std::fs
+use std::time::Date
+use finance::iso4217
+
+pub struct Post { pub account: String, pub amount_cents: i64, pub currency: String }
+pub struct Entry { pub date: Date, pub desc: String, pub posts: Vec<Post> }
+
+pub fn parse(text: &str) -> Result<Vec<Entry>, String> {
+    let mut entries = Vec::new()
+    let mut cur: Option<Entry> = None
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim_end()
+        if line.is_empty() || line.starts_with(';') {
+            if let Some(e) = cur.take() { push_balanced(&mut entries, e, lineno)? }
+            continue
+        }
+        if !line.starts_with(char::is_whitespace) {
+            if let Some(e) = cur.take() { push_balanced(&mut entries, e, lineno)? }
+            let (date_s, rest) = line.split_once(' ').ok_or("bad entry header")?
+            let date = Date::parse_iso(date_s).map_err(|e| e.to_string())?
+            let desc = rest.trim_start_matches(|c: char| c=='*' || c=='!' || c==' ').into()
+            cur = Some(Entry { date, desc, posts: Vec::new() })
+        } else {
+            let body = line.trim()
+            let (acct, amt) = split_account_amount(body)?
+            let (amount_cents, currency) = parse_amount(&amt)?
+            cur.as_mut().ok_or("posting outside entry")?
+                .posts.push(Post { account: acct, amount_cents, currency })
+        }
+    }
+    if let Some(e) = cur { push_balanced(&mut entries, e, 0)? }
+    Ok(entries)
+}
+
+fn push_balanced(out: &mut Vec<Entry>, mut e: Entry, ln: usize) -> Result<(), String> {
+    // Balance pass: at most one posting may have no amount; it's inferred.
+    let sum: i64 = e.posts.iter().map(|p| p.amount_cents).sum()
+    if sum != 0 { return Err(format!("line {ln}: entry doesn't balance ({sum})")) }
+    out.push(e); Ok(())
+}
+
+fn split_account_amount(s: &str) -> Result<(String, String), String> {
+    // Account and amount are separated by 2+ spaces (or a tab).
+    let i = s.find("  ").or_else(|| s.find('\t')).ok_or("bad posting")?
+    Ok((s[..i].trim().into(), s[i..].trim().into()))
+}
+
+fn parse_amount(s: &str) -> Result<(i64, String), String> {
+    let (sign, body) = if let Some(r) = s.strip_prefix('-') { (-1, r) } else { (1, s) }
+    let body = body.trim().trim_start_matches('$')
+    let (num, cur) = body.split_once(' ').unwrap_or((body, "USD"))
+    let f: f64 = num.parse().map_err(|_| "bad number")?
+    Ok((sign * (f * 100.0).round() as i64, cur.into()))
+}
+
+pub fn balances(entries: &[Entry]) -> Map<String, i64> {
+    let mut m: Map<String, i64> = Map::new()
+    for e in entries {
+        for p in &e.posts {
+            *m.entry(p.account.clone()).or_insert(0) += p.amount_cents
+        }
+    }
+    m
+}
+
+fn main() -> Result<(), String> {
+    let args = std::env::args().collect::<Vec<_>>()
+    let path = args.get(1).ok_or("usage: ledger <file>")?
+    let entries = parse(&fs::read_to_string(path)?)?
+    for (acct, cents) in balances(&entries) {
+        println!("{:<30}  {}", acct, iso4217::format(cents, "USD"))
+    }
+    Ok(())
+}
