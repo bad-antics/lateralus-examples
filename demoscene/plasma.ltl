@@ -1,59 +1,217 @@
-// plasma.ltl — Realtime plasma effect in the terminal (classic demoscene)
+
+// Plasma Effect - Classic demoscene visual effect
+// Generates animated plasma patterns using sine wave combinations.
+
 use std.math.{sin, cos, sqrt, PI}
-use std.time.{Instant, sleep_ms}
-use std.io.stdout
 
-const W: int = 80
-const H: int = 40
+const WIDTH: usize = 80
+const HEIGHT: usize = 40
 
-fn plasma_val(x: int, y: int, t: float) -> float {
-    let fx = x as float
-    let fy = y as float
-    let v1 = sin(fx / 5.0 + t)
-    let v2 = sin(fy / 3.0 + t * 0.7)
-    let v3 = sin((fx + fy) / 7.0 + t * 1.3)
-    let cx = fx + 20.0 * sin(t / 3.0)
-    let cy = fy + 10.0 * cos(t / 2.0)
-    let v4 = sin(sqrt(cx*cx + cy*cy + 1.0) / 4.0 - t)
-    (v1 + v2 + v3 + v4) / 4.0
+#[derive(Clone, Copy, Debug)]
+struct Color {
+    r: u8,
+    g: u8,
+    b: u8,
 }
 
-const PALETTE_256: [string] = [
-    "[38;5;196m", "[38;5;202m", "[38;5;208m", "[38;5;214m",
-    "[38;5;220m", "[38;5;226m", "[38;5;190m", "[38;5;154m",
-    "[38;5;118m", "[38;5;82m",  "[38;5;46m",  "[38;5;47m",
-    "[38;5;48m",  "[38;5;51m",  "[38;5;45m",  "[38;5;39m",
-    "[38;5;33m",  "[38;5;27m",  "[38;5;21m",  "[38;5;57m",
-    "[38;5;93m",  "[38;5;129m", "[38;5;165m", "[38;5;201m",
-]
+impl Color {
+    fn new(r: u8, g: u8, b: u8) -> Color { Color { r, g, b } }
+    fn black() -> Color { Color { r: 0, g: 0, b: 0 } }
+    fn white() -> Color { Color { r: 255, g: 255, b: 255 } }
 
-const CHARS: string = " .:-=+*#%@"
-
-fn render_frame(t: float) -> string {
-    let mut out = "[H"   // cursor home
-    for y in range(0, H) {
-        for x in range(0, W) {
-            let v    = plasma_val(x * 2, y * 3, t)   // aspect ratio correction
-            let norm = ((v + 1.0) / 2.0).clamp(0.0, 0.9999)
-            let ci   = (norm * PALETTE_256.len() as float) as int
-            let ch   = CHARS[(norm * CHARS.len() as float) as usize]
-            out += PALETTE_256[ci] + ch.to_string()
-        }
-        out += "[0m
-"
+    fn from_hsv(h: f64, s: f64, v: f64) -> Color {
+        let c = v * s
+        let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs())
+        let m = v - c
+        let (r, g, b) = match (h / 60.0) as u32 {
+            0 => (c, x, 0.0),
+            1 => (x, c, 0.0),
+            2 => (0.0, c, x),
+            3 => (0.0, x, c),
+            4 => (x, 0.0, c),
+            _ => (c, 0.0, x),
+        };
+        Color { r: ((r + m) * 255.0) as u8, g: ((g + m) * 255.0) as u8, b: ((b + m) * 255.0) as u8 }
     }
-    out
+
+    fn lerp(self, other: Color, t: f64) -> Color {
+        Color {
+            r: (self.r as f64 + (other.r as f64 - self.r as f64) * t) as u8,
+            g: (self.g as f64 + (other.g as f64 - self.g as f64) * t) as u8,
+            b: (self.b as f64 + (other.b as f64 - self.b as f64) * t) as u8,
+        }
+    }
+
+    fn brightness(self) -> f64 { (self.r as f64 * 0.299 + self.g as f64 * 0.587 + self.b as f64 * 0.114) / 255.0 }
+}
+
+struct Palette {
+    colors: [Color],
+}
+
+impl Palette {
+    fn new() -> Palette { Palette { colors: [] } }
+
+    fn generate_plasma(size: usize) -> Palette {
+        let mut colors = []
+        for i in 0..size {
+            let t = i as f64 / size as f64 * 360.0
+            colors.push(Color.from_hsv(t, 1.0, 1.0))
+        }
+        Palette { colors }
+    }
+
+    fn generate_fire(size: usize) -> Palette {
+        let mut colors = []
+        for i in 0..size {
+            let t = i as f64 / size as f64
+            let r = (t * 3.0).min(1.0)
+            let g = ((t - 0.33) * 3.0).clamp(0.0, 1.0)
+            let b = ((t - 0.66) * 3.0).clamp(0.0, 1.0)
+            colors.push(Color.new((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8))
+        }
+        Palette { colors }
+    }
+
+    fn len(self) -> usize { self.colors.len() }
+    fn get(self, idx: usize) -> Color { self.colors[idx % self.colors.len()] }
+}
+
+fn plasma_value(x: f64, y: f64, time: f64) -> f64 {
+    let v1 = sin(x * 0.1 + time)
+    let v2 = sin(y * 0.1 + time * 0.5)
+    let v3 = sin((x * 0.1 + y * 0.1 + time) * 0.5)
+    let cx = x + 0.5 * sin(time * 0.3) * WIDTH as f64
+    let cy = y + 0.5 * cos(time * 0.2) * HEIGHT as f64
+    let v4 = sin(sqrt(cx * cx + cy * cy + 1.0) * 0.1)
+    (v1 + v2 + v3 + v4) / 4.0  // normalize to [-1, 1]
+}
+
+struct PlasmaRenderer {
+    width: usize,
+    height: usize,
+    buffer: [f64],
+    palette: Palette,
+    time: f64,
+    frame: u64,
+}
+
+impl PlasmaRenderer {
+    fn new(width: usize, height: usize) -> PlasmaRenderer {
+        PlasmaRenderer {
+            width, height, buffer: vec![0.0; width * height],
+            palette: Palette.generate_plasma(256), time: 0.0, frame: 0,
+        }
+    }
+
+    fn set_palette(mut self, palette: Palette) { self.palette = palette }
+
+    fn render_frame(mut self) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let val = plasma_value(x as f64, y as f64, self.time)
+                self.buffer[y * self.width + x] = val
+            }
+        }
+        self.frame += 1
+    }
+
+    fn advance(mut self, dt: f64) { self.time += dt }
+
+    fn get_pixel(self, x: usize, y: usize) -> f64 { self.buffer[y * self.width + x] }
+
+    fn get_color(self, x: usize, y: usize) -> Color {
+        let val = self.get_pixel(x, y)
+        let idx = ((val + 1.0) * 0.5 * 255.0) as usize  // map [-1,1] to [0,255]
+        self.palette.get(idx)
+    }
+
+    fn average_value(self) -> f64 {
+        let sum: f64 = self.buffer.iter().sum()
+        sum / self.buffer.len() as f64
+    }
+
+    fn min_value(self) -> f64 { self.buffer.iter().cloned().fold(f64.INFINITY, f64.min) }
+    fn max_value(self) -> f64 { self.buffer.iter().cloned().fold(f64.NEG_INFINITY, f64.max) }
 }
 
 fn main() {
-    print("[2J[?25l")  // clear + hide cursor
-    let start  = Instant.now()
-    let frames  = 120
-    for _ in range(0, frames) {
-        let t = start.elapsed_ms() as float / 400.0
-        stdout().write(render_frame(t))
-        sleep_ms(30)
-    }
-    print("[?25h[0m")  // restore
-    print("Plasma — ${frames} frames rendered ✓")
+    // Color
+    let c = Color.new(128, 64, 32)
+    assert(c.r == 128 && c.g == 64 && c.b == 32)
+    let bri = c.brightness()
+    assert(bri > 0.0 && bri < 1.0)
+    print("Color ✓")
+
+    // HSV
+    let red = Color.from_hsv(0.0, 1.0, 1.0)
+    assert(red.r == 255 && red.g == 0 && red.b == 0)
+    print("HSV ✓")
+
+    // Lerp
+    let mid = Color.black().lerp(Color.white(), 0.5)
+    assert((mid.r as i32 - 127).abs() <= 1)
+    print("Lerp ✓")
+
+    // Palette
+    let pal = Palette.generate_plasma(256)
+    assert(pal.len() == 256)
+    let c0 = pal.get(0)
+    let c128 = pal.get(128)
+    // Colors should differ
+    assert(c0.r != c128.r || c0.g != c128.g || c0.b != c128.b)
+    print("Palette ✓")
+
+    // Fire palette
+    let fire = Palette.generate_fire(256)
+    assert(fire.len() == 256)
+    let dark = fire.get(0)
+    let bright = fire.get(255)
+    assert(bright.r > dark.r)
+    print("Fire palette ✓")
+
+    // Plasma value
+    let v1 = plasma_value(0.0, 0.0, 0.0)
+    assert(v1 >= -1.0 && v1 <= 1.0)
+    let v2 = plasma_value(40.0, 20.0, 1.0)
+    assert(v2 >= -1.0 && v2 <= 1.0)
+    // Different positions give different values
+    assert((v1 - v2).abs() > 0.001)
+    print("Plasma value ✓")
+
+    // Renderer
+    let mut renderer = PlasmaRenderer.new(20, 10)
+    renderer.render_frame()
+    assert(renderer.frame == 1)
+    print("Render ✓")
+
+    // Pixel values in range
+    let px = renderer.get_pixel(5, 5)
+    assert(px >= -1.0 && px <= 1.0)
+    print("Pixel ✓")
+
+    // Min/max
+    assert(renderer.min_value() >= -1.0)
+    assert(renderer.max_value() <= 1.0)
+    assert(renderer.min_value() < renderer.max_value())
+    print("Min/Max ✓")
+
+    // Average near zero (plasma is roughly symmetric)
+    let avg = renderer.average_value()
+    assert(avg.abs() < 0.5)
+    print("Average ✓")
+
+    // Color from pixel
+    let color = renderer.get_color(5, 5)
+    assert(color.r <= 255 && color.g <= 255 && color.b <= 255)
+    print("Get color ✓")
+
+    // Animation
+    renderer.advance(0.1)
+    renderer.render_frame()
+    assert(renderer.frame == 2)
+    assert(renderer.time > 0.0)
+    print("Animation ✓")
+
+    print("Plasma complete ✓")
 }
