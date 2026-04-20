@@ -1,0 +1,237 @@
+// Functional Lenses
+// Composable getters and setters for immutable data structures.
+
+use std.fmt.{Display, Formatter}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Lens<S, A> {
+    get: fn(&S) -> A,
+    set: fn(&S, A) -> S,
+}
+
+impl<S, A> Lens<S, A> {
+    fn new(get: fn(&S) -> A, set: fn(&S, A) -> S) -> Lens<S, A> {
+        Lens { get, set }
+    }
+
+    fn view(self, s: &S) -> A {
+        (self.get)(s)
+    }
+
+    fn set(self, s: &S, a: A) -> S {
+        (self.set)(s, a)
+    }
+
+    fn over(self, s: &S, f: fn(A) -> A) -> S {
+        let current = self.view(s)
+        self.set(s, f(current))
+    }
+
+    fn compose<B>(self, other: Lens<A, B>) -> Lens<S, B> where A: Clone {
+        let outer_get = self.get
+        let outer_set = self.set
+        let inner_get = other.get
+        let inner_set = other.set
+        Lens {
+            get: |s| (inner_get)(&(outer_get)(s)),
+            set: |s, b| {
+                let a = (outer_get)(s)
+                let new_a = (inner_set)(&a, b)
+                (outer_set)(s, new_a)
+            },
+        }
+    }
+}
+
+// Prism: optional focus (for enums/Option)
+#[derive(Clone, Debug)]
+struct Prism<S, A> {
+    preview: fn(&S) -> Option<A>,
+    review: fn(A) -> S,
+}
+
+impl<S, A> Prism<S, A> {
+    fn new(preview: fn(&S) -> Option<A>, review: fn(A) -> S) -> Prism<S, A> {
+        Prism { preview, review }
+    }
+
+    fn preview(self, s: &S) -> Option<A> {
+        (self.preview)(s)
+    }
+
+    fn review(self, a: A) -> S {
+        (self.review)(a)
+    }
+
+    fn over(self, s: &S, f: fn(A) -> A) -> S where S: Clone {
+        match self.preview(s) {
+            some(a) => (self.review)(f(a)),
+            none => s.clone(),
+        }
+    }
+}
+
+// --- Test data structures ---
+#[derive(Clone, Debug, PartialEq)]
+struct Address {
+    street: string,
+    city: string,
+    zip: string,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Person {
+    name: string,
+    age: i32,
+    address: Address,
+}
+
+// Lens definitions
+fn person_name() -> Lens<Person, string> {
+    Lens.new(
+        |p| p.name.clone(),
+        |p, n| Person { name: n, ..p.clone() },
+    )
+}
+
+fn person_age() -> Lens<Person, i32> {
+    Lens.new(
+        |p| p.age,
+        |p, a| Person { age: a, ..p.clone() },
+    )
+}
+
+fn person_address() -> Lens<Person, Address> {
+    Lens.new(
+        |p| p.address.clone(),
+        |p, a| Person { address: a, ..p.clone() },
+    )
+}
+
+fn address_street() -> Lens<Address, string> {
+    Lens.new(
+        |a| a.street.clone(),
+        |a, s| Address { street: s, ..a.clone() },
+    )
+}
+
+fn address_city() -> Lens<Address, string> {
+    Lens.new(
+        |a| a.city.clone(),
+        |a, c| Address { city: c, ..a.clone() },
+    )
+}
+
+fn address_zip() -> Lens<Address, string> {
+    Lens.new(
+        |a| a.zip.clone(),
+        |a, z| Address { zip: z, ..a.clone() },
+    )
+}
+
+// Composed lens: person -> address -> street
+fn person_street() -> Lens<Person, string> {
+    person_address().compose(address_street())
+}
+
+fn main() {
+    let addr = Address {
+        street: "123 Main St".into(),
+        city: "Springfield".into(),
+        zip: "62701".into(),
+    }
+    let person = Person {
+        name: "Alice".into(),
+        age: 30,
+        address: addr.clone(),
+    }
+
+    // View
+    assert(person_name().view(&person) == "Alice")
+    assert(person_age().view(&person) == 30)
+    assert(address_city().view(&addr) == "Springfield")
+    print("View ✓")
+
+    // Set
+    let renamed = person_name().set(&person, "Bob".into())
+    assert(renamed.name == "Bob")
+    assert(renamed.age == 30)  // unchanged
+    print("Set ✓")
+
+    // Over (modify)
+    let older = person_age().over(&person, |a| a + 1)
+    assert(older.age == 31)
+    assert(older.name == "Alice")  // unchanged
+    print("Over ✓")
+
+    // Composed lens: view
+    assert(person_street().view(&person) == "123 Main St")
+    print("Composed view ✓")
+
+    // Composed lens: set
+    let moved = person_street().set(&person, "456 Oak Ave".into())
+    assert(moved.address.street == "456 Oak Ave")
+    assert(moved.address.city == "Springfield")  // unchanged
+    assert(moved.name == "Alice")  // unchanged
+    print("Composed set ✓")
+
+    // Composed lens: over
+    let uppered = person_street().over(&person, |s| s.to_uppercase())
+    assert(uppered.address.street == "123 MAIN ST")
+    print("Composed over ✓")
+
+    // Multiple lens operations
+    let updated = person_name().set(
+        &person_age().set(
+            &person_street().set(&person, "789 Elm".into()),
+            25),
+        "Carol".into())
+    assert(updated.name == "Carol")
+    assert(updated.age == 25)
+    assert(updated.address.street == "789 Elm")
+    print("Chained operations ✓")
+
+    // Lens laws: GetPut - set(s, get(s)) == s
+    let l = person_name()
+    let v = l.view(&person)
+    let same = l.set(&person, v)
+    assert(same == person)
+    print("Law: GetPut ✓")
+
+    // Lens laws: PutGet - get(set(s, a)) == a
+    let new_name = "Zara".to_string()
+    let after_set = l.set(&person, new_name.clone())
+    assert(l.view(&after_set) == new_name)
+    print("Law: PutGet ✓")
+
+    // Lens laws: PutPut - set(set(s, a), b) == set(s, b)
+    let s1 = l.set(&l.set(&person, "X".into()), "Y".into())
+    let s2 = l.set(&person, "Y".into())
+    assert(s1 == s2)
+    print("Law: PutPut ✓")
+
+    // Prism for Option
+    let some_prism: Prism<Option<i32>, i32> = Prism.new(
+        |opt| opt.clone(),
+        |v| some(v),
+    )
+    assert(some_prism.preview(&some(42)) == some(42))
+    assert(some_prism.preview(&none).is_none())
+    assert(some_prism.review(99) == some(99))
+    print("Prism ✓")
+
+    // Prism over
+    let doubled = some_prism.over(&some(5), |x| x * 2)
+    assert(doubled == some(10))
+    let unchanged = some_prism.over(&none, |x| x * 2)
+    assert(unchanged.is_none())
+    print("Prism over ✓")
+
+    // Address lens
+    let new_addr = address_zip().set(&addr, "90210".into())
+    assert(new_addr.zip == "90210")
+    assert(new_addr.street == "123 Main St")
+    print("Address lens ✓")
+
+    print("Lenses complete ✓")
+}
