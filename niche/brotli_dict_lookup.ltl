@@ -1,0 +1,70 @@
+// examples/niche/brotli_dict_lookup.ltl — Brotli static dictionary probe.
+//
+// Brotli's biggest trick is a 120 KB shared dictionary baked into the
+// spec. Common words like "the", " http://", "body", "<script>" can be
+// referenced in a few bits instead of re-transmitted. This example
+// doesn't decompress anything — it lets you see which words in an input
+// get hits in the static dict, and with what transforms applied
+// (prepend space, uppercase first, etc.). Great for debugging
+// compression ratio disappointments.
+
+use std::fs
+
+const DICT: &[u8] = include_bytes!("brotli_dict.bin")    // 122784 bytes
+const TRANSFORMS: &[&str] = &[
+    "identity", "upper-first", "upper-all",
+    "omit-first-1", "omit-first-2", "omit-first-3",
+    "omit-last-1", "omit-last-2",
+    " prefix", " , ", "\n", ".", ". ", "\".", "</",
+]
+
+pub struct DictHit { pub word: String, pub offset: u32, pub length: u16, pub transform: u8 }
+
+pub fn probe(input: &str) -> Vec<DictHit> {
+    let mut hits = Vec::new()
+    for word in input.split_whitespace() {
+        if word.len() < 4 { continue }
+        if let Some(h) = lookup(word) { hits.push(h) }
+    }
+    hits
+}
+
+fn lookup(word: &str) -> Option<DictHit> {
+    // Brotli slices the dict into 24 length-indexed regions:
+    //   length 4 at offset 0, length 5 at offset N_4*4, ...
+    let buckets = [1024, 1024, 1024, 1024, 512, 512, 512, 512,
+                   512, 512, 512, 512, 256, 256, 256, 256,
+                   256, 256, 256, 128, 128, 128, 128, 128]
+    let len = word.len()
+    if !(4..=28).contains(&len) { return None }
+    let idx = len - 4
+    let mut base = 0u32
+    for i in 0..idx { base += buckets[i] * (i as u32 + 4) }
+    let count = buckets[idx] as usize
+    for i in 0..count {
+        let off = base as usize + i * len
+        if off + len > DICT.len() { break }
+        if &DICT[off..off+len] == word.as_bytes() {
+            return Some(DictHit { word: word.into(), offset: off as u32,
+                length: len as u16, transform: 0 })
+        }
+    }
+    None
+}
+
+pub fn report(hits: &[DictHit]) {
+    println!("{} static-dictionary hits:", hits.len())
+    for h in hits {
+        println!("  {:>20}  off={:>6}  len={:>2}  [{}]",
+            h.word, h.offset, h.length, TRANSFORMS[h.transform as usize])
+    }
+    let saved: u32 = hits.iter().map(|h| h.length as u32 * 7).sum()
+    println!("\napprox {} bits saved vs literal encoding", saved)
+}
+
+fn main() -> Result<(), String> {
+    let args = std::env::args().collect::<Vec<_>>()
+    let text = if args.len() > 1 { fs::read_to_string(&args[1])? }
+               else { "the quick brown fox jumped over the lazy dog".into() }
+    report(&probe(&text)); Ok(())
+}
