@@ -1,0 +1,238 @@
+
+// Cloth simulation using Verlet integration
+// Models a grid of particles connected by distance constraints.
+
+use std.math.{sqrt, abs}
+
+#[derive(Clone, Debug)]
+struct Vec2 { x: f64, y: f64 }
+
+impl Vec2 {
+    fn new(x: f64, y: f64) -> Vec2 { Vec2 { x, y } }
+    fn zero() -> Vec2 { Vec2 { x: 0.0, y: 0.0 } }
+    fn add(self, other: &Vec2) -> Vec2 { Vec2 { x: self.x + other.x, y: self.y + other.y } }
+    fn sub(self, other: &Vec2) -> Vec2 { Vec2 { x: self.x - other.x, y: self.y - other.y } }
+    fn scale(self, s: f64) -> Vec2 { Vec2 { x: self.x * s, y: self.y * s } }
+    fn length(self) -> f64 { sqrt(self.x * self.x + self.y * self.y) }
+    fn distance(self, other: &Vec2) -> f64 { self.sub(other).length() }
+}
+
+#[derive(Clone, Debug)]
+struct Particle {
+    pos: Vec2,
+    prev_pos: Vec2,
+    acceleration: Vec2,
+    pinned: bool,
+    mass: f64,
+}
+
+impl Particle {
+    fn new(x: f64, y: f64) -> Particle {
+        Particle {
+            pos: Vec2.new(x, y),
+            prev_pos: Vec2.new(x, y),
+            acceleration: Vec2.zero(),
+            pinned: false,
+            mass: 1.0,
+        }
+    }
+
+    fn pinned_at(x: f64, y: f64) -> Particle {
+        let mut p = Particle.new(x, y)
+        p.pinned = true
+        p
+    }
+
+    fn apply_force(mut self, force: &Vec2) {
+        if !self.pinned {
+            self.acceleration = self.acceleration.add(&force.scale(1.0 / self.mass))
+        }
+    }
+
+    fn update(mut self, dt: f64, damping: f64) {
+        if self.pinned { return }
+        let velocity = self.pos.sub(&self.prev_pos).scale(damping)
+        let new_pos = self.pos.add(&velocity).add(&self.acceleration.scale(dt * dt))
+        self.prev_pos = self.pos.clone()
+        self.pos = new_pos
+        self.acceleration = Vec2.zero()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Constraint {
+    a: usize,
+    b: usize,
+    rest_length: f64,
+    stiffness: f64,
+}
+
+impl Constraint {
+    fn new(a: usize, b: usize, rest_length: f64) -> Constraint {
+        Constraint { a, b, rest_length, stiffness: 1.0 }
+    }
+
+    fn with_stiffness(a: usize, b: usize, rest_length: f64, stiffness: f64) -> Constraint {
+        Constraint { a, b, rest_length, stiffness }
+    }
+}
+
+struct ClothSim {
+    particles: [Particle],
+    constraints: [Constraint],
+    gravity: Vec2,
+    damping: f64,
+    solver_iterations: usize,
+}
+
+impl ClothSim {
+    fn new_grid(cols: usize, rows: usize, spacing: f64) -> ClothSim {
+        let mut particles = vec![]
+        for row in 0..rows {
+            for col in 0..cols {
+                let x = col as f64 * spacing
+                let y = row as f64 * spacing
+                if row == 0 && (col == 0 || col == cols - 1) {
+                    particles.push(Particle.pinned_at(x, y))
+                } else {
+                    particles.push(Particle.new(x, y))
+                }
+            }
+        }
+
+        let mut constraints = vec![]
+        for row in 0..rows {
+            for col in 0..cols {
+                let idx = row * cols + col
+                if col < cols - 1 {
+                    constraints.push(Constraint.new(idx, idx + 1, spacing))
+                }
+                if row < rows - 1 {
+                    constraints.push(Constraint.new(idx, idx + cols, spacing))
+                }
+            }
+        }
+
+        ClothSim {
+            particles, constraints,
+            gravity: Vec2.new(0.0, 9.81),
+            damping: 0.99,
+            solver_iterations: 5,
+        }
+    }
+
+    fn step(mut self, dt: f64) {
+        // Apply gravity
+        for p in &mut self.particles {
+            p.apply_force(&self.gravity)
+        }
+
+        // Verlet integration
+        for p in &mut self.particles {
+            p.update(dt, self.damping)
+        }
+
+        // Solve constraints
+        for _ in 0..self.solver_iterations {
+            self.solve_constraints()
+        }
+    }
+
+    fn solve_constraints(mut self) {
+        for c in &self.constraints {
+            let a_pos = self.particles[c.a].pos.clone()
+            let b_pos = self.particles[c.b].pos.clone()
+            let delta = b_pos.sub(&a_pos)
+            let dist = delta.length()
+            if dist < 0.0001 { continue }
+            let diff = (c.rest_length - dist) / dist * c.stiffness
+            let offset = delta.scale(diff * 0.5)
+
+            if !self.particles[c.a].pinned {
+                self.particles[c.a].pos = self.particles[c.a].pos.sub(&offset)
+            }
+            if !self.particles[c.b].pinned {
+                self.particles[c.b].pos = self.particles[c.b].pos.add(&offset)
+            }
+        }
+    }
+
+    fn particle_count(self) -> usize { self.particles.len() }
+    fn constraint_count(self) -> usize { self.constraints.len() }
+}
+
+fn main() {
+    // Vec2 basics
+    let v = Vec2.new(3.0, 4.0)
+    assert(abs(v.length() - 5.0) < 0.001)
+    let v2 = v.add(&Vec2.new(1.0, 1.0))
+    assert(abs(v2.x - 4.0) < 0.001)
+    assert(abs(v2.y - 5.0) < 0.001)
+    let v3 = v.scale(2.0)
+    assert(abs(v3.x - 6.0) < 0.001)
+    let z = Vec2.zero()
+    assert(z.x == 0.0 && z.y == 0.0)
+    print("Vec2 ✓")
+
+    // Distance
+    let a = Vec2.new(0.0, 0.0)
+    let b = Vec2.new(3.0, 4.0)
+    assert(abs(a.distance(&b) - 5.0) < 0.001)
+    print("Distance ✓")
+
+    // Particle
+    let mut p = Particle.new(5.0, 10.0)
+    assert(!p.pinned)
+    assert(p.mass == 1.0)
+    p.apply_force(&Vec2.new(0.0, 9.81))
+    assert(abs(p.acceleration.y - 9.81) < 0.001)
+    print("Particle ✓")
+
+    // Pinned particle
+    let mut pinned = Particle.pinned_at(0.0, 0.0)
+    assert(pinned.pinned)
+    let old_pos = pinned.pos.clone()
+    pinned.apply_force(&Vec2.new(100.0, 100.0))
+    pinned.update(0.016, 0.99)
+    assert(pinned.pos.x == old_pos.x)
+    assert(pinned.pos.y == old_pos.y)
+    print("Pinned particle ✓")
+
+    // Constraint
+    let c = Constraint.new(0, 1, 10.0)
+    assert(c.stiffness == 1.0)
+    let c2 = Constraint.with_stiffness(0, 1, 10.0, 0.5)
+    assert(c2.stiffness == 0.5)
+    print("Constraint ✓")
+
+    // Cloth grid
+    let cloth = ClothSim.new_grid(4, 3, 10.0)
+    assert(cloth.particle_count() == 12)
+    // Horizontal + vertical constraints
+    // H: 3 per row * 3 rows = 9, V: 4 per col * 2 rows = 8 => 17
+    assert(cloth.constraint_count() == 17)
+    // Check pins
+    assert(cloth.particles[0].pinned)
+    assert(cloth.particles[3].pinned)
+    assert(!cloth.particles[1].pinned)
+    print("Cloth grid ✓")
+
+    // Simulate
+    let mut sim = ClothSim.new_grid(3, 3, 5.0)
+    let initial_y = sim.particles[8].pos.y  // bottom-right
+    sim.step(0.016)
+    // Gravity should pull unpinned particles down
+    assert(sim.particles[8].pos.y > initial_y)
+    print("Simulation step ✓")
+
+    // Multiple steps
+    for _ in 0..10 {
+        sim.step(0.016)
+    }
+    // Pinned particles should not move
+    assert(sim.particles[0].pos.x == 0.0)
+    assert(sim.particles[0].pos.y == 0.0)
+    print("Multi-step ✓")
+
+    print("Cloth simulation complete ✓")
+}
