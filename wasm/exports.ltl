@@ -1,0 +1,134 @@
+// examples/wasm/exports.ltl
+//
+// Compile this file with `lateralus build --target wasm32` and the
+// exported functions below become WASM exports callable from JS.
+//
+// The compiler recognises `#[wasm_export]` on public functions and
+// emits matching `(export "...")` entries in the `.wasm` module.
+//
+// Batch 77 / wasm.
+
+import std::collections::Map
+import std::math::{sqrt, sin, cos, pi}
+
+// -- Numerical kernels -----------------------------------------------------
+
+#[wasm_export]
+pub fn fib(n: Int) -> Int {
+    if n < 2 { return n }
+    let mut a = 0
+    let mut b = 1
+    for _ in 0..n {
+        let t = a + b
+        a = b
+        b = t
+    }
+    a
+}
+
+#[wasm_export]
+pub fn mandelbrot_iters(cx: Float, cy: Float, max: Int) -> Int {
+    let mut zx = 0.0
+    let mut zy = 0.0
+    for i in 0..max {
+        let zx2 = zx*zx - zy*zy + cx
+        let zy2 = 2.0*zx*zy + cy
+        zx = zx2
+        zy = zy2
+        if zx*zx + zy*zy > 4.0 { return i }
+    }
+    max
+}
+
+// -- Array helpers (JS passes ArrayBuffer views) ---------------------------
+//
+// WASM ABI note: in the default calling convention, `[Float]` lowers to
+// a (ptr, len) pair. On the JS side, call via:
+//   const buf = module.exports.alloc_f32(N);
+//   new Float32Array(module.exports.memory.buffer, buf, N).set(myArray);
+//   module.exports.smooth(buf, N, alpha);
+
+#[wasm_export]
+pub fn smooth(xs: [Float], alpha: Float) -> () {
+    if len(xs) < 2 { return }
+    for i in 1..len(xs) {
+        xs[i] = alpha * xs[i] + (1.0 - alpha) * xs[i-1]
+    }
+}
+
+#[wasm_export]
+pub fn fft_magnitudes(re: [Float], im: [Float]) -> [Float] {
+    // Cooley-Tukey radix-2 on power-of-two inputs.
+    let n = len(re)
+    fft_in_place(re, im)
+    let mags = [0.0; n / 2]
+    for i in 0..n/2 {
+        mags[i] = sqrt(re[i]*re[i] + im[i]*im[i])
+    }
+    mags
+}
+
+fn fft_in_place(re: &mut [Float], im: &mut [Float]) {
+    let n = len(re)
+    // bit-reverse
+    let mut j = 0
+    for i in 1..n {
+        let mut bit = n >> 1
+        while (j & bit) != 0 { j = j ^ bit; bit = bit >> 1 }
+        j = j | bit
+        if i < j {
+            swap(re, i, j)
+            swap(im, i, j)
+        }
+    }
+    // butterflies
+    let mut size = 2
+    while size <= n {
+        let half = size >> 1
+        let theta = 0.0 - 2.0 * pi / (size as Float)
+        let wr = cos(theta)
+        let wi = sin(theta)
+        let mut i = 0
+        while i < n {
+            let mut cur_r = 1.0
+            let mut cur_i = 0.0
+            for k in 0..half {
+                let xr = re[i+k+half] * cur_r - im[i+k+half] * cur_i
+                let xi = re[i+k+half] * cur_i + im[i+k+half] * cur_r
+                re[i+k+half] = re[i+k] - xr
+                im[i+k+half] = im[i+k] - xi
+                re[i+k]      = re[i+k] + xr
+                im[i+k]      = im[i+k] + xi
+                let nr = cur_r*wr - cur_i*wi
+                cur_i = cur_r*wi + cur_i*wr
+                cur_r = nr
+            }
+            i = i + size
+        }
+        size = size << 1
+    }
+}
+
+fn swap(xs: &mut [Float], i: Int, j: Int) {
+    let t = xs[i]
+    xs[i] = xs[j]
+    xs[j] = t
+}
+
+// -- String round-trip (UTF-8) ---------------------------------------------
+
+#[wasm_export]
+pub fn greet(name_ptr: Int, name_len: Int) -> Int {
+    let name = std::wasm::read_string(name_ptr, name_len)
+    let out  = "hello, {name}!"
+    std::wasm::return_string(out)   // returns ptr packed with len in high bits
+}
+
+// -- Allocation (so JS can pre-allocate buffers) ---------------------------
+
+#[wasm_export]
+pub fn alloc_f32(n: Int) -> Int  { std::wasm::alloc(n * 4) }
+#[wasm_export]
+pub fn alloc_u8(n: Int)  -> Int  { std::wasm::alloc(n) }
+#[wasm_export]
+pub fn free(ptr: Int, n: Int) -> () { std::wasm::free(ptr, n) }
