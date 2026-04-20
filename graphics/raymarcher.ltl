@@ -1,0 +1,199 @@
+
+// Raymarching renderer using signed distance functions (SDFs)
+// Renders 3D scenes by stepping rays through distance fields.
+
+use std.math.{sqrt, abs, min, max, sin, cos}
+
+#[derive(Clone, Debug)]
+struct Vec3 { x: f64, y: f64, z: f64 }
+
+impl Vec3 {
+    fn new(x: f64, y: f64, z: f64) -> Vec3 { Vec3 { x, y, z } }
+    fn zero() -> Vec3 { Vec3 { x: 0.0, y: 0.0, z: 0.0 } }
+    fn add(self, o: &Vec3) -> Vec3 { Vec3 { x: self.x+o.x, y: self.y+o.y, z: self.z+o.z } }
+    fn sub(self, o: &Vec3) -> Vec3 { Vec3 { x: self.x-o.x, y: self.y-o.y, z: self.z-o.z } }
+    fn scale(self, s: f64) -> Vec3 { Vec3 { x: self.x*s, y: self.y*s, z: self.z*s } }
+    fn dot(self, o: &Vec3) -> f64 { self.x*o.x + self.y*o.y + self.z*o.z }
+    fn length(self) -> f64 { sqrt(self.dot(self)) }
+    fn normalize(self) -> Vec3 { let l = self.length(); if l < 1e-10 { Vec3.zero() } else { self.scale(1.0/l) } }
+    fn lerp(self, o: &Vec3, t: f64) -> Vec3 { self.scale(1.0-t).add(&o.scale(t)) }
+}
+
+// Signed Distance Functions
+fn sdf_sphere(p: &Vec3, center: &Vec3, radius: f64) -> f64 {
+    p.sub(center).length() - radius
+}
+
+fn sdf_box(p: &Vec3, center: &Vec3, half_extents: &Vec3) -> f64 {
+    let d = Vec3.new(
+        abs(p.x - center.x) - half_extents.x,
+        abs(p.y - center.y) - half_extents.y,
+        abs(p.z - center.z) - half_extents.z,
+    )
+    let outside = Vec3.new(max(d.x, 0.0), max(d.y, 0.0), max(d.z, 0.0)).length()
+    let inside = min(max(d.x, max(d.y, d.z)), 0.0)
+    outside + inside
+}
+
+fn sdf_plane(p: &Vec3, normal: &Vec3, offset: f64) -> f64 {
+    p.dot(normal) + offset
+}
+
+fn sdf_torus(p: &Vec3, major_r: f64, minor_r: f64) -> f64 {
+    let q_x = sqrt(p.x * p.x + p.z * p.z) - major_r
+    sqrt(q_x * q_x + p.y * p.y) - minor_r
+}
+
+// CSG operations
+fn sdf_union(a: f64, b: f64) -> f64 { min(a, b) }
+fn sdf_intersect(a: f64, b: f64) -> f64 { max(a, b) }
+fn sdf_subtract(a: f64, b: f64) -> f64 { max(a, -b) }
+fn sdf_smooth_union(a: f64, b: f64, k: f64) -> f64 {
+    let h = max(k - abs(a - b), 0.0) / k
+    min(a, b) - h * h * k * 0.25
+}
+
+#[derive(Clone, Debug)]
+struct RayHit {
+    distance: f64,
+    position: Vec3,
+    steps: usize,
+    hit: bool,
+}
+
+struct RayMarcher {
+    max_steps: usize,
+    max_distance: f64,
+    epsilon: f64,
+}
+
+impl RayMarcher {
+    fn new() -> RayMarcher {
+        RayMarcher { max_steps: 128, max_distance: 100.0, epsilon: 0.001 }
+    }
+
+    fn high_quality() -> RayMarcher {
+        RayMarcher { max_steps: 256, max_distance: 200.0, epsilon: 0.0001 }
+    }
+
+    fn march<F>(self, origin: &Vec3, direction: &Vec3, scene_sdf: F) -> RayHit
+    where F: Fn(&Vec3) -> f64 {
+        let dir = direction.normalize()
+        let mut t = 0.0
+
+        for step in 0..self.max_steps {
+            let pos = origin.add(&dir.scale(t))
+            let d = scene_sdf(&pos)
+
+            if d < self.epsilon {
+                return RayHit { distance: t, position: pos, steps: step, hit: true }
+            }
+            if t > self.max_distance {
+                break
+            }
+            t += d
+        }
+
+        RayHit {
+            distance: self.max_distance,
+            position: origin.add(&dir.scale(self.max_distance)),
+            steps: self.max_steps,
+            hit: false,
+        }
+    }
+
+    fn estimate_normal<F>(self, p: &Vec3, scene_sdf: F) -> Vec3
+    where F: Fn(&Vec3) -> f64 {
+        let e = self.epsilon
+        let nx = scene_sdf(&Vec3.new(p.x+e, p.y, p.z)) - scene_sdf(&Vec3.new(p.x-e, p.y, p.z))
+        let ny = scene_sdf(&Vec3.new(p.x, p.y+e, p.z)) - scene_sdf(&Vec3.new(p.x, p.y-e, p.z))
+        let nz = scene_sdf(&Vec3.new(p.x, p.y, p.z+e)) - scene_sdf(&Vec3.new(p.x, p.y, p.z-e))
+        Vec3.new(nx, ny, nz).normalize()
+    }
+}
+
+fn main() {
+    // Vec3
+    let v = Vec3.new(1.0, 2.0, 3.0)
+    assert(abs(v.length() - sqrt(14.0)) < 0.001)
+    let n = v.normalize()
+    assert(abs(n.length() - 1.0) < 0.001)
+    assert(Vec3.zero().length() == 0.0)
+    print("Vec3 ✓")
+
+    // Dot product
+    let a = Vec3.new(1.0, 0.0, 0.0)
+    let b = Vec3.new(0.0, 1.0, 0.0)
+    assert(a.dot(&b) == 0.0)
+    assert(a.dot(&a) == 1.0)
+    print("Dot product ✓")
+
+    // Lerp
+    let l = Vec3.new(0.0, 0.0, 0.0).lerp(&Vec3.new(10.0, 10.0, 10.0), 0.5)
+    assert(abs(l.x - 5.0) < 0.001)
+    print("Lerp ✓")
+
+    // SDF sphere
+    let center = Vec3.zero()
+    assert(abs(sdf_sphere(&Vec3.new(2.0, 0.0, 0.0), &center, 1.0) - 1.0) < 0.001)
+    assert(abs(sdf_sphere(&Vec3.new(0.5, 0.0, 0.0), &center, 1.0) - (-0.5)) < 0.001)
+    assert(abs(sdf_sphere(&center, &center, 1.0) - (-1.0)) < 0.001)
+    print("SDF sphere ✓")
+
+    // SDF box
+    let box_center = Vec3.zero()
+    let half = Vec3.new(1.0, 1.0, 1.0)
+    assert(sdf_box(&Vec3.new(2.0, 0.0, 0.0), &box_center, &half) > 0.0)  // outside
+    assert(sdf_box(&Vec3.new(0.5, 0.5, 0.5), &box_center, &half) < 0.0)  // inside
+    print("SDF box ✓")
+
+    // SDF plane
+    let up = Vec3.new(0.0, 1.0, 0.0)
+    assert(abs(sdf_plane(&Vec3.new(0.0, 5.0, 0.0), &up, 0.0) - 5.0) < 0.001)
+    assert(abs(sdf_plane(&Vec3.new(0.0, -3.0, 0.0), &up, 0.0) - (-3.0)) < 0.001)
+    print("SDF plane ✓")
+
+    // CSG operations
+    assert(sdf_union(1.0, 2.0) == 1.0)
+    assert(sdf_intersect(1.0, 2.0) == 2.0)
+    assert(sdf_subtract(1.0, 0.5) == 1.0)
+    let su = sdf_smooth_union(1.0, 1.0, 0.5)
+    assert(su < 1.0)  // smooth union is smaller than min
+    print("CSG ✓")
+
+    // Raymarching a sphere
+    let rm = RayMarcher.new()
+    let origin = Vec3.new(0.0, 0.0, -5.0)
+    let direction = Vec3.new(0.0, 0.0, 1.0)
+    let hit = rm.march(&origin, &direction, |p| sdf_sphere(p, &Vec3.zero(), 1.0))
+    assert(hit.hit)
+    assert(abs(hit.distance - 4.0) < 0.01)
+    assert(hit.steps < 128)
+    print("Raymarch hit ✓")
+
+    // Ray miss
+    let miss_dir = Vec3.new(0.0, 1.0, 0.0)
+    let miss = rm.march(&origin, &miss_dir, |p| sdf_sphere(p, &Vec3.zero(), 1.0))
+    assert(!miss.hit)
+    print("Raymarch miss ✓")
+
+    // Normal estimation
+    let normal = rm.estimate_normal(&Vec3.new(1.0, 0.0, 0.0), |p| sdf_sphere(p, &Vec3.zero(), 1.0))
+    assert(abs(normal.x - 1.0) < 0.01)
+    assert(abs(normal.y) < 0.01)
+    assert(abs(normal.z) < 0.01)
+    print("Normal estimation ✓")
+
+    // High quality preset
+    let hq = RayMarcher.high_quality()
+    assert(hq.max_steps == 256)
+    assert(hq.epsilon == 0.0001)
+    print("High quality ✓")
+
+    // Torus SDF
+    let torus_d = sdf_torus(&Vec3.new(2.0, 0.0, 0.0), 2.0, 0.5)
+    assert(abs(torus_d - (-0.5)) < 0.01)  // on major radius, inside minor
+    print("SDF torus ✓")
+
+    print("Raymarcher complete ✓")
+}
