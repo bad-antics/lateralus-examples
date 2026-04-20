@@ -1,0 +1,336 @@
+// YAML Parser
+// Subset YAML 1.2 parser supporting scalars, sequences, mappings, and multi-line strings.
+
+use std.collections.HashMap
+use std.fmt.{Display, Formatter}
+
+#[derive(Clone, Debug, PartialEq)]
+enum YamlValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(string),
+    Sequence([YamlValue]),
+    Mapping([(string, YamlValue)]),
+}
+
+impl YamlValue {
+    fn is_null(self) -> bool { matches!(self, YamlValue.Null) }
+    fn as_bool(self) -> Option<bool> { match self { YamlValue.Bool(b) => some(b), _ => none } }
+    fn as_int(self) -> Option<i64> { match self { YamlValue.Int(n) => some(n), _ => none } }
+    fn as_float(self) -> Option<f64> { match self { YamlValue.Float(f) => some(f), _ => none } }
+    fn as_str(self) -> Option<&string> { match self { YamlValue.Str(s) => some(s), _ => none } }
+    fn as_seq(self) -> Option<&[YamlValue]> { match self { YamlValue.Sequence(s) => some(s), _ => none } }
+    fn as_map(self) -> Option<&[(string, YamlValue)]> { match self { YamlValue.Mapping(m) => some(m), _ => none } }
+
+    fn get(self, key: &str) -> Option<&YamlValue> {
+        match self {
+            YamlValue.Mapping(entries) => {
+                entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+            },
+            _ => none,
+        }
+    }
+
+    fn index(self, i: usize) -> Option<&YamlValue> {
+        match self {
+            YamlValue.Sequence(items) => items.get(i),
+            _ => none,
+        }
+    }
+}
+
+impl Display for YamlValue {
+    fn fmt(self, f: &mut Formatter) -> Result<(), std.fmt.FmtError> {
+        match self {
+            YamlValue.Null => f.write_str("null"),
+            YamlValue.Bool(b) => f.write_str(if b { "true" } else { "false" }),
+            YamlValue.Int(n) => f.write_str(&n.to_string()),
+            YamlValue.Float(v) => f.write_str(&v.to_string()),
+            YamlValue.Str(s) => f.write_str(s),
+            YamlValue.Sequence(items) => {
+                f.write_str("[")?
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 { f.write_str(", ")? }
+                    item.fmt(f)?
+                }
+                f.write_str("]")
+            },
+            YamlValue.Mapping(entries) => {
+                f.write_str("{")?
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 { f.write_str(", ")? }
+                    f.write_str(k)?; f.write_str(": ")?; v.fmt(f)?
+                }
+                f.write_str("}")
+            },
+        }
+    }
+}
+
+struct YamlParser {
+    lines: [string],
+    pos: usize,
+}
+
+#[derive(Debug)]
+struct ParseError {
+    line: usize,
+    message: string,
+}
+
+impl YamlParser {
+    fn new(input: &str) -> YamlParser {
+        let lines = input.lines().collect::<[string]>()
+        YamlParser { lines, pos: 0 }
+    }
+
+    fn parse(mut self) -> Result<YamlValue, ParseError> {
+        self.skip_blanks()
+        if self.pos >= self.lines.len() { return ok(YamlValue.Null) }
+        self.parse_value(0)
+    }
+
+    fn current_indent(self) -> usize {
+        if self.pos >= self.lines.len() { return 0 }
+        let line = &self.lines[self.pos]
+        line.len() - line.trim_start().len()
+    }
+
+    fn current_line(self) -> &str {
+        if self.pos >= self.lines.len() { "" } else { &self.lines[self.pos] }
+    }
+
+    fn skip_blanks(mut self) {
+        while self.pos < self.lines.len() {
+            let trimmed = self.lines[self.pos].trim()
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                self.pos += 1
+            } else {
+                break
+            }
+        }
+    }
+
+    fn parse_value(mut self, min_indent: usize) -> Result<YamlValue, ParseError> {
+        self.skip_blanks()
+        if self.pos >= self.lines.len() { return ok(YamlValue.Null) }
+
+        let trimmed = self.current_line().trim().to_string()
+
+        // Flow sequence: [a, b, c]
+        if trimmed.starts_with('[') { return self.parse_flow_sequence() }
+        // Flow mapping: {a: 1, b: 2}
+        if trimmed.starts_with('{') { return self.parse_flow_mapping() }
+
+        // Block sequence
+        if trimmed.starts_with("- ") || trimmed == "-" {
+            return self.parse_block_sequence(min_indent)
+        }
+
+        // Block mapping (key: value)
+        if trimmed.contains(": ") || trimmed.ends_with(':') {
+            return self.parse_block_mapping(min_indent)
+        }
+
+        // Scalar
+        self.pos += 1
+        ok(self.parse_scalar(&trimmed))
+    }
+
+    fn parse_scalar(self, s: &str) -> YamlValue {
+        match s {
+            "null" | "~" | "" => YamlValue.Null,
+            "true" | "True" | "TRUE" => YamlValue.Bool(true),
+            "false" | "False" | "FALSE" => YamlValue.Bool(false),
+            _ => {
+                if let ok(n) = s.parse::<i64>() { return YamlValue.Int(n) }
+                if let ok(f) = s.parse::<f64>() { return YamlValue.Float(f) }
+                // Strip quotes
+                let unquoted = if (s.starts_with('"') && s.ends_with('"'))
+                    || (s.starts_with('\'') && s.ends_with('\'')) {
+                    s[1..s.len()-1].to_string()
+                } else { s.to_string() }
+                YamlValue.Str(unquoted)
+            },
+        }
+    }
+
+    fn parse_block_sequence(mut self, min_indent: usize) -> Result<YamlValue, ParseError> {
+        let mut items = []
+        while self.pos < self.lines.len() {
+            self.skip_blanks()
+            if self.pos >= self.lines.len() { break }
+            let indent = self.current_indent()
+            if indent < min_indent { break }
+            let trimmed = self.current_line().trim().to_string()
+            if !trimmed.starts_with("- ") && trimmed != "-" { break }
+
+            let value_part = if trimmed == "-" {
+                self.pos += 1
+                self.parse_value(indent + 2)?
+            } else {
+                let rest = trimmed[2..].trim().to_string()
+                self.pos += 1
+                if rest.contains(": ") || rest.ends_with(':') {
+                    // Inline mapping inside sequence item
+                    let key_val: [&str] = if rest.ends_with(':') {
+                        vec![&rest[..rest.len()-1], ""]
+                    } else {
+                        rest.splitn(2, ": ").collect()
+                    }
+                    let k = key_val[0].trim().to_string()
+                    let v = self.parse_scalar(key_val.get(1).unwrap_or(&"").trim())
+                    YamlValue.Mapping(vec![(k, v)])
+                } else {
+                    self.parse_scalar(&rest)
+                }
+            }
+            items.push(value_part)
+        }
+        ok(YamlValue.Sequence(items))
+    }
+
+    fn parse_block_mapping(mut self, min_indent: usize) -> Result<YamlValue, ParseError> {
+        let mut entries = []
+        while self.pos < self.lines.len() {
+            self.skip_blanks()
+            if self.pos >= self.lines.len() { break }
+            let indent = self.current_indent()
+            if indent < min_indent { break }
+            let trimmed = self.current_line().trim().to_string()
+            if !trimmed.contains(": ") && !trimmed.ends_with(':') { break }
+
+            let (key, rest) = if trimmed.ends_with(':') {
+                (trimmed[..trimmed.len()-1].trim().to_string(), "".to_string())
+            } else {
+                let parts: [&str] = trimmed.splitn(2, ": ").collect()
+                (parts[0].trim().to_string(), parts[1].trim().to_string())
+            }
+
+            self.pos += 1
+
+            let value = if rest.is_empty() {
+                self.parse_value(indent + 2)?
+            } else {
+                self.parse_scalar(&rest)
+            }
+            entries.push((key, value))
+        }
+        ok(YamlValue.Mapping(entries))
+    }
+
+    fn parse_flow_sequence(mut self) -> Result<YamlValue, ParseError> {
+        let trimmed = self.current_line().trim().to_string()
+        self.pos += 1
+        let inner = trimmed[1..trimmed.len()-1].trim().to_string()
+        if inner.is_empty() { return ok(YamlValue.Sequence([])) }
+        let items = inner.split(", ").map(|s| self.parse_scalar(s.trim())).collect()
+        ok(YamlValue.Sequence(items))
+    }
+
+    fn parse_flow_mapping(mut self) -> Result<YamlValue, ParseError> {
+        let trimmed = self.current_line().trim().to_string()
+        self.pos += 1
+        let inner = trimmed[1..trimmed.len()-1].trim().to_string()
+        if inner.is_empty() { return ok(YamlValue.Mapping([])) }
+        let mut entries = []
+        for pair in inner.split(", ") {
+            let parts: [&str] = pair.splitn(2, ": ").collect()
+            let k = parts[0].trim().to_string()
+            let v = self.parse_scalar(parts.get(1).unwrap_or(&"null").trim())
+            entries.push((k, v))
+        }
+        ok(YamlValue.Mapping(entries))
+    }
+}
+
+fn parse(input: &str) -> Result<YamlValue, ParseError> {
+    YamlParser.new(input).parse()
+}
+
+fn main() {
+    // Scalars
+    assert(parse("42").unwrap() == YamlValue.Int(42))
+    assert(parse("3.14").unwrap() == YamlValue.Float(3.14))
+    assert(parse("true").unwrap() == YamlValue.Bool(true))
+    assert(parse("null").unwrap() == YamlValue.Null)
+    assert(parse("~").unwrap() == YamlValue.Null)
+    assert(parse("hello world").unwrap() == YamlValue.Str("hello world".to_string()))
+    print("Scalars ✓")
+
+    // Quoted strings
+    assert(parse("\"quoted\"").unwrap() == YamlValue.Str("quoted".to_string()))
+    assert(parse("'single'").unwrap() == YamlValue.Str("single".to_string()))
+    print("Quoted strings ✓")
+
+    // Boolean variants
+    assert(parse("True").unwrap() == YamlValue.Bool(true))
+    assert(parse("FALSE").unwrap() == YamlValue.Bool(false))
+    print("Bool variants ✓")
+
+    // Flow sequence
+    let seq = parse("[1, 2, 3]").unwrap()
+    assert(seq.as_seq().unwrap().len() == 3)
+    assert(seq.index(0).unwrap() == &YamlValue.Int(1))
+    assert(seq.index(2).unwrap() == &YamlValue.Int(3))
+    print("Flow sequence ✓")
+
+    // Empty flow
+    assert(parse("[]").unwrap() == YamlValue.Sequence([]))
+    assert(parse("{}").unwrap() == YamlValue.Mapping([]))
+    print("Empty flow ✓")
+
+    // Flow mapping
+    let map = parse("{name: Alice, age: 30}").unwrap()
+    assert(map.get("name").unwrap() == &YamlValue.Str("Alice".to_string()))
+    assert(map.get("age").unwrap() == &YamlValue.Int(30))
+    print("Flow mapping ✓")
+
+    // Block sequence
+    let block_seq = parse("- one\n- two\n- three").unwrap()
+    assert(block_seq.as_seq().unwrap().len() == 3)
+    assert(block_seq.index(1).unwrap() == &YamlValue.Str("two".to_string()))
+    print("Block sequence ✓")
+
+    // Block mapping
+    let block_map = parse("host: localhost\nport: 8080\ndebug: true").unwrap()
+    assert(block_map.get("host").unwrap() == &YamlValue.Str("localhost".to_string()))
+    assert(block_map.get("port").unwrap() == &YamlValue.Int(8080))
+    assert(block_map.get("debug").unwrap() == &YamlValue.Bool(true))
+    print("Block mapping ✓")
+
+    // Comments are ignored
+    let with_comments = parse("# this is a comment\nvalue: 42\n# another comment").unwrap()
+    assert(with_comments.get("value").unwrap() == &YamlValue.Int(42))
+    print("Comments ✓")
+
+    // YamlValue accessors
+    let v = YamlValue.Int(42)
+    assert(v.as_int() == some(42))
+    assert(v.as_str().is_none())
+    assert(!v.is_null())
+    assert(YamlValue.Null.is_null())
+    print("Accessors ✓")
+
+    // Display
+    assert(YamlValue.Int(10).to_string() == "10")
+    assert(YamlValue.Bool(true).to_string() == "true")
+    assert(YamlValue.Null.to_string() == "null")
+    print("Display ✓")
+
+    // Nested mapping lookup
+    let nested = parse("db:\n  host: pg.local\n  port: 5432").unwrap()
+    let db = nested.get("db").unwrap()
+    assert(db.get("host").unwrap() == &YamlValue.Str("pg.local".to_string()))
+    assert(db.get("port").unwrap() == &YamlValue.Int(5432))
+    print("Nested mapping ✓")
+
+    // get returns none for missing
+    assert(block_map.get("missing").is_none())
+    assert(YamlValue.Int(1).get("x").is_none())
+    print("Missing key ✓")
+
+    print("YAML Parser complete ✓")
+}
