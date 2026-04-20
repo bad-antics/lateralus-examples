@@ -1,0 +1,249 @@
+
+// Raft Consensus Algorithm - Leader election and log replication
+// Simplified simulation of the Raft distributed consensus protocol.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug, PartialEq)]
+enum Role { Follower, Candidate, Leader }
+
+type NodeId = usize
+type Term = u64
+type LogIndex = usize
+
+#[derive(Clone, Debug)]
+struct LogEntry {
+    term: Term,
+    index: LogIndex,
+    command: string,
+}
+
+#[derive(Clone, Debug)]
+struct RaftNode {
+    id: NodeId,
+    role: Role,
+    current_term: Term,
+    voted_for: Option<NodeId>,
+    log: [LogEntry],
+    commit_index: LogIndex,
+    last_applied: LogIndex,
+    votes_received: usize,
+    cluster_size: usize,
+    leader_id: Option<NodeId>,
+    next_index: HashMap<NodeId, LogIndex>,
+    match_index: HashMap<NodeId, LogIndex>,
+    state_machine: [string],
+}
+
+impl RaftNode {
+    fn new(id: NodeId, cluster_size: usize) -> RaftNode {
+        RaftNode {
+            id, role: Role.Follower, current_term: 0,
+            voted_for: none, log: [], commit_index: 0,
+            last_applied: 0, votes_received: 0,
+            cluster_size, leader_id: none,
+            next_index: HashMap.new(), match_index: HashMap.new(),
+            state_machine: [],
+        }
+    }
+
+    fn is_leader(self) -> bool { self.role == Role.Leader }
+    fn is_follower(self) -> bool { self.role == Role.Follower }
+    fn is_candidate(self) -> bool { self.role == Role.Candidate }
+    fn majority(self) -> usize { self.cluster_size / 2 + 1 }
+    fn last_log_index(self) -> LogIndex { self.log.len() }
+    fn last_log_term(self) -> Term {
+        self.log.last().map(|e| e.term).unwrap_or(0)
+    }
+
+    fn start_election(mut self) {
+        self.current_term += 1
+        self.role = Role.Candidate
+        self.voted_for = some(self.id)
+        self.votes_received = 1  // vote for self
+        self.leader_id = none
+    }
+
+    fn receive_vote(mut self, granted: bool) {
+        if granted && self.role == Role.Candidate {
+            self.votes_received += 1
+            if self.votes_received >= self.majority() {
+                self.become_leader()
+            }
+        }
+    }
+
+    fn become_leader(mut self) {
+        self.role = Role.Leader
+        self.leader_id = some(self.id)
+        // Initialize next_index for all peers
+        let next = self.last_log_index() + 1
+        for peer in 0..self.cluster_size {
+            if peer != self.id {
+                self.next_index.insert(peer, next)
+                self.match_index.insert(peer, 0)
+            }
+        }
+    }
+
+    fn handle_vote_request(mut self, candidate_id: NodeId, candidate_term: Term,
+                           last_log_index: LogIndex, last_log_term: Term) -> (Term, bool) {
+        if candidate_term < self.current_term { return (self.current_term, false) }
+        if candidate_term > self.current_term {
+            self.current_term = candidate_term
+            self.role = Role.Follower
+            self.voted_for = none
+        }
+        let can_vote = self.voted_for.is_none() || self.voted_for == some(candidate_id)
+        let log_ok = last_log_term > self.last_log_term() ||
+            (last_log_term == self.last_log_term() && last_log_index >= self.last_log_index())
+        if can_vote && log_ok {
+            self.voted_for = some(candidate_id)
+            (self.current_term, true)
+        } else {
+            (self.current_term, false)
+        }
+    }
+
+    fn append_entry(mut self, command: string) -> Option<LogIndex> {
+        if !self.is_leader() { return none }
+        let entry = LogEntry {
+            term: self.current_term,
+            index: self.last_log_index() + 1,
+            command,
+        }
+        self.log.push(entry)
+        some(self.last_log_index())
+    }
+
+    fn handle_append_entries(mut self, leader_term: Term, leader_id: NodeId,
+                             entries: &[LogEntry], leader_commit: LogIndex) -> (Term, bool) {
+        if leader_term < self.current_term { return (self.current_term, false) }
+        self.current_term = leader_term
+        self.role = Role.Follower
+        self.leader_id = some(leader_id)
+        for entry in entries {
+            if entry.index <= self.log.len() {
+                self.log[entry.index - 1] = entry.clone()
+            } else {
+                self.log.push(entry.clone())
+            }
+        }
+        if leader_commit > self.commit_index {
+            self.commit_index = leader_commit.min(self.last_log_index())
+        }
+        self.apply_committed()
+        (self.current_term, true)
+    }
+
+    fn apply_committed(mut self) {
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1
+            let cmd = &self.log[self.last_applied - 1].command
+            self.state_machine.push(cmd.clone())
+        }
+    }
+
+    fn advance_commit(mut self) {
+        if !self.is_leader() { return }
+        for n in (self.commit_index + 1)..=self.last_log_index() {
+            if self.log[n - 1].term != self.current_term { continue }
+            let mut replicated = 1  // self
+            for (_, &match_idx) in &self.match_index {
+                if match_idx >= n { replicated += 1 }
+            }
+            if replicated >= self.majority() { self.commit_index = n }
+        }
+        self.apply_committed()
+    }
+}
+
+fn main() {
+    // Node creation
+    let node = RaftNode.new(0, 5)
+    assert(node.is_follower())
+    assert(node.current_term == 0)
+    assert(node.majority() == 3)
+    print("Node creation ✓")
+
+    // Election
+    let mut candidate = RaftNode.new(0, 5)
+    candidate.start_election()
+    assert(candidate.is_candidate())
+    assert(candidate.current_term == 1)
+    assert(candidate.votes_received == 1)
+    assert(candidate.voted_for == some(0))
+    print("Election start ✓")
+
+    // Vote granting
+    candidate.receive_vote(true)
+    assert(candidate.votes_received == 2)
+    assert(candidate.is_candidate())
+    candidate.receive_vote(true)
+    assert(candidate.votes_received == 3)
+    assert(candidate.is_leader())
+    assert(candidate.leader_id == some(0))
+    print("Vote + become leader ✓")
+
+    // Log append
+    let idx1 = candidate.append_entry("SET x=1".into())
+    assert(idx1 == some(1))
+    let idx2 = candidate.append_entry("SET y=2".into())
+    assert(idx2 == some(2))
+    assert(candidate.last_log_index() == 2)
+    assert(candidate.last_log_term() == 1)
+    print("Log append ✓")
+
+    // Follower rejects append with lower term
+    let mut follower = RaftNode.new(1, 5)
+    follower.current_term = 5
+    let (term, ok) = follower.handle_append_entries(3, 0, &[], 0)
+    assert(!ok)
+    assert(term == 5)
+    print("Reject lower term ✓")
+
+    // Follower accepts append
+    let mut f2 = RaftNode.new(2, 5)
+    let entries = [LogEntry { term: 1, index: 1, command: "SET x=1".into() }]
+    let (_, ok2) = f2.handle_append_entries(1, 0, &entries, 1)
+    assert(ok2)
+    assert(f2.last_log_index() == 1)
+    assert(f2.leader_id == some(0))
+    assert(f2.commit_index == 1)
+    assert(f2.state_machine.len() == 1)
+    print("Follower accept ✓")
+
+    // Vote request
+    let mut v1 = RaftNode.new(3, 5)
+    let (_, granted) = v1.handle_vote_request(1, 1, 0, 0)
+    assert(granted)
+    assert(v1.voted_for == some(1))
+    // Already voted
+    let (_, granted2) = v1.handle_vote_request(2, 1, 0, 0)
+    assert(!granted2)
+    print("Vote request ✓")
+
+    // Higher term resets vote
+    let (_, granted3) = v1.handle_vote_request(2, 2, 0, 0)
+    assert(granted3)
+    assert(v1.current_term == 2)
+    print("Higher term reset ✓")
+
+    // Commit advance
+    let mut leader = RaftNode.new(0, 3)
+    leader.start_election()
+    leader.receive_vote(true)  // majority
+    leader.append_entry("cmd1".into())
+    leader.match_index.insert(1, 1)
+    leader.advance_commit()
+    assert(leader.commit_index == 1)
+    assert(leader.state_machine == ["cmd1"])
+    print("Commit advance ✓")
+
+    // Non-leader can't append
+    let mut follower3 = RaftNode.new(4, 5)
+    assert(follower3.append_entry("nope".into()) == none)
+    print("Non-leader reject ✓")
+
+    print("Raft consensus complete ✓")
+}
