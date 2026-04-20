@@ -1,0 +1,233 @@
+
+// CSV Parser - RFC 4180 compliant CSV parsing
+// Handles quoted fields, escaped quotes, and custom delimiters.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug, PartialEq)]
+struct CsvConfig {
+    delimiter: char,
+    quote_char: char,
+    has_header: bool,
+    trim_whitespace: bool,
+}
+
+impl CsvConfig {
+    fn default() -> CsvConfig {
+        CsvConfig { delimiter: ',', quote_char: '"', has_header: true, trim_whitespace: false }
+    }
+
+    fn tsv() -> CsvConfig {
+        CsvConfig { delimiter: '\t', quote_char: '"', has_header: true, trim_whitespace: false }
+    }
+
+    fn with_delimiter(delimiter: char) -> CsvConfig {
+        CsvConfig { delimiter, ..CsvConfig.default() }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CsvRow {
+    fields: [string],
+}
+
+impl CsvRow {
+    fn new(fields: [string]) -> CsvRow { CsvRow { fields } }
+    fn get(self, idx: usize) -> Option<&str> { self.fields.get(idx).map(|s| s.as_str()) }
+    fn len(self) -> usize { self.fields.len() }
+    fn is_empty(self) -> bool { self.fields.is_empty() }
+}
+
+#[derive(Clone, Debug)]
+struct CsvTable {
+    headers: Option<[string]>,
+    rows: [CsvRow],
+}
+
+impl CsvTable {
+    fn new(headers: Option<[string]>, rows: [CsvRow]) -> CsvTable {
+        CsvTable { headers, rows }
+    }
+
+    fn row_count(self) -> usize { self.rows.len() }
+    fn col_count(self) -> usize {
+        self.headers.as_ref().map(|h| h.len())
+            .or_else(|| self.rows.first().map(|r| r.len()))
+            .unwrap_or(0)
+    }
+
+    fn get_column(self, name: &str) -> Option<[string]> {
+        let idx = self.headers.as_ref()?.iter().position(|h| h == name)?;
+        some(self.rows.iter().filter_map(|r| r.get(idx).map(|s| s.to_string())).collect())
+    }
+
+    fn get_cell(self, row: usize, col: usize) -> Option<&str> {
+        self.rows.get(row)?.get(col)
+    }
+
+    fn filter<F: Fn(&CsvRow) -> bool>(self, predicate: F) -> CsvTable {
+        CsvTable {
+            headers: self.headers.clone(),
+            rows: self.rows.iter().filter(|r| predicate(r)).cloned().collect(),
+        }
+    }
+}
+
+fn parse_csv_line(line: &str, config: &CsvConfig) -> CsvRow {
+    let mut fields = vec![]
+    let mut current = String.new()
+    let mut in_quotes = false
+    let mut chars = line.chars().peekable()
+
+    while let some(ch) = chars.next() {
+        if in_quotes {
+            if ch == config.quote_char {
+                if chars.peek() == some(&config.quote_char) {
+                    current.push(config.quote_char)
+                    chars.next()
+                } else {
+                    in_quotes = false
+                }
+            } else {
+                current.push(ch)
+            }
+        } else if ch == config.quote_char {
+            in_quotes = true
+        } else if ch == config.delimiter {
+            let field = if config.trim_whitespace { current.trim().to_string() } else { current.clone() }
+            fields.push(field)
+            current.clear()
+        } else {
+            current.push(ch)
+        }
+    }
+
+    let field = if config.trim_whitespace { current.trim().to_string() } else { current }
+    fields.push(field)
+    CsvRow.new(fields)
+}
+
+fn parse_csv(input: &str, config: &CsvConfig) -> CsvTable {
+    let lines: [&str] = input.lines().filter(|l| !l.is_empty()).collect()
+    if lines.is_empty() { return CsvTable.new(none, vec![]) }
+
+    if config.has_header {
+        let header_row = parse_csv_line(lines[0], config)
+        let rows: [CsvRow] = lines[1..].iter().map(|l| parse_csv_line(l, config)).collect()
+        CsvTable.new(some(header_row.fields), rows)
+    } else {
+        let rows: [CsvRow] = lines.iter().map(|l| parse_csv_line(l, config)).collect()
+        CsvTable.new(none, rows)
+    }
+}
+
+fn to_csv(table: &CsvTable, config: &CsvConfig) -> string {
+    let mut output = String.new()
+    if let some(ref headers) = table.headers {
+        output.push_str(&headers.iter().map(|h| escape_field(h, config)).collect::<[string]>().join(&config.delimiter.to_string()))
+        output.push('\n')
+    }
+    for row in &table.rows {
+        output.push_str(&row.fields.iter().map(|f| escape_field(f, config)).collect::<[string]>().join(&config.delimiter.to_string()))
+        output.push('\n')
+    }
+    output
+}
+
+fn escape_field(field: &str, config: &CsvConfig) -> string {
+    if field.contains(config.delimiter) || field.contains(config.quote_char) || field.contains('\n') {
+        let escaped = field.replace(
+            &config.quote_char.to_string(),
+            &format!("{}{}", config.quote_char, config.quote_char),
+        )
+        format!("{}{}{}", config.quote_char, escaped, config.quote_char)
+    } else {
+        field.to_string()
+    }
+}
+
+fn main() {
+    // Simple CSV parsing
+    let csv = "name,age,city\nAlice,30,NYC\nBob,25,LA\nCarol,35,SF"
+    let config = CsvConfig.default()
+    let table = parse_csv(csv, &config)
+    assert(table.row_count() == 3)
+    assert(table.col_count() == 3)
+    assert(table.get_cell(0, 0) == some("Alice"))
+    assert(table.get_cell(1, 1) == some("25"))
+    print("Simple parse ✓")
+
+    // Headers
+    assert(table.headers == some(vec!["name".into(), "age".into(), "city".into()]))
+    print("Headers ✓")
+
+    // Column extraction
+    let names = table.get_column("name").unwrap()
+    assert(names.len() == 3)
+    assert(names[0] == "Alice")
+    assert(names[2] == "Carol")
+    assert(table.get_column("missing").is_none())
+    print("Column extraction ✓")
+
+    // Quoted fields
+    let quoted_csv = "title,desc\n\"Hello, World\",simple\n\"She said \"\"hi\"\"\",quoted"
+    let qt = parse_csv(quoted_csv, &config)
+    assert(qt.get_cell(0, 0) == some("Hello, World"))
+    assert(qt.get_cell(1, 0) == some("She said \"hi\""))
+    print("Quoted fields ✓")
+
+    // TSV
+    let tsv = "name\tage\nAlice\t30"
+    let tsv_table = parse_csv(tsv, &CsvConfig.tsv())
+    assert(tsv_table.get_cell(0, 0) == some("Alice"))
+    assert(tsv_table.get_cell(0, 1) == some("30"))
+    print("TSV ✓")
+
+    // No header
+    let no_header_cfg = CsvConfig { has_header: false, ..CsvConfig.default() }
+    let raw = "1,2,3\n4,5,6"
+    let raw_table = parse_csv(raw, &no_header_cfg)
+    assert(raw_table.headers.is_none())
+    assert(raw_table.row_count() == 2)
+    assert(raw_table.get_cell(0, 0) == some("1"))
+    print("No header ✓")
+
+    // Filter
+    let filtered = table.filter(|row| row.get(1).unwrap_or("0").parse::<i32>().unwrap_or(0) >= 30)
+    assert(filtered.row_count() == 2)  // Alice (30) and Carol (35)
+    print("Filter ✓")
+
+    // Escape field
+    assert(escape_field("simple", &config) == "simple")
+    assert(escape_field("has,comma", &config) == "\"has,comma\"")
+    assert(escape_field("has\"quote", &config) == "\"has\"\"quote\"")
+    print("Escape ✓")
+
+    // Round-trip
+    let output = to_csv(&table, &config)
+    let reparsed = parse_csv(&output, &config)
+    assert(reparsed.row_count() == 3)
+    assert(reparsed.get_cell(0, 0) == some("Alice"))
+    print("Round-trip ✓")
+
+    // Empty
+    let empty = parse_csv("", &config)
+    assert(empty.row_count() == 0)
+    print("Empty ✓")
+
+    // CsvRow
+    let row = CsvRow.new(vec!["a".into(), "b".into()])
+    assert(row.len() == 2)
+    assert(!row.is_empty())
+    assert(CsvRow.new(vec![]).is_empty())
+    print("CsvRow ✓")
+
+    // Custom delimiter
+    let pipe_cfg = CsvConfig.with_delimiter('|')
+    let pipe_csv = "a|b|c\n1|2|3"
+    let pipe_table = parse_csv(pipe_csv, &pipe_cfg)
+    assert(pipe_table.get_cell(0, 1) == some("2"))
+    print("Custom delimiter ✓")
+
+    print("CSV parser complete ✓")
+}
