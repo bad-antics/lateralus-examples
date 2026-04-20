@@ -1,0 +1,234 @@
+// Complex Numbers
+// Full complex arithmetic with polar form, roots, and common functions.
+
+use std.math.{sqrt, atan2, cos, sin, exp, ln, PI}
+use std.fmt.{Display, Formatter}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Complex {
+    re: f64,
+    im: f64,
+}
+
+impl Complex {
+    fn new(re: f64, im: f64) -> Complex { Complex { re, im } }
+    fn zero() -> Complex { Complex { re: 0.0, im: 0.0 } }
+    fn one() -> Complex { Complex { re: 1.0, im: 0.0 } }
+    fn i() -> Complex { Complex { re: 0.0, im: 1.0 } }
+    fn from_polar(r: f64, theta: f64) -> Complex {
+        Complex { re: r * cos(theta), im: r * sin(theta) }
+    }
+
+    fn abs(self) -> f64 { sqrt(self.re * self.re + self.im * self.im) }
+    fn arg(self) -> f64 { atan2(self.im, self.re) }
+    fn norm_sq(self) -> f64 { self.re * self.re + self.im * self.im }
+    fn conj(self) -> Complex { Complex { re: self.re, im: -self.im } }
+
+    fn add(self, other: Complex) -> Complex {
+        Complex { re: self.re + other.re, im: self.im + other.im }
+    }
+    fn sub(self, other: Complex) -> Complex {
+        Complex { re: self.re - other.re, im: self.im - other.im }
+    }
+    fn mul(self, other: Complex) -> Complex {
+        Complex {
+            re: self.re * other.re - self.im * other.im,
+            im: self.re * other.im + self.im * other.re,
+        }
+    }
+    fn div(self, other: Complex) -> Complex {
+        let denom = other.norm_sq()
+        Complex {
+            re: (self.re * other.re + self.im * other.im) / denom,
+            im: (self.im * other.re - self.re * other.im) / denom,
+        }
+    }
+
+    fn scale(self, s: f64) -> Complex { Complex { re: self.re * s, im: self.im * s } }
+    fn neg(self) -> Complex { Complex { re: -self.re, im: -self.im } }
+    fn recip(self) -> Complex { Complex.one().div(self) }
+
+    fn pow(self, n: i32) -> Complex {
+        if n == 0 { return Complex.one() }
+        if n < 0 { return self.recip().pow(-n) }
+        let r = self.abs().powf(n as f64)
+        let theta = self.arg() * (n as f64)
+        Complex.from_polar(r, theta)
+    }
+
+    fn exp(self) -> Complex {
+        let r = exp(self.re)
+        Complex { re: r * cos(self.im), im: r * sin(self.im) }
+    }
+
+    fn ln(self) -> Complex {
+        Complex { re: ln(self.abs()), im: self.arg() }
+    }
+
+    fn sqrt(self) -> Complex {
+        let r = self.abs().sqrt()
+        let theta = self.arg() / 2.0
+        Complex.from_polar(r, theta)
+    }
+
+    fn nth_roots(self, n: usize) -> [Complex] {
+        let r = self.abs().powf(1.0 / n as f64)
+        let theta = self.arg()
+        (0..n).map(|k| {
+            let angle = (theta + 2.0 * PI * k as f64) / n as f64
+            Complex.from_polar(r, angle)
+        }).collect()
+    }
+
+    fn is_real(self) -> bool { self.im.abs() < 1e-10 }
+    fn is_imaginary(self) -> bool { self.re.abs() < 1e-10 }
+    fn is_zero(self) -> bool { self.norm_sq() < 1e-20 }
+
+    fn approx_eq(self, other: Complex, epsilon: f64) -> bool {
+        (self.re - other.re).abs() < epsilon && (self.im - other.im).abs() < epsilon
+    }
+
+    fn to_polar(self) -> (f64, f64) { (self.abs(), self.arg()) }
+}
+
+impl Display for Complex {
+    fn fmt(self, f: &mut Formatter) -> Result<(), std.fmt.FmtError> {
+        if self.im >= 0.0 {
+            f.write_str(&format!("{}+{}i", self.re, self.im))
+        } else {
+            f.write_str(&format!("{}{}i", self.re, self.im))
+        }
+    }
+}
+
+fn quadratic_roots(a: f64, b: f64, c: f64) -> (Complex, Complex) {
+    let disc = Complex.new(b * b - 4.0 * a * c, 0.0).sqrt()
+    let neg_b = Complex.new(-b, 0.0)
+    let two_a = Complex.new(2.0 * a, 0.0)
+    (neg_b.add(disc).div(two_a), neg_b.sub(disc).div(two_a))
+}
+
+fn main() {
+    let eps = 1e-9
+
+    // Construction
+    let z = Complex.new(3.0, 4.0)
+    assert(z.re == 3.0 && z.im == 4.0)
+    assert(Complex.zero().is_zero())
+    assert(Complex.one().re == 1.0)
+    assert(Complex.i().im == 1.0)
+    print("Construction ✓")
+
+    // Abs and arg
+    assert((z.abs() - 5.0).abs() < eps)
+    assert((Complex.new(1.0, 0.0).arg() - 0.0).abs() < eps)
+    print("Abs/arg ✓")
+
+    // Conjugate
+    let conj = z.conj()
+    assert(conj.re == 3.0 && conj.im == -4.0)
+    print("Conjugate ✓")
+
+    // Arithmetic
+    let a = Complex.new(1.0, 2.0)
+    let b = Complex.new(3.0, 4.0)
+    assert(a.add(b).approx_eq(Complex.new(4.0, 6.0), eps))
+    assert(a.sub(b).approx_eq(Complex.new(-2.0, -2.0), eps))
+    assert(a.mul(b).approx_eq(Complex.new(-5.0, 10.0), eps))
+    print("Arithmetic ✓")
+
+    // Division
+    let d = a.div(b)
+    let check = d.mul(b)
+    assert(check.approx_eq(a, eps))
+    print("Division ✓")
+
+    // i^2 = -1
+    let i2 = Complex.i().mul(Complex.i())
+    assert(i2.approx_eq(Complex.new(-1.0, 0.0), eps))
+    print("i² = -1 ✓")
+
+    // Power
+    let z2 = Complex.new(1.0, 1.0)
+    let z4 = z2.pow(4)
+    assert(z4.approx_eq(Complex.new(-4.0, 0.0), eps))
+    print("Power ✓")
+
+    // Negative power
+    let inv = z2.pow(-1)
+    let product = z2.mul(inv)
+    assert(product.approx_eq(Complex.one(), eps))
+    print("Negative power ✓")
+
+    // Euler's formula: e^(i*pi) = -1
+    let euler = Complex.new(0.0, PI).exp()
+    assert(euler.approx_eq(Complex.new(-1.0, 0.0), eps))
+    print("Euler's formula ✓")
+
+    // Logarithm
+    let w = Complex.new(1.0, 0.0).ln()
+    assert(w.approx_eq(Complex.zero(), eps))
+    print("Logarithm ✓")
+
+    // Square root
+    let sr = Complex.new(-1.0, 0.0).sqrt()
+    assert(sr.approx_eq(Complex.i(), eps))
+    print("Square root ✓")
+
+    // Nth roots (cube roots of 1)
+    let roots = Complex.one().nth_roots(3)
+    assert(roots.len() == 3)
+    for root in &roots {
+        let cubed = root.pow(3)
+        assert(cubed.approx_eq(Complex.one(), 1e-6))
+    }
+    print("Nth roots ✓")
+
+    // Polar conversion
+    let p = Complex.from_polar(5.0, PI / 4.0)
+    let (r, theta) = p.to_polar()
+    assert((r - 5.0).abs() < eps)
+    assert((theta - PI / 4.0).abs() < eps)
+    print("Polar ✓")
+
+    // Quadratic with real roots: x^2 - 5x + 6 = 0
+    let (r1, r2) = quadratic_roots(1.0, -5.0, 6.0)
+    assert(r1.is_real() && r2.is_real())
+    assert(r1.re.approx_eq(3.0, eps) || r1.re.approx_eq(2.0, eps))
+    print("Quadratic real roots ✓")
+
+    // Quadratic with complex roots: x^2 + 1 = 0
+    let (c1, c2) = quadratic_roots(1.0, 0.0, 1.0)
+    assert(c1.is_imaginary())
+    assert(c2.is_imaginary())
+    assert((c1.im.abs() - 1.0).abs() < eps)
+    print("Quadratic complex roots ✓")
+
+    // Predicates
+    assert(Complex.new(5.0, 0.0).is_real())
+    assert(Complex.new(0.0, 3.0).is_imaginary())
+    assert(!z.is_real())
+    print("Predicates ✓")
+
+    // Scale and negate
+    assert(z.scale(2.0).approx_eq(Complex.new(6.0, 8.0), eps))
+    assert(z.neg().approx_eq(Complex.new(-3.0, -4.0), eps))
+    print("Scale/negate ✓")
+
+    // Display
+    let disp = Complex.new(1.0, 2.0).to_string()
+    assert(disp.contains("1"))
+    assert(disp.contains("2"))
+    print("Display ✓")
+
+    // Reciprocal
+    let rec = z.recip()
+    assert(z.mul(rec).approx_eq(Complex.one(), eps))
+    print("Reciprocal ✓")
+
+    // norm_sq
+    assert((z.norm_sq() - 25.0).abs() < eps)
+    print("Norm squared ✓")
+
+    print("Complex Numbers complete ✓")
+}
