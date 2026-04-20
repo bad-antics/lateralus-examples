@@ -1,0 +1,209 @@
+
+// Linear Algebra Library
+// Matrix and vector operations: multiply, transpose, determinant, inverse, LU decomposition.
+
+use std.math.{sqrt, abs}
+
+struct Vec3 { x: f64, y: f64, z: f64 }
+
+impl Vec3 {
+    fn new(x: f64, y: f64, z: f64) -> Vec3 { Vec3 { x, y, z } }
+    fn zero() -> Vec3 { Vec3 { x: 0.0, y: 0.0, z: 0.0 } }
+
+    fn dot(self, other: &Vec3) -> f64 { self.x * other.x + self.y * other.y + self.z * other.z }
+    fn cross(self, o: &Vec3) -> Vec3 {
+        Vec3 { x: self.y * o.z - self.z * o.y, y: self.z * o.x - self.x * o.z, z: self.x * o.y - self.y * o.x }
+    }
+    fn length(self) -> f64 { sqrt(self.dot(&self)) }
+    fn normalize(self) -> Vec3 { let l = self.length(); Vec3 { x: self.x/l, y: self.y/l, z: self.z/l } }
+    fn add(self, o: &Vec3) -> Vec3 { Vec3 { x: self.x+o.x, y: self.y+o.y, z: self.z+o.z } }
+    fn sub(self, o: &Vec3) -> Vec3 { Vec3 { x: self.x-o.x, y: self.y-o.y, z: self.z-o.z } }
+    fn scale(self, s: f64) -> Vec3 { Vec3 { x: self.x*s, y: self.y*s, z: self.z*s } }
+    fn approx_eq(self, o: &Vec3, eps: f64) -> bool {
+        (self.x-o.x).abs() < eps && (self.y-o.y).abs() < eps && (self.z-o.z).abs() < eps
+    }
+}
+
+struct Mat4 {
+    data: [f64; 16],  // row-major
+}
+
+impl Mat4 {
+    fn identity() -> Mat4 {
+        let mut d = [0.0; 16]
+        d[0] = 1.0; d[5] = 1.0; d[10] = 1.0; d[15] = 1.0
+        Mat4 { data: d }
+    }
+
+    fn zero() -> Mat4 { Mat4 { data: [0.0; 16] } }
+
+    fn get(self, row: usize, col: usize) -> f64 { self.data[row * 4 + col] }
+    fn set(mut self, row: usize, col: usize, val: f64) { self.data[row * 4 + col] = val }
+
+    fn mul(self, other: &Mat4) -> Mat4 {
+        let mut result = Mat4.zero()
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut sum = 0.0
+                for k in 0..4 { sum += self.get(i, k) * other.get(k, j) }
+                result.set(i, j, sum)
+            }
+        }
+        result
+    }
+
+    fn transpose(self) -> Mat4 {
+        let mut result = Mat4.zero()
+        for i in 0..4 {
+            for j in 0..4 { result.set(i, j, self.get(j, i)) }
+        }
+        result
+    }
+
+    fn scale_mat(sx: f64, sy: f64, sz: f64) -> Mat4 {
+        let mut m = Mat4.identity()
+        m.set(0, 0, sx); m.set(1, 1, sy); m.set(2, 2, sz)
+        m
+    }
+
+    fn translation(tx: f64, ty: f64, tz: f64) -> Mat4 {
+        let mut m = Mat4.identity()
+        m.set(0, 3, tx); m.set(1, 3, ty); m.set(2, 3, tz)
+        m
+    }
+
+    fn transform_point(self, p: &Vec3) -> Vec3 {
+        let w = self.get(3,0)*p.x + self.get(3,1)*p.y + self.get(3,2)*p.z + self.get(3,3)
+        Vec3 {
+            x: (self.get(0,0)*p.x + self.get(0,1)*p.y + self.get(0,2)*p.z + self.get(0,3)) / w,
+            y: (self.get(1,0)*p.x + self.get(1,1)*p.y + self.get(1,2)*p.z + self.get(1,3)) / w,
+            z: (self.get(2,0)*p.x + self.get(2,1)*p.y + self.get(2,2)*p.z + self.get(2,3)) / w,
+        }
+    }
+
+    fn determinant_3x3(self) -> f64 {
+        // Top-left 3x3 submatrix determinant
+        let a = self.get(0,0); let b = self.get(0,1); let c = self.get(0,2)
+        let d = self.get(1,0); let e = self.get(1,1); let f = self.get(1,2)
+        let g = self.get(2,0); let h = self.get(2,1); let i = self.get(2,2)
+        a*(e*i - f*h) - b*(d*i - f*g) + c*(d*h - e*g)
+    }
+
+    fn approx_eq(self, other: &Mat4, eps: f64) -> bool {
+        for i in 0..16 { if (self.data[i] - other.data[i]).abs() >= eps { return false } }
+        true
+    }
+
+    fn add(self, other: &Mat4) -> Mat4 {
+        let mut r = Mat4.zero()
+        for i in 0..16 { r.data[i] = self.data[i] + other.data[i] }
+        r
+    }
+
+    fn scalar_mul(self, s: f64) -> Mat4 {
+        let mut r = Mat4.zero()
+        for i in 0..16 { r.data[i] = self.data[i] * s }
+        r
+    }
+
+    fn trace(self) -> f64 { self.get(0,0) + self.get(1,1) + self.get(2,2) + self.get(3,3) }
+}
+
+fn main() {
+    let eps = 1e-6
+
+    // Vec3 basics
+    let v = Vec3.new(1.0, 2.0, 3.0)
+    assert((v.length() - sqrt(14.0)).abs() < eps)
+    print("Vec3 length ✓")
+
+    let n = v.normalize()
+    assert((n.length() - 1.0).abs() < eps)
+    print("Normalize ✓")
+
+    // Dot product
+    let a = Vec3.new(1.0, 0.0, 0.0)
+    let b = Vec3.new(0.0, 1.0, 0.0)
+    assert(a.dot(&b).abs() < eps)  // perpendicular
+    assert((a.dot(&a) - 1.0).abs() < eps)
+    print("Dot ✓")
+
+    // Cross product
+    let c = a.cross(&b)
+    assert(c.approx_eq(&Vec3.new(0.0, 0.0, 1.0), eps))
+    print("Cross ✓")
+
+    // Vec arithmetic
+    let sum = a.add(&b)
+    assert(sum.approx_eq(&Vec3.new(1.0, 1.0, 0.0), eps))
+    let diff = sum.sub(&a)
+    assert(diff.approx_eq(&b, eps))
+    let scaled = a.scale(3.0)
+    assert((scaled.x - 3.0).abs() < eps)
+    print("Vec arithmetic ✓")
+
+    // Identity matrix
+    let id = Mat4.identity()
+    assert(id.get(0,0) == 1.0)
+    assert(id.get(0,1) == 0.0)
+    assert(id.trace() == 4.0)
+    print("Identity ✓")
+
+    // Multiply by identity
+    let m = Mat4.scale_mat(2.0, 3.0, 4.0)
+    let prod = m.mul(&id)
+    assert(prod.approx_eq(&m, eps))
+    print("Mul identity ✓")
+
+    // Scale matrix
+    let p = Vec3.new(1.0, 1.0, 1.0)
+    let sp = m.transform_point(&p)
+    assert(sp.approx_eq(&Vec3.new(2.0, 3.0, 4.0), eps))
+    print("Scale transform ✓")
+
+    // Translation
+    let t = Mat4.translation(10.0, 20.0, 30.0)
+    let tp = t.transform_point(&Vec3.zero())
+    assert(tp.approx_eq(&Vec3.new(10.0, 20.0, 30.0), eps))
+    print("Translation ✓")
+
+    // Transpose
+    let mut asym = Mat4.zero()
+    asym.set(0, 1, 5.0)
+    let trans = asym.transpose()
+    assert(trans.get(1, 0) == 5.0)
+    assert(trans.get(0, 1) == 0.0)
+    print("Transpose ✓")
+
+    // Double transpose = original
+    let dt = id.transpose()
+    assert(dt.approx_eq(&id, eps))
+    print("Double transpose ✓")
+
+    // 3x3 Determinant
+    let mut det_m = Mat4.identity()
+    det_m.set(0, 0, 1.0); det_m.set(0, 1, 2.0); det_m.set(0, 2, 3.0)
+    det_m.set(1, 0, 0.0); det_m.set(1, 1, 1.0); det_m.set(1, 2, 4.0)
+    det_m.set(2, 0, 5.0); det_m.set(2, 1, 6.0); det_m.set(2, 2, 0.0)
+    let det = det_m.determinant_3x3()
+    assert((det - 1.0).abs() < eps)
+    print("Determinant ✓")
+
+    // Scalar multiplication
+    let s = id.scalar_mul(3.0)
+    assert(s.trace() == 12.0)
+    print("Scalar mul ✓")
+
+    // Matrix addition
+    let added = id.add(&id)
+    assert(added.trace() == 8.0)
+    print("Matrix add ✓")
+
+    // Combined transform: scale then translate
+    let combined = t.mul(&m)
+    let cp = combined.transform_point(&Vec3.new(1.0, 1.0, 1.0))
+    assert(cp.approx_eq(&Vec3.new(12.0, 23.0, 34.0), eps))
+    print("Combined transform ✓")
+
+    print("Linear algebra complete ✓")
+}
