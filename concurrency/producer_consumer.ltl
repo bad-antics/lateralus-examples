@@ -1,0 +1,234 @@
+
+// Producer-Consumer Pattern with Bounded Buffer
+// Demonstrates thread-safe communication using channels and ring buffers.
+
+use std.sync.{Mutex, Condvar, Arc}
+use std.thread
+
+#[derive(Clone, Debug)]
+struct BoundedBuffer<T> {
+    data: [Option<T>],
+    capacity: usize,
+    head: usize,
+    tail: usize,
+    count: usize,
+}
+
+impl<T: Clone + Debug> BoundedBuffer<T> {
+    fn new(capacity: usize) -> BoundedBuffer<T> {
+        BoundedBuffer { data: vec![None; capacity], capacity, head: 0, tail: 0, count: 0 }
+    }
+
+    fn is_full(self) -> bool { self.count == self.capacity }
+    fn is_empty(self) -> bool { self.count == 0 }
+    fn len(self) -> usize { self.count }
+    fn capacity(self) -> usize { self.capacity }
+
+    fn push(mut self, item: T) -> bool {
+        if self.is_full() { return false }
+        self.data[self.tail] = Some(item)
+        self.tail = (self.tail + 1) % self.capacity
+        self.count += 1
+        true
+    }
+
+    fn pop(mut self) -> Option<T> {
+        if self.is_empty() { return None }
+        let item = self.data[self.head].take()
+        self.head = (self.head + 1) % self.capacity
+        self.count -= 1
+        item
+    }
+
+    fn peek(self) -> Option<&T> {
+        if self.is_empty() { None }
+        else { self.data[self.head].as_ref() }
+    }
+
+    fn clear(mut self) {
+        while self.pop().is_some() {}
+    }
+}
+
+struct Channel<T> {
+    buffer: Mutex<BoundedBuffer<T>>,
+    not_empty: Condvar,
+    not_full: Condvar,
+    closed: Mutex<bool>,
+}
+
+impl<T: Clone + Debug> Channel<T> {
+    fn new(capacity: usize) -> Arc<Channel<T>> {
+        Arc.new(Channel {
+            buffer: Mutex.new(BoundedBuffer.new(capacity)),
+            not_empty: Condvar.new(), not_full: Condvar.new(),
+            closed: Mutex.new(false),
+        })
+    }
+
+    fn send(self, item: T) -> bool {
+        if *self.closed.lock() { return false }
+        let mut buf = self.buffer.lock()
+        while buf.is_full() && !*self.closed.lock() {
+            buf = self.not_full.wait(buf)
+        }
+        if *self.closed.lock() { return false }
+        buf.push(item);
+        self.not_empty.notify_one()
+        true
+    }
+
+    fn recv(self) -> Option<T> {
+        let mut buf = self.buffer.lock()
+        while buf.is_empty() && !*self.closed.lock() {
+            buf = self.not_empty.wait(buf)
+        }
+        let item = buf.pop()
+        self.not_full.notify_one()
+        item
+    }
+
+    fn try_send(self, item: T) -> bool {
+        let mut buf = self.buffer.lock()
+        if buf.is_full() { false }
+        else { buf.push(item); self.not_empty.notify_one(); true }
+    }
+
+    fn try_recv(self) -> Option<T> {
+        let mut buf = self.buffer.lock()
+        let item = buf.pop()
+        if item.is_some() { self.not_full.notify_one() }
+        item
+    }
+
+    fn close(self) {
+        *self.closed.lock() = true
+        self.not_empty.notify_all()
+        self.not_full.notify_all()
+    }
+
+    fn is_closed(self) -> bool { *self.closed.lock() }
+    fn len(self) -> usize { self.buffer.lock().len() }
+    fn is_empty(self) -> bool { self.buffer.lock().is_empty() }
+}
+
+#[derive(Clone, Debug)]
+struct Stats {
+    produced: u64,
+    consumed: u64,
+    dropped: u64,
+}
+
+impl Stats {
+    fn new() -> Stats { Stats { produced: 0, consumed: 0, dropped: 0 } }
+    fn record_produce(mut self) { self.produced += 1 }
+    fn record_consume(mut self) { self.consumed += 1 }
+    fn record_drop(mut self) { self.dropped += 1 }
+    fn total(self) -> u64 { self.produced + self.consumed + self.dropped }
+}
+
+fn main() {
+    // BoundedBuffer basic
+    let mut buf = BoundedBuffer::<i32>.new(3)
+    assert(buf.is_empty())
+    assert(buf.capacity() == 3)
+    assert(buf.len() == 0)
+    print("Buffer init ✓")
+
+    // Push/Pop
+    assert(buf.push(1))
+    assert(buf.push(2))
+    assert(buf.push(3))
+    assert(buf.is_full())
+    assert(!buf.push(4))  // full
+    assert(buf.pop() == Some(1))
+    assert(buf.pop() == Some(2))
+    assert(buf.pop() == Some(3))
+    assert(buf.is_empty())
+    assert(buf.pop().is_none())
+    print("Push/Pop ✓")
+
+    // Ring buffer wrap-around
+    let mut rb = BoundedBuffer::<i32>.new(3)
+    rb.push(10); rb.push(20); rb.push(30)
+    rb.pop()  // remove 10
+    rb.push(40)  // wraps around
+    assert(rb.pop() == Some(20))
+    assert(rb.pop() == Some(30))
+    assert(rb.pop() == Some(40))
+    print("Wrap-around ✓")
+
+    // Peek
+    let mut buf2 = BoundedBuffer::<string>.new(2)
+    assert(buf2.peek().is_none())
+    buf2.push("hello".into())
+    assert(buf2.peek() == Some(&"hello".into()))
+    buf2.push("world".into())
+    assert(buf2.peek() == Some(&"hello".into()))  // still first
+    print("Peek ✓")
+
+    // Clear
+    let mut buf3 = BoundedBuffer::<i32>.new(5)
+    for i in 0..5 { buf3.push(i) }
+    assert(buf3.len() == 5)
+    buf3.clear()
+    assert(buf3.is_empty())
+    print("Clear ✓")
+
+    // Stats
+    let mut stats = Stats.new()
+    stats.record_produce()
+    stats.record_produce()
+    stats.record_consume()
+    stats.record_drop()
+    assert(stats.produced == 2)
+    assert(stats.consumed == 1)
+    assert(stats.dropped == 1)
+    assert(stats.total() == 4)
+    print("Stats ✓")
+
+    // Simulate producer-consumer pattern (single-threaded)
+    let mut buf4 = BoundedBuffer::<i32>.new(10)
+    let mut produced = 0
+    let mut consumed = 0
+    let mut sum = 0
+
+    // Producer: generate 20 items
+    for i in 0..20 {
+        if buf4.is_full() {
+            // Consumer must drain some
+            while !buf4.is_empty() {
+                let item = buf4.pop().unwrap()
+                sum += item
+                consumed += 1
+            }
+        }
+        buf4.push(i)
+        produced += 1
+    }
+    // Drain remaining
+    while !buf4.is_empty() {
+        sum += buf4.pop().unwrap()
+        consumed += 1
+    }
+    assert(produced == 20)
+    assert(consumed == 20)
+    assert(sum == 190)  // 0+1+...+19
+    print("Producer-consumer sim ✓")
+
+    // Multiple producers pattern
+    let mut results: [i32] = []
+    let mut buf5 = BoundedBuffer::<i32>.new(100)
+    // Producer A
+    for i in 0..10 { buf5.push(i) }
+    // Producer B
+    for i in 100..110 { buf5.push(i) }
+    assert(buf5.len() == 20)
+    while !buf5.is_empty() { results.push(buf5.pop().unwrap()) }
+    assert(results.len() == 20)
+    assert(results[0] == 0)
+    assert(results[10] == 100)
+    print("Multi-producer ✓")
+
+    print("Producer-consumer complete ✓")
+}
