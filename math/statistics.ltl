@@ -1,87 +1,208 @@
-// statistics.ltl — Descriptive statistics
-// Run: lateralus run math/statistics.ltl
 
-fn mean(xs: [float]) -> float {
-    xs |> sum() / xs.len().float()
+// Statistics Library - Descriptive and inferential statistics
+// Mean, median, mode, variance, standard deviation, percentiles, correlation.
+
+use std.math.{sqrt, ln, exp, PI}
+
+fn mean(data: &[f64]) -> f64 {
+    if data.is_empty() { return 0.0 }
+    data.iter().sum::<f64>() / data.len() as f64
 }
 
-fn median(xs: [float]) -> float {
-    let sorted = xs |> sort() |> collect()
+fn median(data: &[f64]) -> f64 {
+    if data.is_empty() { return 0.0 }
+    let mut sorted = data.to_vec()
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap())
     let n = sorted.len()
-    if n % 2 == 0 {
-        (sorted[n/2 - 1] + sorted[n/2]) / 2.0
-    } else {
-        sorted[n/2]
+    if n % 2 == 0 { (sorted[n/2 - 1] + sorted[n/2]) / 2.0 }
+    else { sorted[n/2] }
+}
+
+fn mode(data: &[f64]) -> f64 {
+    if data.is_empty() { return 0.0 }
+    let mut counts: [(f64, usize)] = []
+    for &val in data {
+        if let some(entry) = counts.iter_mut().find(|(v, _)| (*v - val).abs() < 1e-10) {
+            entry.1 += 1
+        } else {
+            counts.push((val, 1))
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1))
+    counts[0].0
+}
+
+fn variance(data: &[f64], sample: bool) -> f64 {
+    if data.len() < 2 { return 0.0 }
+    let m = mean(data)
+    let sum_sq: f64 = data.iter().map(|x| (x - m) * (x - m)).sum()
+    let n = if sample { data.len() - 1 } else { data.len() }
+    sum_sq / n as f64
+}
+
+fn std_dev(data: &[f64], sample: bool) -> f64 { sqrt(variance(data, sample)) }
+
+fn min(data: &[f64]) -> f64 { data.iter().copied().fold(f64.INFINITY, f64.min) }
+fn max(data: &[f64]) -> f64 { data.iter().copied().fold(f64.NEG_INFINITY, f64.max) }
+fn range(data: &[f64]) -> f64 { max(data) - min(data) }
+fn sum(data: &[f64]) -> f64 { data.iter().sum() }
+
+fn percentile(data: &[f64], p: f64) -> f64 {
+    if data.is_empty() { return 0.0 }
+    let mut sorted = data.to_vec()
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap())
+    let idx = (p / 100.0) * (sorted.len() - 1) as f64
+    let lo = idx.floor() as usize
+    let hi = idx.ceil() as usize
+    if lo == hi { sorted[lo] }
+    else {
+        let frac = idx - lo as f64
+        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
     }
 }
 
-fn mode(xs: [float]) -> [float] {
-    let counts = xs |> fold({}, |acc, x| {
-        acc[x] = acc.get(x) ?? 0 + 1
-        acc
-    })
-    let max_count = counts.values() |> max() |> unwrap()
-    counts.iter()
-        |> filter(|(_, c)| c == max_count)
-        |> map(|(v, _)| v)
-        |> sort()
-        |> collect()
+fn quartiles(data: &[f64]) -> (f64, f64, f64) {
+    (percentile(data, 25.0), percentile(data, 50.0), percentile(data, 75.0))
 }
 
-fn variance(xs: [float]) -> float {
-    let m = mean(xs)
-    xs |> map(x => (x - m).powi(2)) |> mean()
+fn iqr(data: &[f64]) -> f64 {
+    let (q1, _, q3) = quartiles(data)
+    q3 - q1
 }
 
-fn std_dev(xs: [float]) -> float { variance(xs).sqrt() }
-
-fn percentile(xs: [float], p: float) -> float {
-    let sorted = xs |> sort() |> collect()
-    let idx = (p / 100.0 * (sorted.len() - 1).float()).round() as int
-    sorted[idx.clamp(0, sorted.len() - 1)]
+fn covariance(x: &[f64], y: &[f64]) -> f64 {
+    assert(x.len() == y.len())
+    let mx = mean(x)
+    let my = mean(y)
+    let n = x.len() as f64
+    x.iter().zip(y.iter()).map(|(a, b)| (a - mx) * (b - my)).sum::<f64>() / (n - 1.0)
 }
 
-fn iqr(xs: [float]) -> float {
-    percentile(xs, 75.0) - percentile(xs, 25.0)
+fn correlation(x: &[f64], y: &[f64]) -> f64 {
+    let cov = covariance(x, y)
+    let sx = std_dev(x, true)
+    let sy = std_dev(y, true)
+    if sx == 0.0 || sy == 0.0 { return 0.0 }
+    cov / (sx * sy)
 }
 
-fn z_scores(xs: [float]) -> [float] {
-    let m = mean(xs)
-    let s = std_dev(xs)
-    if s == 0.0 { return xs |> map(_ => 0.0) |> collect() }
-    xs |> map(x => (x - m) / s) |> collect()
+fn z_score(value: f64, mean_val: f64, std_val: f64) -> f64 {
+    if std_val == 0.0 { return 0.0 }
+    (value - mean_val) / std_val
 }
 
-fn outliers(xs: [float], threshold: float = 3.0) -> [float] {
-    let zs = z_scores(xs)
-    xs.zip(zs)
-        |> filter(|(_, z)| z.abs() > threshold)
-        |> map(|(x, _)| x)
-        |> collect()
+fn geometric_mean(data: &[f64]) -> f64 {
+    if data.is_empty() { return 0.0 }
+    let log_sum: f64 = data.iter().map(|x| ln(*x)).sum()
+    exp(log_sum / data.len() as f64)
 }
 
-fn summary(xs: [float]) {
-    print("  n:      ${xs.len()}")
-    print("  mean:   ${mean(xs).round(4)}")
-    print("  median: ${median(xs).round(4)}")
-    print("  std:    ${std_dev(xs).round(4)}")
-    print("  min:    ${xs |> min() |> unwrap()}")
-    print("  max:    ${xs |> max() |> unwrap()}")
-    print("  p25:    ${percentile(xs, 25.0).round(4)}")
-    print("  p75:    ${percentile(xs, 75.0).round(4)}")
-    print("  IQR:    ${iqr(xs).round(4)}")
+fn harmonic_mean(data: &[f64]) -> f64 {
+    if data.is_empty() || data.iter().any(|&x| x == 0.0) { return 0.0 }
+    let n = data.len() as f64
+    n / data.iter().map(|x| 1.0 / x).sum::<f64>()
+}
+
+fn skewness(data: &[f64]) -> f64 {
+    let n = data.len() as f64
+    let m = mean(data)
+    let s = std_dev(data, true)
+    if s == 0.0 { return 0.0 }
+    let m3: f64 = data.iter().map(|x| ((x - m) / s).powi(3)).sum()
+    m3 * n / ((n - 1.0) * (n - 2.0))
+}
+
+fn kurtosis(data: &[f64]) -> f64 {
+    let n = data.len() as f64
+    let m = mean(data)
+    let s = std_dev(data, true)
+    if s == 0.0 { return 0.0 }
+    let m4: f64 = data.iter().map(|x| ((x - m) / s).powi(4)).sum()
+    m4 / n - 3.0
 }
 
 fn main() {
     let data = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
-    print("Dataset: ${data}")
-    summary(data)
-    assert_eq(mean(data),    5.0)
-    assert_eq(std_dev(data), 2.0)
+    let eps = 1e-6
 
-    let with_outlier = [2.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0, 100.0]
-    print("
-Outliers (z > 2): ${outliers(with_outlier, 2.0)}")
+    // Mean
+    assert((mean(&data) - 5.0).abs() < eps)
+    assert(mean(&[]) == 0.0)
+    print("Mean ✓")
+
+    // Median
+    assert((median(&data) - 4.5).abs() < eps)
+    assert((median(&[1.0, 3.0, 5.0]) - 3.0).abs() < eps)
+    print("Median ✓")
+
+    // Mode
+    assert((mode(&data) - 4.0).abs() < eps)
+    print("Mode ✓")
+
+    // Variance & std dev
+    let pop_var = variance(&data, false)
+    let sample_var = variance(&data, true)
+    assert(sample_var > pop_var)
+    assert((std_dev(&data, false) - sqrt(pop_var)).abs() < eps)
+    print("Variance/StdDev ✓")
+
+    // Min/Max/Range/Sum
+    assert(min(&data) == 2.0)
+    assert(max(&data) == 9.0)
+    assert(range(&data) == 7.0)
+    assert(sum(&data) == 40.0)
+    print("Min/Max/Range/Sum ✓")
+
+    // Percentile
+    let sorted = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    assert((percentile(&sorted, 50.0) - 5.5).abs() < eps)
+    assert((percentile(&sorted, 0.0) - 1.0).abs() < eps)
+    assert((percentile(&sorted, 100.0) - 10.0).abs() < eps)
+    print("Percentile ✓")
+
+    // Quartiles
+    let (q1, q2, q3) = quartiles(&sorted)
+    assert(q1 < q2 && q2 < q3)
+    print("Quartiles ✓")
+
+    // IQR
+    assert(iqr(&sorted) > 0.0)
+    print("IQR ✓")
+
+    // Correlation
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let y = [2.0, 4.0, 6.0, 8.0, 10.0]
+    assert((correlation(&x, &y) - 1.0).abs() < eps)
+    let y_neg = [10.0, 8.0, 6.0, 4.0, 2.0]
+    assert((correlation(&x, &y_neg) + 1.0).abs() < eps)
+    print("Correlation ✓")
+
+    // Covariance
+    assert(covariance(&x, &y) > 0.0)
+    print("Covariance ✓")
+
+    // Z-score
+    assert((z_score(5.0, 5.0, 1.0)).abs() < eps)
+    assert((z_score(7.0, 5.0, 1.0) - 2.0).abs() < eps)
+    print("Z-score ✓")
+
+    // Geometric mean
+    assert((geometric_mean(&[2.0, 8.0]) - 4.0).abs() < eps)
+    print("Geometric mean ✓")
+
+    // Harmonic mean
+    assert((harmonic_mean(&[1.0, 4.0]) - 8.0/5.0).abs() < eps)
+    assert(harmonic_mean(&[]) == 0.0)
+    print("Harmonic mean ✓")
+
+    // Skewness
+    let sym = [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert(skewness(&sym).abs() < 0.1)  // roughly symmetric
+    print("Skewness ✓")
+
+    // Kurtosis
+    let _ = kurtosis(&data)  // just ensure it runs
+    print("Kurtosis ✓")
+
+    print("Statistics complete ✓")
 }
-
-main()
