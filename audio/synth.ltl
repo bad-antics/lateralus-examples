@@ -1,111 +1,236 @@
-// synth.ltl — Software synthesiser: oscillators, envelopes, WAV export
-use std.math.{sin, cos, PI, pow}
-use std.fs.File
 
-const SAMPLE_RATE: int   = 44100
-const TWO_PI:      float = 2.0 * PI
+// Audio Synthesizer - Waveform generation and mixing
+// Supports sine, square, sawtooth, triangle waves with ADSR envelope.
 
+use std.math.{sin, PI, abs, floor}
+
+const SAMPLE_RATE: f64 = 44100.0
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Waveform { Sine, Square, Sawtooth, Triangle, Noise }
 
-fn sample_osc(wave: Waveform, freq: float, t: float, phase: float) -> float {
-    let p = TWO_PI * freq * t + phase
-    match wave {
-        Waveform.Sine     => sin(p),
-        Waveform.Square   => if (p % TWO_PI) < PI { 1.0 } else { -1.0 },
-        Waveform.Sawtooth => 2.0 * ((freq * t + phase / TWO_PI) % 1.0) - 1.0,
-        Waveform.Triangle => {
-            let r = (freq * t + phase / TWO_PI) % 1.0
-            if r < 0.5 { 4.0 * r - 1.0 } else { 3.0 - 4.0 * r }
-        },
-        Waveform.Noise => (std.random.rand_float() * 2.0 - 1.0),
+impl Waveform {
+    fn sample(self, phase: f64) -> f64 {
+        match self {
+            Waveform.Sine => sin(2.0 * PI * phase),
+            Waveform.Square => if phase.fract() < 0.5 { 1.0 } else { -1.0 },
+            Waveform.Sawtooth => 2.0 * phase.fract() - 1.0,
+            Waveform.Triangle => {
+                let t = phase.fract()
+                if t < 0.25 { 4.0 * t }
+                else if t < 0.75 { 2.0 - 4.0 * t }
+                else { -4.0 + 4.0 * t }
+            }
+            Waveform.Noise => {
+                // Simple LCG pseudo-random
+                let seed = ((phase * 1000000.0) as u64).wrapping_mul(6364136223846793005).wrapping_add(1)
+                (seed as f64 / u64.MAX as f64) * 2.0 - 1.0
+            }
+        }
     }
 }
 
-struct Envelope {
-    attack:  float,   // seconds
-    decay:   float,
-    sustain: float,   // 0..1 level
-    release: float,
+#[derive(Clone, Copy, Debug)]
+struct Adsr {
+    attack: f64,   // seconds
+    decay: f64,
+    sustain: f64,  // level 0..1
+    release: f64,
 }
 
-impl Envelope {
-    fn adsr() -> Envelope { Envelope { attack: 0.01, decay: 0.1, sustain: 0.7, release: 0.2 } }
+impl Adsr {
+    fn new(a: f64, d: f64, s: f64, r: f64) -> Adsr { Adsr { attack: a, decay: d, sustain: s, release: r } }
+    fn default() -> Adsr { Adsr.new(0.01, 0.1, 0.7, 0.3) }
+    fn instant() -> Adsr { Adsr.new(0.0, 0.0, 1.0, 0.0) }
+    fn total_time(self) -> f64 { self.attack + self.decay + self.release }
 
-    fn amplitude(self, t: float, duration: float) -> float {
-        let a = self.attack
-        let d = self.decay
-        let r = self.release
-        let s = self.sustain
-        if t < a                         { t / a }
-        else if t < a + d                { 1.0 - (1.0 - s) * (t - a) / d }
-        else if t < duration - r         { s }
-        else if t < duration             { s * (duration - t) / r }
-        else                             { 0.0 }
+    fn amplitude(self, time: f64, note_off: Option<f64>) -> f64 {
+        match note_off {
+            Some(off_time) if time >= off_time => {
+                let release_time = time - off_time
+                if release_time >= self.release { return 0.0 }
+                let level = self.level_at(off_time)
+                level * (1.0 - release_time / self.release)
+            }
+            _ => self.level_at(time),
+        }
+    }
+
+    fn level_at(self, time: f64) -> f64 {
+        if time < self.attack {
+            if self.attack == 0.0 { 1.0 } else { time / self.attack }
+        } else if time < self.attack + self.decay {
+            let decay_progress = (time - self.attack) / self.decay
+            1.0 - (1.0 - self.sustain) * decay_progress
+        } else {
+            self.sustain
+        }
     }
 }
 
-struct Note { freq: float, duration: float, wave: Waveform, env: Envelope }
+struct Oscillator {
+    waveform: Waveform,
+    frequency: f64,
+    amplitude: f64,
+    phase: f64,
+    detune: f64,  // cents
+}
+
+impl Oscillator {
+    fn new(waveform: Waveform, freq: f64) -> Oscillator {
+        Oscillator { waveform, frequency: freq, amplitude: 1.0, phase: 0.0, detune: 0.0 }
+    }
+    fn with_amplitude(mut self, amp: f64) -> Oscillator { self.amplitude = amp; self }
+    fn with_detune(mut self, cents: f64) -> Oscillator { self.detune = cents; self }
+
+    fn effective_freq(self) -> f64 {
+        self.frequency * (2.0_f64).powf(self.detune / 1200.0)
+    }
+
+    fn sample_at(self, time: f64) -> f64 {
+        let freq = self.effective_freq()
+        let phase = self.phase + freq * time
+        self.waveform.sample(phase) * self.amplitude
+    }
+}
+
+struct Note {
+    oscillator: Oscillator,
+    envelope: Adsr,
+    start_time: f64,
+    note_off: Option<f64>,
+    velocity: f64,
+}
 
 impl Note {
-    fn render(self) -> [i16] {
-        let n_samples = (self.duration * SAMPLE_RATE as float) as int
-        range(0, n_samples) |> map(|i| {
-            let t   = i as float / SAMPLE_RATE as float
-            let amp = self.env.amplitude(t, self.duration)
-            let s   = sample_osc(self.wave, self.freq, t, 0.0) * amp
-            (s * 32767.0).clamp(-32768.0, 32767.0) as i16
-        }) |> collect()
+    fn new(osc: Oscillator, env: Adsr, start: f64, vel: f64) -> Note {
+        Note { oscillator: osc, envelope: env, start_time: start, note_off: None, velocity: vel }
+    }
+    fn release(mut self, time: f64) { self.note_off = Some(time - self.start_time) }
+    fn is_done(self, time: f64) -> bool {
+        match self.note_off {
+            Some(off) => (time - self.start_time) >= off + self.envelope.release,
+            None => false,
+        }
+    }
+    fn sample_at(self, time: f64) -> f64 {
+        let t = time - self.start_time
+        if t < 0.0 { return 0.0 }
+        let env = self.envelope.amplitude(t, self.note_off)
+        self.oscillator.sample_at(t) * env * self.velocity
     }
 }
 
-fn freq_of(note: string) -> float {
-    let notes = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-    let octave = note.chars().last().unwrap().to_digit(10).unwrap() as int
-    let name   = note[..note.len()-1]
-    let idx    = notes |> position(|n| n == name) ?? 9
-    440.0 * pow(2.0, (idx as float - 9.0 + (octave - 4) * 12) as float / 12.0)
+struct Mixer {
+    notes: [Note],
+    master_volume: f64,
+    samples_generated: u64,
 }
 
-fn write_wav(path: string, samples: [i16], channels: int) {
-    let data_size = samples.len() * 2
-    let mut hdr   = []
-    // RIFF header
-    hdr.extend(b"RIFF")
-    hdr.extend((36 + data_size as u32).to_le_bytes())
-    hdr.extend(b"WAVEfmt ")
-    hdr.extend(16u32.to_le_bytes())
-    hdr.extend(1u16.to_le_bytes())          // PCM
-    hdr.extend((channels as u16).to_le_bytes())
-    hdr.extend((SAMPLE_RATE as u32).to_le_bytes())
-    hdr.extend(((SAMPLE_RATE * channels * 2) as u32).to_le_bytes())
-    hdr.extend(((channels * 2) as u16).to_le_bytes())
-    hdr.extend(16u16.to_le_bytes())         // bit depth
-    hdr.extend(b"data")
-    hdr.extend((data_size as u32).to_le_bytes())
-    let mut file = File.create(path)
-    file.write_all(hdr)
-    for s in samples { file.write_all(s.to_le_bytes()) }
+impl Mixer {
+    fn new() -> Mixer { Mixer { notes: [], master_volume: 0.8, samples_generated: 0 } }
+    fn add_note(mut self, note: Note) { self.notes.push(note) }
+    fn set_volume(mut self, vol: f64) { self.master_volume = vol }
+
+    fn render_sample(mut self, time: f64) -> f64 {
+        let mut sum = 0.0
+        for note in &self.notes { sum += note.sample_at(time) }
+        self.samples_generated += 1
+        (sum * self.master_volume).clamp(-1.0, 1.0)
+    }
+
+    fn render_buffer(mut self, start: f64, num_samples: usize) -> [f64] {
+        let mut buf = []
+        for i in 0..num_samples {
+            let time = start + i as f64 / SAMPLE_RATE
+            buf.push(self.render_sample(time))
+        }
+        buf
+    }
+
+    fn cleanup(mut self, time: f64) {
+        self.notes.retain(|n| !n.is_done(time))
+    }
+
+    fn active_notes(self) -> usize { self.notes.len() }
 }
+
+fn midi_to_freq(note: u8) -> f64 { 440.0 * (2.0_f64).powf((note as f64 - 69.0) / 12.0) }
 
 fn main() {
-    let melody = [("C4",0.3),("E4",0.3),("G4",0.3),("C5",0.6),
-                  ("G4",0.3),("E4",0.3),("C4",0.6)]
-    let env    = Envelope.adsr()
-    let mut samples: [i16] = []
-    for (name, dur) in melody {
-        let note = Note { freq: freq_of(name), duration: dur, wave: Waveform.Sine, env }
-        samples.extend(note.render())
-    }
-    write_wav("/tmp/melody.wav", samples, 1)
-    print("Wrote /tmp/melody.wav  (${samples.len()} samples, ${samples.len() / SAMPLE_RATE}s)")
+    // Waveforms
+    assert((Waveform.Sine.sample(0.0)).abs() < 0.001)
+    assert((Waveform.Sine.sample(0.25) - 1.0).abs() < 0.001)
+    assert(Waveform.Square.sample(0.1) == 1.0)
+    assert(Waveform.Square.sample(0.6) == -1.0)
+    assert((Waveform.Sawtooth.sample(0.5) - 0.0).abs() < 0.001)
+    assert((Waveform.Triangle.sample(0.0)).abs() < 0.001)
+    print("Waveforms ✓")
 
-    // Chord: C major
-    let freqs = [freq_of("C4"), freq_of("E4"), freq_of("G4")]
-    let chord: [i16] = range(0, SAMPLE_RATE) |> map(|i| {
-        let t = i as float / SAMPLE_RATE as float
-        let s = freqs |> map(|f| sample_osc(Waveform.Sine, f, t, 0.0)) |> sum() / 3.0
-        (s * 32767.0) as i16
-    }) |> collect()
-    write_wav("/tmp/chord.wav", chord, 1)
-    print("Wrote /tmp/chord.wav (C major) ✓")
+    // ADSR
+    let env = Adsr.new(0.1, 0.2, 0.5, 0.3)
+    assert((env.amplitude(0.0, None)).abs() < 0.001)    // start of attack
+    assert((env.amplitude(0.1, None) - 1.0).abs() < 0.01)  // end of attack
+    assert((env.amplitude(0.5, None) - 0.5).abs() < 0.01)  // sustain
+    print("ADSR ✓")
+
+    // ADSR release
+    let release_level = env.amplitude(0.5, Some(0.4))
+    assert(release_level >= 0.0 && release_level <= 1.0)
+    let done_level = env.amplitude(10.0, Some(0.4))
+    assert(done_level == 0.0)
+    print("Release ✓")
+
+    // Instant envelope
+    let inst = Adsr.instant()
+    assert(inst.amplitude(0.0, None) == 1.0)
+    print("Instant ✓")
+
+    // Oscillator
+    let osc = Oscillator.new(Waveform.Sine, 440.0)
+    let s0 = osc.sample_at(0.0)
+    assert(s0.abs() < 0.001)  // sin(0) = 0
+    print("Oscillator ✓")
+
+    // Detune
+    let detuned = Oscillator.new(Waveform.Sine, 440.0).with_detune(1200.0)
+    assert((detuned.effective_freq() - 880.0).abs() < 0.1)  // +1200 cents = octave up
+    print("Detune ✓")
+
+    // MIDI to freq
+    assert((midi_to_freq(69) - 440.0).abs() < 0.01)   // A4
+    assert((midi_to_freq(60) - 261.63).abs() < 0.1)    // C4
+    print("MIDI ✓")
+
+    // Note
+    let note = Note.new(Oscillator.new(Waveform.Sine, 440.0), Adsr.default(), 0.0, 0.8)
+    assert(!note.is_done(0.5))
+    let sample = note.sample_at(0.05)
+    assert(sample.abs() <= 1.0)
+    print("Note ✓")
+
+    // Mixer
+    let mut mixer = Mixer.new()
+    mixer.add_note(Note.new(Oscillator.new(Waveform.Sine, 440.0), Adsr.default(), 0.0, 0.5))
+    mixer.add_note(Note.new(Oscillator.new(Waveform.Square, 880.0), Adsr.default(), 0.0, 0.3))
+    assert(mixer.active_notes() == 2)
+    print("Mixer ✓")
+
+    // Render buffer
+    let buf = mixer.render_buffer(0.0, 100)
+    assert(buf.len() == 100)
+    for s in &buf { assert(*s >= -1.0 && *s <= 1.0) }
+    assert(mixer.samples_generated == 100)
+    print("Render ✓")
+
+    // Cleanup done notes
+    let mut mixer2 = Mixer.new()
+    let mut n = Note.new(Oscillator.new(Waveform.Sine, 440.0), Adsr.new(0.0, 0.0, 1.0, 0.01), 0.0, 1.0)
+    n.release(0.0)
+    mixer2.add_note(n)
+    mixer2.cleanup(10.0)
+    assert(mixer2.active_notes() == 0)
+    print("Cleanup ✓")
+
+    print("Synthesizer complete ✓")
 }
