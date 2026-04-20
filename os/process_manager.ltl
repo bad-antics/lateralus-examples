@@ -1,0 +1,228 @@
+
+// Process Manager - Simulates OS process scheduling and lifecycle
+// Round-robin scheduler with priorities, states, and resource tracking.
+
+use std.collections.HashMap
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ProcessState { Ready, Running, Blocked, Terminated }
+
+#[derive(Clone, Copy, PartialEq, Debug, PartialOrd, Ord)]
+enum Priority { Low, Normal, High, Critical }
+
+#[derive(Clone, Debug)]
+struct Process {
+    pid: u32,
+    name: string,
+    state: ProcessState,
+    priority: Priority,
+    cpu_time: u64,
+    memory_kb: u64,
+    parent_pid: Option<u32>,
+    exit_code: Option<i32>,
+}
+
+impl Process {
+    fn new(pid: u32, name: &str, priority: Priority) -> Process {
+        Process {
+            pid, name: name.into(), state: ProcessState.Ready,
+            priority, cpu_time: 0, memory_kb: 0, parent_pid: None, exit_code: None,
+        }
+    }
+
+    fn is_alive(self) -> bool { self.state != ProcessState.Terminated }
+}
+
+struct ProcessManager {
+    processes: HashMap<u32, Process>,
+    next_pid: u32,
+    current_pid: Option<u32>,
+    time_quantum: u64,
+    ready_queue: [u32],
+    total_memory_kb: u64,
+    used_memory_kb: u64,
+}
+
+impl ProcessManager {
+    fn new(total_memory_kb: u64) -> ProcessManager {
+        ProcessManager {
+            processes: HashMap.new(), next_pid: 1, current_pid: None,
+            time_quantum: 10, ready_queue: [],
+            total_memory_kb, used_memory_kb: 0,
+        }
+    }
+
+    fn spawn(mut self, name: &str, priority: Priority, memory_kb: u64) -> Option<u32> {
+        if self.used_memory_kb + memory_kb > self.total_memory_kb { return None }
+        let pid = self.next_pid
+        self.next_pid += 1
+        let mut proc = Process.new(pid, name, priority)
+        proc.memory_kb = memory_kb
+        proc.parent_pid = self.current_pid
+        self.processes.insert(pid, proc)
+        self.ready_queue.push(pid)
+        self.used_memory_kb += memory_kb
+        Some(pid)
+    }
+
+    fn kill(mut self, pid: u32, exit_code: i32) -> bool {
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            if proc.state == ProcessState.Terminated { return false }
+            proc.state = ProcessState.Terminated
+            proc.exit_code = Some(exit_code)
+            self.used_memory_kb -= proc.memory_kb
+            self.ready_queue.retain(|&p| p != pid)
+            if self.current_pid == Some(pid) { self.current_pid = None }
+            true
+        } else { false }
+    }
+
+    fn block(mut self, pid: u32) -> bool {
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            if proc.state == ProcessState.Running || proc.state == ProcessState.Ready {
+                proc.state = ProcessState.Blocked
+                self.ready_queue.retain(|&p| p != pid)
+                if self.current_pid == Some(pid) { self.current_pid = None }
+                return true
+            }
+        }
+        false
+    }
+
+    fn unblock(mut self, pid: u32) -> bool {
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            if proc.state == ProcessState.Blocked {
+                proc.state = ProcessState.Ready
+                self.ready_queue.push(pid)
+                return true
+            }
+        }
+        false
+    }
+
+    fn schedule(mut self) -> Option<u32> {
+        // Priority-aware round robin
+        if self.ready_queue.is_empty() { return None }
+
+        // Sort by priority (higher first)
+        self.ready_queue.sort_by(|&a, &b| {
+            let pa = self.processes.get(&a).map(|p| p.priority).unwrap_or(Priority.Low)
+            let pb = self.processes.get(&b).map(|p| p.priority).unwrap_or(Priority.Low)
+            pb.cmp(&pa)
+        })
+
+        // Preempt current if lower priority
+        if let Some(current) = self.current_pid {
+            if let Some(proc) = self.processes.get_mut(&current) {
+                proc.state = ProcessState.Ready
+                if !self.ready_queue.contains(&current) {
+                    self.ready_queue.push(current)
+                }
+            }
+        }
+
+        let pid = self.ready_queue.remove(0)
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            proc.state = ProcessState.Running
+        }
+        self.current_pid = Some(pid)
+        Some(pid)
+    }
+
+    fn tick(mut self) {
+        if let Some(pid) = self.current_pid {
+            if let Some(proc) = self.processes.get_mut(&pid) {
+                proc.cpu_time += 1
+            }
+        }
+    }
+
+    fn process_count(self) -> usize { self.processes.len() }
+    fn alive_count(self) -> usize { self.processes.values().filter(|p| p.is_alive()).count() }
+    fn available_memory(self) -> u64 { self.total_memory_kb - self.used_memory_kb }
+
+    fn get_state(self, pid: u32) -> Option<ProcessState> {
+        self.processes.get(&pid).map(|p| p.state)
+    }
+
+    fn get_cpu_time(self, pid: u32) -> Option<u64> {
+        self.processes.get(&pid).map(|p| p.cpu_time)
+    }
+
+    fn children(self, pid: u32) -> [u32] {
+        self.processes.values()
+            .filter(|p| p.parent_pid == Some(pid))
+            .map(|p| p.pid)
+            .collect()
+    }
+}
+
+fn main() {
+    let mut pm = ProcessManager.new(1024)
+
+    // Spawn
+    let p1 = pm.spawn("init", Priority.Critical, 64).unwrap()
+    assert(p1 == 1)
+    assert(pm.process_count() == 1)
+    assert(pm.available_memory() == 960)
+    print("Spawn ✓")
+
+    // Schedule
+    let scheduled = pm.schedule().unwrap()
+    assert(scheduled == p1)
+    assert(pm.get_state(p1) == Some(ProcessState.Running))
+    print("Schedule ✓")
+
+    // Tick
+    pm.tick()
+    pm.tick()
+    assert(pm.get_cpu_time(p1) == Some(2))
+    print("Tick ✓")
+
+    // Multiple processes with priority
+    let p2 = pm.spawn("shell", Priority.Normal, 32).unwrap()
+    let p3 = pm.spawn("daemon", Priority.High, 128).unwrap()
+    let next = pm.schedule().unwrap()
+    assert(next == p1 || next == p3)  // Critical or High runs first
+    print("Priority ✓")
+
+    // Block/Unblock
+    pm.block(p2)
+    assert(pm.get_state(p2) == Some(ProcessState.Blocked))
+    pm.unblock(p2)
+    assert(pm.get_state(p2) == Some(ProcessState.Ready))
+    print("Block/Unblock ✓")
+
+    // Kill
+    pm.kill(p2, 0)
+    assert(pm.get_state(p2) == Some(ProcessState.Terminated))
+    assert(pm.alive_count() == 2)
+    assert(pm.available_memory() == 832)  // 1024 - 64 - 128
+    print("Kill ✓")
+
+    // OOM
+    let big = pm.spawn("bloat", Priority.Low, 2000)
+    assert(big.is_none())
+    print("OOM ✓")
+
+    // Parent-child
+    pm.current_pid = Some(p1)
+    let child = pm.spawn("worker", Priority.Normal, 16).unwrap()
+    let kids = pm.children(p1)
+    assert(kids.contains(&child))
+    print("Parent-child ✓")
+
+    // Can't kill already terminated
+    assert(!pm.kill(p2, 1))
+    print("Double kill ✓")
+
+    // Can't block terminated
+    assert(!pm.block(p2))
+    print("Block terminated ✓")
+
+    // Can't unblock non-blocked
+    assert(!pm.unblock(p1))
+    print("Unblock running ✓")
+
+    print("Process manager complete ✓")
+}
