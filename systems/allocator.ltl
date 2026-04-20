@@ -1,0 +1,220 @@
+
+// Memory Allocator - First-fit free list allocator with coalescing
+// Implements malloc/free/realloc with block splitting and merging.
+
+const ALIGNMENT: usize = 8
+const MIN_BLOCK: usize = 16
+
+#[derive(Clone, Debug)]
+struct Block {
+    offset: usize,
+    size: usize,
+    free: bool,
+}
+
+impl Block {
+    fn new(offset: usize, size: usize, free: bool) -> Block { Block { offset, size, free } }
+    fn end(self) -> usize { self.offset + self.size }
+    fn can_split(self, requested: usize) -> bool { self.size >= requested + MIN_BLOCK }
+}
+
+struct Allocator {
+    heap_size: usize,
+    blocks: [Block],
+    allocated_bytes: usize,
+    allocation_count: usize,
+    free_count: usize,
+    peak_usage: usize,
+}
+
+impl Allocator {
+    fn new(heap_size: usize) -> Allocator {
+        Allocator {
+            heap_size,
+            blocks: [Block.new(0, heap_size, true)],
+            allocated_bytes: 0, allocation_count: 0,
+            free_count: 0, peak_usage: 0,
+        }
+    }
+
+    fn align_up(size: usize) -> usize {
+        (size + ALIGNMENT - 1) & !(ALIGNMENT - 1)
+    }
+
+    fn alloc(mut self, size: usize) -> Option<usize> {
+        let aligned = Allocator.align_up(size.max(MIN_BLOCK))
+        // First-fit
+        for i in 0..self.blocks.len() {
+            if self.blocks[i].free && self.blocks[i].size >= aligned {
+                let offset = self.blocks[i].offset
+                if self.blocks[i].can_split(aligned) {
+                    let remaining = self.blocks[i].size - aligned
+                    self.blocks[i].size = aligned
+                    self.blocks[i].free = false
+                    self.blocks.insert(i + 1, Block.new(offset + aligned, remaining, true))
+                } else {
+                    self.blocks[i].free = false
+                }
+                self.allocated_bytes += self.blocks[i].size
+                self.allocation_count += 1
+                self.peak_usage = self.peak_usage.max(self.allocated_bytes)
+                return Some(offset)
+            }
+        }
+        None
+    }
+
+    fn free(mut self, offset: usize) -> bool {
+        let idx = self.blocks.iter().position(|b| b.offset == offset && !b.free);
+        if let Some(i) = idx {
+            self.allocated_bytes -= self.blocks[i].size
+            self.blocks[i].free = true
+            self.free_count += 1
+            self.coalesce(i)
+            true
+        } else { false }
+    }
+
+    fn coalesce(mut self, idx: usize) {
+        // Merge with next
+        if idx + 1 < self.blocks.len() && self.blocks[idx + 1].free {
+            self.blocks[idx].size += self.blocks[idx + 1].size
+            self.blocks.remove(idx + 1)
+        }
+        // Merge with previous
+        if idx > 0 && self.blocks[idx - 1].free {
+            self.blocks[idx - 1].size += self.blocks[idx].size
+            self.blocks.remove(idx)
+        }
+    }
+
+    fn realloc(mut self, offset: usize, new_size: usize) -> Option<usize> {
+        let idx = self.blocks.iter().position(|b| b.offset == offset && !b.free)?;
+        let old_size = self.blocks[idx].size
+        let aligned = Allocator.align_up(new_size.max(MIN_BLOCK))
+
+        if aligned <= old_size { return Some(offset) }
+
+        // Try to extend into next free block
+        if idx + 1 < self.blocks.len() && self.blocks[idx + 1].free {
+            let combined = old_size + self.blocks[idx + 1].size
+            if combined >= aligned {
+                self.allocated_bytes -= old_size
+                self.blocks[idx].size = combined
+                self.blocks.remove(idx + 1)
+                if self.blocks[idx].can_split(aligned) {
+                    let rem = self.blocks[idx].size - aligned
+                    self.blocks[idx].size = aligned
+                    self.blocks.insert(idx + 1, Block.new(offset + aligned, rem, true))
+                }
+                self.allocated_bytes += self.blocks[idx].size
+                self.peak_usage = self.peak_usage.max(self.allocated_bytes)
+                return Some(offset)
+            }
+        }
+
+        // Allocate new, free old
+        self.free(offset);
+        self.alloc(new_size)
+    }
+
+    fn free_space(self) -> usize { self.blocks.iter().filter(|b| b.free).map(|b| b.size).sum() }
+    fn used_space(self) -> usize { self.allocated_bytes }
+    fn block_count(self) -> usize { self.blocks.len() }
+    fn fragmentation(self) -> f64 {
+        let free_blocks = self.blocks.iter().filter(|b| b.free).count()
+        if free_blocks <= 1 { 0.0 } else { (free_blocks - 1) as f64 / free_blocks as f64 }
+    }
+
+    fn largest_free(self) -> usize {
+        self.blocks.iter().filter(|b| b.free).map(|b| b.size).max().unwrap_or(0)
+    }
+}
+
+fn main() {
+    let mut alloc = Allocator.new(1024)
+    assert(alloc.free_space() == 1024)
+    assert(alloc.used_space() == 0)
+    print("Init ✓")
+
+    // Alignment
+    assert(Allocator.align_up(1) == 8)
+    assert(Allocator.align_up(8) == 8)
+    assert(Allocator.align_up(9) == 16)
+    assert(Allocator.align_up(16) == 16)
+    print("Alignment ✓")
+
+    // Allocation
+    let a = alloc.alloc(100).unwrap()
+    assert(a == 0)
+    assert(alloc.used_space() > 0)
+    assert(alloc.allocation_count == 1)
+    print("Alloc ✓")
+
+    // Second allocation
+    let b = alloc.alloc(200).unwrap()
+    assert(b > a)
+    assert(alloc.block_count() == 3)  // allocated, allocated, free
+    print("Second alloc ✓")
+
+    // Free
+    assert(alloc.free(a))
+    assert(alloc.free_count == 1)
+    assert(!alloc.free(999))  // invalid
+    print("Free ✓")
+
+    // Coalescing
+    let mut alloc2 = Allocator.new(256)
+    let p1 = alloc2.alloc(32).unwrap()
+    let p2 = alloc2.alloc(32).unwrap()
+    let p3 = alloc2.alloc(32).unwrap()
+    alloc2.free(p1)
+    alloc2.free(p3)
+    let blocks_before = alloc2.block_count()
+    alloc2.free(p2)  // should coalesce all three
+    assert(alloc2.block_count() < blocks_before)
+    print("Coalesce ✓")
+
+    // Realloc - shrink
+    let mut alloc3 = Allocator.new(512)
+    let r = alloc3.alloc(100).unwrap()
+    let r2 = alloc3.realloc(r, 50).unwrap()
+    assert(r2 == r)  // same location
+    print("Realloc shrink ✓")
+
+    // OOM
+    let mut alloc4 = Allocator.new(64)
+    alloc4.alloc(32);
+    assert(alloc4.alloc(64).is_none())
+    print("OOM ✓")
+
+    // Fragmentation
+    let mut alloc5 = Allocator.new(256)
+    let f1 = alloc5.alloc(32).unwrap()
+    let f2 = alloc5.alloc(32).unwrap()
+    let f3 = alloc5.alloc(32).unwrap()
+    alloc5.free(f1)
+    alloc5.free(f3)
+    assert(alloc5.fragmentation() > 0.0)
+    print("Fragmentation ✓")
+
+    // Largest free
+    assert(alloc5.largest_free() > 0)
+    print("Largest free ✓")
+
+    // Peak usage
+    let mut alloc6 = Allocator.new(1024)
+    alloc6.alloc(200);
+    alloc6.alloc(300);
+    assert(alloc6.peak_usage >= 500)
+    print("Peak ✓")
+
+    // Block properties
+    let blk = Block.new(100, 50, true)
+    assert(blk.end() == 150)
+    assert(blk.can_split(20))
+    assert(!blk.can_split(50))
+    print("Block ✓")
+
+    print("Allocator complete ✓")
+}
