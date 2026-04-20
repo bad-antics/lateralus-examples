@@ -1,0 +1,38 @@
+// examples/niche/webp_vp8l_probe.ltl — Sniff WebP/VP8L dimensions.
+//
+// A WebP file starts with "RIFF<size>WEBP" followed by a chunk. The
+// lossless variant uses chunk magic "VP8L" and encodes the dimensions
+// in a tight bitfield: signature (0x2F), then width-1 (14 bits) and
+// height-1 (14 bits), both little-endian. This demo reads only enough
+// bits to report the logical pixel size — useful for a triage tool
+// that needs to walk 10k WebPs and find ones that fit a constraint.
+
+use io
+use std::bits::BitReader
+
+fn main() -> Result<(), &'static str> {
+    let path = std::env::args().nth(1).ok_or("usage: webp_vp8l_probe <file>")?
+    let bytes = io::read_file(&path)?
+    if bytes.len() < 30 { return Err("too short") }
+    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" { return Err("not WebP") }
+    match &bytes[12..16] {
+        b"VP8L" => {
+            let sig = bytes[20]
+            if sig != 0x2F { return Err("bad VP8L signature byte") }
+            let mut br = BitReader::new(&bytes[21..])
+            let w = br.read_bits(14) + 1
+            let h = br.read_bits(14) + 1
+            let has_alpha = br.read_bits(1) == 1
+            println!("VP8L: {}×{} alpha={}", w, h, has_alpha)
+        }
+        b"VP8 " => {
+            // Lossy: dimensions live at offset 26 after the frame tag.
+            let w = u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF
+            let h = u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF
+            println!("VP8 (lossy): {}×{}", w, h)
+        }
+        b"VP8X" => println!("VP8X: extended (animation/ICCP/EXIF)"),
+        other => return Err("unknown chunk")
+    }
+    Ok(())
+}
