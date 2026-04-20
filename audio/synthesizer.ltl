@@ -1,0 +1,211 @@
+
+// Audio Synthesizer - Generates waveforms with oscillators, envelopes, and mixing
+// Supports sine, square, sawtooth, triangle waves with ADSR envelopes.
+
+use std.math.{sin, PI, abs, floor}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Waveform { Sine, Square, Sawtooth, Triangle, Noise }
+
+struct Oscillator {
+    waveform: Waveform,
+    frequency: f64,
+    amplitude: f64,
+    phase: f64,
+    detune_cents: f64,
+}
+
+impl Oscillator {
+    fn new(waveform: Waveform, freq: f64) -> Oscillator {
+        Oscillator { waveform, frequency: freq, amplitude: 1.0, phase: 0.0, detune_cents: 0.0 }
+    }
+
+    fn with_amplitude(mut self, a: f64) -> Oscillator { self.amplitude = a; self }
+    fn with_detune(mut self, cents: f64) -> Oscillator { self.detune_cents = cents; self }
+
+    fn effective_freq(self) -> f64 {
+        self.frequency * (2.0_f64).powf(self.detune_cents / 1200.0)
+    }
+
+    fn sample(self, t: f64) -> f64 {
+        let freq = self.effective_freq()
+        let phase = 2.0 * PI * freq * t + self.phase
+        let raw = match self.waveform {
+            Waveform.Sine => sin(phase),
+            Waveform.Square => if sin(phase) >= 0.0 { 1.0 } else { -1.0 },
+            Waveform.Sawtooth => 2.0 * (freq * t + self.phase / (2.0 * PI) - floor(freq * t + self.phase / (2.0 * PI) + 0.5)),
+            Waveform.Triangle => 2.0 * abs(2.0 * (freq * t - floor(freq * t + 0.5))) - 1.0,
+            Waveform.Noise => {
+                let seed = ((t * 1000000.0) as u64).wrapping_mul(6364136223846793005).wrapping_add(1)
+                ((seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
+            }
+        }
+        raw * self.amplitude
+    }
+}
+
+struct Envelope {
+    attack: f64,
+    decay: f64,
+    sustain: f64,    // level 0-1
+    release: f64,
+}
+
+impl Envelope {
+    fn new(a: f64, d: f64, s: f64, r: f64) -> Envelope {
+        Envelope { attack: a, decay: d, sustain: s, release: r }
+    }
+
+    fn sample(self, t: f64, note_off: Option<f64>) -> f64 {
+        let release_start = note_off.unwrap_or(f64.INFINITY)
+        if t >= release_start {
+            let rt = t - release_start
+            let level_at_release = self.level_at(release_start)
+            let rel = 1.0 - (rt / self.release).min(1.0)
+            level_at_release * rel
+        } else {
+            self.level_at(t)
+        }
+    }
+
+    fn level_at(self, t: f64) -> f64 {
+        if t < self.attack {
+            t / self.attack
+        } else if t < self.attack + self.decay {
+            let dt = t - self.attack
+            1.0 - (1.0 - self.sustain) * (dt / self.decay)
+        } else {
+            self.sustain
+        }
+    }
+
+    fn total_duration(self, hold: f64) -> f64 {
+        hold + self.release
+    }
+
+    fn is_active(self, t: f64, note_off: Option<f64>) -> bool {
+        self.sample(t, note_off) > 0.001
+    }
+}
+
+struct Voice {
+    osc: Oscillator,
+    env: Envelope,
+    start_time: f64,
+    note_off: Option<f64>,
+}
+
+impl Voice {
+    fn new(osc: Oscillator, env: Envelope, start: f64) -> Voice {
+        Voice { osc, env, start_time: start, note_off: None }
+    }
+
+    fn release(mut self, t: f64) { self.note_off = Some(t - self.start_time) }
+
+    fn sample(self, t: f64) -> f64 {
+        let local_t = t - self.start_time
+        if local_t < 0.0 { return 0.0 }
+        self.osc.sample(local_t) * self.env.sample(local_t, self.note_off)
+    }
+
+    fn is_active(self, t: f64) -> bool {
+        let local_t = t - self.start_time
+        self.env.is_active(local_t, self.note_off)
+    }
+}
+
+fn midi_to_freq(note: u8) -> f64 {
+    440.0 * (2.0_f64).powf((note as f64 - 69.0) / 12.0)
+}
+
+fn mix(voices: &[Voice], t: f64) -> f64 {
+    let mut sum = 0.0
+    for v in voices { sum += v.sample(t) }
+    sum.clamp(-1.0, 1.0)
+}
+
+fn generate_buffer(voices: &[Voice], sample_rate: u32, duration: f64) -> [f64] {
+    let samples = (sample_rate as f64 * duration) as usize
+    let mut buf = []
+    for i in 0..samples {
+        let t = i as f64 / sample_rate as f64
+        buf.push(mix(voices, t))
+    }
+    buf
+}
+
+fn main() {
+    let eps = 1e-6
+
+    // Oscillator basics
+    let sine = Oscillator.new(Waveform.Sine, 440.0)
+    assert((sine.sample(0.0)).abs() < eps)  // sin(0) = 0
+    assert((sine.sample(0.25 / 440.0) - 1.0).abs() < 0.01)  // quarter period ≈ peak
+    print("Sine osc ✓")
+
+    // Square wave
+    let sq = Oscillator.new(Waveform.Square, 100.0)
+    let s1 = sq.sample(0.001)
+    assert(s1 == 1.0 || s1 == -1.0)
+    print("Square osc ✓")
+
+    // Amplitude
+    let quiet = Oscillator.new(Waveform.Sine, 440.0).with_amplitude(0.5)
+    let peak = quiet.sample(0.25 / 440.0)
+    assert((peak - 0.5).abs() < 0.01)
+    print("Amplitude ✓")
+
+    // Detune
+    let detuned = Oscillator.new(Waveform.Sine, 440.0).with_detune(100.0)
+    assert(detuned.effective_freq() > 440.0)
+    let detuned2 = Oscillator.new(Waveform.Sine, 440.0).with_detune(-100.0)
+    assert(detuned2.effective_freq() < 440.0)
+    print("Detune ✓")
+
+    // ADSR envelope
+    let env = Envelope.new(0.1, 0.1, 0.7, 0.2)
+    assert(env.sample(0.0, None) < eps)          // start at 0
+    assert((env.sample(0.1, None) - 1.0).abs() < eps)  // peak at attack end
+    assert((env.sample(0.2, None) - 0.7).abs() < 0.01) // sustain after decay
+    assert((env.sample(0.5, None) - 0.7).abs() < eps)   // still sustain
+    print("ADSR ✓")
+
+    // Release
+    assert(env.sample(0.5, Some(0.5)) > 0.0)   // just released
+    assert(env.sample(0.7, Some(0.5)) < 0.01)   // released and faded
+    print("Release ✓")
+
+    // Envelope duration
+    let dur = env.total_duration(1.0)
+    assert(dur == 1.2)
+    print("Duration ✓")
+
+    // Voice
+    let osc = Oscillator.new(Waveform.Sine, 440.0)
+    let voice = Voice.new(osc, env, 0.0)
+    assert(voice.is_active(0.05))
+    assert(voice.sample(0.0).abs() < eps)
+    print("Voice ✓")
+
+    // MIDI to freq
+    assert((midi_to_freq(69) - 440.0).abs() < eps)
+    assert((midi_to_freq(60) - 261.626).abs() < 0.01)  // middle C
+    assert(midi_to_freq(81) > midi_to_freq(69))  // higher note = higher freq
+    print("MIDI freq ✓")
+
+    // Buffer generation
+    let voices = [Voice.new(Oscillator.new(Waveform.Sine, 440.0), env, 0.0)]
+    let buf = generate_buffer(&voices, 44100, 0.01)
+    assert(buf.len() == 441)
+    for &s in &buf { assert(s >= -1.0 && s <= 1.0) }
+    print("Buffer ✓")
+
+    // Mixing clamps
+    let loud1 = Voice.new(Oscillator.new(Waveform.Square, 100.0), Envelope.new(0.0, 0.0, 1.0, 0.0), 0.0)
+    let loud2 = Voice.new(Oscillator.new(Waveform.Square, 100.0), Envelope.new(0.0, 0.0, 1.0, 0.0), 0.0)
+    let mixed = mix(&[loud1, loud2], 0.001)
+    assert(mixed >= -1.0 && mixed <= 1.0)
+    print("Mix clamp ✓")
+
+    print("Synthesizer complete ✓")
+}
