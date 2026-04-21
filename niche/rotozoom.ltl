@@ -1,0 +1,45 @@
+// examples/niche/rotozoom.ltl — Amiga demoscene rotozoom.
+//
+// For each destination pixel (u, v) compute the source coordinate by
+// the inverse affine transform
+//     src_x = cos(θ)/s · (u - cx) + sin(θ)/s · (v - cy) + cx
+//     src_y = -sin(θ)/s · (u - cx) + cos(θ)/s · (v - cy) + cy
+// and sample with wrap-around. Animate θ and s over time and you get
+// the classic demoscene effect that used to melt Amiga CPUs in the
+// '90s — now a single-frame operation on any device.
+
+use gfx::framebuffer::Framebuffer
+use std::math::{sin, cos}
+
+pub fn rotozoom(src: &Framebuffer, dst: &mut Framebuffer,
+               angle_rad: f32, zoom: f32) {
+    let (cx, cy) = (dst.w as f32 / 2.0, dst.h as f32 / 2.0)
+    let inv_zoom = 1.0 / zoom.max(1e-3)
+    let c = cos(angle_rad) * inv_zoom; let s = sin(angle_rad) * inv_zoom
+    for y in 0..dst.h {
+        for x in 0..dst.w {
+            let u = x as f32 - cx; let v = y as f32 - cy
+            let sx = (c * u + s * v + cx) as i32
+            let sy = (-s * u + c * v + cy) as i32
+            // Wrap source texture for the infinite-tile look.
+            let sx = ((sx % src.w as i32) + src.w as i32) as u32 % src.w
+            let sy = ((sy % src.h as i32) + src.h as i32) as u32 % src.h
+            dst.set(x, y, src.get(sx, sy))
+        }
+    }
+}
+
+fn main() {
+    let mut src = Framebuffer::new(64, 64)
+    for y in 0..64 { for x in 0..64 {
+        let c = ((x ^ y) * 4) as u32
+        src.set(x, y, 0xFF000000 | (c << 16) | (c << 8) | c)
+    }}
+    let mut dst = Framebuffer::new(320, 240)
+    let mut t: f32 = 0.0
+    loop {
+        rotozoom(&src, &mut dst, t, 1.0 + 0.5 * t.sin())
+        t += 0.05
+        std::thread::sleep(std::time::Duration::from_millis(16))
+    }
+}
