@@ -61,7 +61,7 @@ Every file includes a `fn main()` with built-in assertions that validate correct
 
 ## Contributing
 
-See CONTRIBUTING.md for guidelines. Each example should be self-contained with a `fn main()` entry point and test assertions.
+See [CONTRIBUTING.md](https://github.com/bad-antics/lateralus-examples/blob/main/CONTRIBUTING.md) for guidelines. Each example should be self-contained with a `fn main()` entry point and test assertions.
 
 ## License
 
