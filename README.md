@@ -34,7 +34,13 @@ A collection of example programs written in Lateralus, demonstrating language fe
 
 **Networking** — DNS resolver, HTTP/2 frames, port scanner, TCP client
 
-**Niche** — broad collection of standalone tools: YAML parser, cron scheduler, blockchain, chess engine, compression, database engine, ECS, ELF parser, FTP/SMTP/MQTT/IRC clients, hex editor, image processing, JSON-RPC, key-value store, load balancer, markdown renderer, package manager, protocol buffers, proxy server, Redis client, regex engine, shell, SQL parser, static site generator, task scheduler, terminal UI, text editor, TOML parser, torrent client, VM bytecode, WebSocket
+**Niche** — broad collection of standalone tools:
+
+- Parsers & formats: YAML parser, TOML parser, SQL parser, regex engine, markdown renderer, ELF parser, protocol buffers, JSON-RPC
+- Storage & data: key-value store, Redis client, database engine, blockchain, compression
+- Network clients: FTP, SMTP, MQTT, IRC, WebSocket, torrent, proxy server, load balancer
+- Tools & UI: hex editor, text editor, terminal UI, shell, package manager, static site generator, task scheduler, cron scheduler
+- Engines & VMs: chess engine, ECS, image processing, VM bytecode
 
 **OS** — kernel syscalls, network stack, encrypted messenger, secure boot, process isolation
 
